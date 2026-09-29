@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <RootNamespace>Data1c.Core</RootNamespace>
+        <AssemblyName>Data1c.Core</AssemblyName>
+        <Description>Библиотека разбора выгрузки конфигурации 1С (XML + BSL) и построения графа зависимостей.</Description>
+    </PropertyGroup>
+
+</Project>

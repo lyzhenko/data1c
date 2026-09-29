@@ -1,0 +1,1021 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data1C — граф зависимостей выгрузки 1С</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --line: #d7dbe0; --text: #1f2328; --muted: #6b7280;
+    --config: #1f4e79; --meta: #2e7d32; --module: #ef6c00; --routine: #1565c0; --external: #9e9e9e;
+    --calls: #c62828; --uses: #6a1b9a; --refs: #2e7d32; --contains: #b9bfc7; --defines: #ef6c00;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 13px/1.45 "Segoe UI", system-ui, sans-serif; color: var(--text); background: var(--bg); }
+  #app { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+  header { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 14px; margin: 0 8px 0 0; font-weight: 600; white-space: nowrap; }
+  #search-box { position: relative; flex: 1 1 320px; min-width: 220px; }
+  #search { width: 100%; padding: 6px 9px; border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+  #results { position: absolute; z-index: 20; top: 32px; left: 0; right: 0; max-height: 340px; overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 6px 20px rgba(0,0,0,.12); display: none; }
+  #results div.item { padding: 6px 9px; cursor: pointer; border-bottom: 1px solid #f0f1f3; }
+  #results div.item:hover { background: #eef3f9; }
+  #results .kind { color: var(--muted); font-size: 11px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+  .controls label { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
+  .controls select, .controls input[type=number] { font: inherit; padding: 2px 4px; border: 1px solid var(--line); border-radius: 4px; }
+  .controls .sep { width: 1px; height: 18px; background: var(--line); }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  main { position: relative; flex: 1; display: flex; min-height: 0; }
+  #canvas-wrap { position: relative; flex: 1; min-width: 0; }
+  canvas { display: block; width: 100%; height: 100%; cursor: grab; background: #fbfcfd; }
+  canvas.dragging { cursor: grabbing; }
+  #status { position: absolute; left: 10px; bottom: 10px; background: rgba(255,255,255,.92); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font-size: 12px; color: var(--muted); }
+  #hint { position: absolute; right: 10px; bottom: 10px; background: rgba(255,255,255,.92); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font-size: 12px; color: var(--muted); }
+  aside { width: 340px; flex: 0 0 340px; background: var(--panel); border-left: 1px solid var(--line); overflow: auto; padding: 10px 12px; }
+  aside h2 { font-size: 13px; margin: 0 0 6px; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 11px; color: #fff; }
+  .card dl { display: grid; grid-template-columns: 92px 1fr; gap: 2px 8px; margin: 8px 0; }
+  .card dt { color: var(--muted); }
+  .card dd { margin: 0; word-break: break-word; }
+  .card code { font: 12px/1.4 Consolas, monospace; background: #f2f4f7; padding: 1px 4px; border-radius: 3px; }
+  .links { list-style: none; margin: 0 0 10px; padding: 0; }
+  .links li { padding: 4px 6px; border-radius: 4px; cursor: pointer; display: flex; gap: 6px; align-items: baseline; }
+  .links li:hover { background: #eef3f9; }
+  .links .k { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .links .n { flex: 1; word-break: break-word; }
+  .empty { color: var(--muted); }
+  .node-link { cursor: pointer; color: #0b57d0; }
+  .node-link:hover { text-decoration: underline; }
+  button { font: inherit; padding: 4px 9px; border: 1px solid var(--line); background: #fff; border-radius: 5px; cursor: pointer; }
+  button:hover { background: #eef3f9; }
+  button.mini { padding: 0 5px; font-size: 11px; line-height: 16px; border-radius: 4px; color: var(--muted); }
+  #code-panel { display: none; flex: 0 0 auto; flex-direction: column; height: min(340px, 45vh); min-height: 120px; max-height: 70vh; background: var(--panel); border-top: 3px solid var(--routine); }
+  #code-panel.open { display: flex; }
+  #code-resizer { flex: 0 0 auto; height: 6px; cursor: ns-resize; background: linear-gradient(#e8eaee, rgba(232,234,238,0)); }
+  #code-resizer:hover { background: #cfd6de; }
+  #code-head { flex: 0 0 auto; display: flex; gap: 10px; align-items: center; padding: 6px 12px; border-bottom: 1px solid var(--line); font-size: 12px; }
+  #code-label { font-weight: 700; font-size: 11px; letter-spacing: .06em; color: #fff; background: var(--routine); padding: 2px 6px; border-radius: 4px; }
+  #code-title { font-weight: 600; font-size: 13px; white-space: nowrap; }
+  #code-meta { color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #code-meta code { background: #f2f4f7; padding: 1px 4px; border-radius: 3px; }
+  #code-body { flex: 1 1 auto; min-height: 0; overflow: auto; background: #fbfcfd; }
+  #code-pre { margin: 0; font: 12px/1.5 Consolas, "Cascadia Mono", monospace; }
+  .cl { display: flex; white-space: pre; }
+  .cl .no { flex: 0 0 58px; text-align: right; padding-right: 10px; color: #9aa1a9; user-select: none; background: #f4f6f8; border-right: 1px solid #e8eaee; }
+  .cl .tx { padding-left: 10px; }
+  .cl.hl { background: #fff8e1; }
+  .cl.decl { background: #ffe6ad; font-weight: 600; }
+  .cl.decl .no { background: #ffdf9a; color: #5a4a20; }
+  #code-hint { padding: 10px 14px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Граф зависимостей 1С</h1>
+    <div id="search-box">
+      <input id="search" type="search" placeholder="Поиск: Catalog.Товары, ОбщегоНазначения, ПодставитьПараметрыВСтроку, Номенклатура…" autocomplete="off">
+      <div id="results"></div>
+    </div>
+    <button id="fit" title="Показать весь подграф">Вписать</button>
+    <button id="clear" title="Убрать всё с холста">Очистить</button>
+  </header>
+
+  <div class="controls">
+    <span>Раскладка</span>
+    <select id="layout"><option value="radial" selected>радиальная</option><option value="force">силовая</option></select>
+    <span class="sep"></span>
+    <span>Глубина</span>
+    <select id="depth"><option>1</option><option selected>2</option><option>3</option><option>4</option></select>
+    <label><input type="checkbox" id="dir-in" checked> входящие</label>
+    <label><input type="checkbox" id="dir-out" checked> исходящие</label>
+    <span class="sep"></span>
+    <label><input type="checkbox" id="e-Calls" checked><span class="swatch" style="background:var(--calls)"></span> вызовы</label>
+    <label><input type="checkbox" id="e-UsesMetadata" checked><span class="swatch" style="background:var(--uses)"></span> обращения</label>
+    <label><input type="checkbox" id="e-References"><span class="swatch" style="background:var(--refs)"></span> ссылки</label>
+    <label><input type="checkbox" id="e-Contains" checked><span class="swatch" style="background:var(--contains)"></span> вложенность</label>
+    <label><input type="checkbox" id="e-Defines" checked><span class="swatch" style="background:var(--defines)"></span> объявления</label>
+    <span class="sep"></span>
+    <label><input type="checkbox" id="n-MetadataObject" checked> объекты</label>
+    <label><input type="checkbox" id="n-Module" checked> модули</label>
+    <label><input type="checkbox" id="n-Routine" checked> процедуры</label>
+    <label><input type="checkbox" id="n-External"> внешние</label>
+    <label><input type="checkbox" id="n-Configuration" title="У конфигурации десятки тысяч детей: при раскрытии она затапливает картину"> конфигурация</label>
+    <span class="sep"></span>
+    <span>макс. узлов</span>
+    <input type="number" id="max" value="250" min="10" max="5000" step="10" style="width:70px">
+  </div>
+
+  <main>
+    <div id="canvas-wrap">
+      <canvas id="canvas"></canvas>
+      <div id="status">—</div>
+      <div id="hint">клик по подписи узла — код внизу · двойной клик — раскрыть соседей · колесо — масштаб</div>
+    </div>
+    <aside class="card" id="panel">
+      <h2>Узел не выбран</h2>
+      <p class="empty">Найдите объект в строке поиска или щёлкните по узлу на холсте.</p>
+    </aside>
+  </main>
+
+  <section id="code-panel" aria-label="Исходный код">
+    <div id="code-resizer" title="Потянуть, чтобы изменить высоту"></div>
+    <div id="code-head">
+      <span id="code-label">КОД</span>
+      <span id="code-title">не выбран</span>
+      <span id="code-meta"></span>
+      <button id="code-whole" hidden>Весь модуль</button>
+      <button id="code-to-routine" hidden>К процедуре</button>
+      <button id="code-close" title="Закрыть (Esc)">✕</button>
+    </div>
+    <div id="code-body"><pre id="code-pre"></pre></div>
+  </section>
+</div>
+
+<script id="graph-data" type="application/json">__GRAPH_DATA__</script>
+<script>
+"use strict";
+
+const NODE_COLORS = { Configuration: "#1f4e79", MetadataObject: "#2e7d32", Module: "#ef6c00", Routine: "#1565c0", External: "#9e9e9e" };
+const EDGE_COLORS = { Calls: "#c62828", UsesMetadata: "#6a1b9a", References: "#2e7d32", Contains: "#b9bfc7", Defines: "#ef6c00" };
+const EDGE_LABELS = { Calls: "вызов", UsesMetadata: "обращение", References: "ссылка", Contains: "вложенность", Defines: "объявление" };
+const NODE_LABELS = { Configuration: "конфигурация", MetadataObject: "объект", Module: "модуль", Routine: "процедура", External: "внешний" };
+const NODE_KIND_NAMES = ["MetadataObject", "Module", "Routine", "External", "Configuration"];
+
+const payload = JSON.parse(document.getElementById("graph-data").textContent || "null");
+const state = {
+  mode: payload ? "static" : "server",
+  nodes: new Map(),
+  edges: new Map(),
+  selection: null,
+  hover: null,
+  hoverLabel: null,
+  view: { scale: 1, ox: 0, oy: 0 },
+  drag: null,
+  panning: null,
+  alpha: 0,
+  truncated: false,
+  activeNodes: new Map(),
+  activeEdges: [],
+  totals: { nodes: 0, edges: 0 }
+};
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const results = document.getElementById("results");
+const panel = document.getElementById("panel");
+const status = document.getElementById("status");
+
+for (const node of payload ? payload.nodes : []) addNode(node);
+for (const edge of payload ? payload.edges : []) addEdge(edge);
+if (payload && payload.stats) state.totals = { nodes: payload.stats.totalNodes ?? payload.nodes.length, edges: payload.stats.totalEdges ?? payload.edges.length };
+refreshActive();
+
+// ---------------------------------------------------------------- модель
+
+function addNode(node) {
+  if (state.nodes.has(node.id)) return state.nodes.get(node.id);
+  const created = { ...node, x: 0, y: 0, vx: 0, vy: 0, degree: 0 };
+  state.nodes.set(node.id, created);
+  return created;
+}
+
+function edgeKey(edge) { return edge.sourceId + "|" + edge.targetId + "|" + edge.kind + "|" + (edge.line ?? 0); }
+
+function addEdge(edge) {
+  if (!state.nodes.has(edge.sourceId) || !state.nodes.has(edge.targetId)) return false;
+  const key = edgeKey(edge);
+  if (state.edges.has(key)) return false;
+  state.edges.set(key, edge);
+  state.nodes.get(edge.sourceId).degree++;
+  state.nodes.get(edge.targetId).degree++;
+  return true;
+}
+
+function clearGraph() {
+  state.nodes.clear(); state.edges.clear(); state.selection = null; state.hover = null;
+  state.alpha = 0;
+  refreshActive();
+  renderPanel(null); render();
+}
+
+function mergeSubgraph(subgraph, reset) {
+  if (reset) { state.nodes.clear(); state.edges.clear(); }
+  for (const node of subgraph.nodes) addNode(node);
+  for (const edge of subgraph.edges) addEdge(edge);
+  state.truncated = !!subgraph.truncated;
+  refreshActive();
+  relayout();
+}
+
+/// Фильтры типов применяются и на клиенте: в статичной странице это единственный способ
+/// убрать лишнее, а в режиме сервера — способ мгновенно скрыть уже загруженное.
+function refreshActive() {
+  const nodeKinds = new Set(NODE_KIND_NAMES.filter(kind => document.getElementById("n-" + kind).checked));
+  const edgeKinds = new Set(Object.keys(EDGE_COLORS).filter(kind => document.getElementById("e-" + kind).checked));
+
+  state.activeNodes = new Map();
+  for (const node of state.nodes.values()) {
+    if (nodeKinds.has(node.kind) || node.id === state.selection) state.activeNodes.set(node.id, node);
+    node.activeDegree = 0;
+  }
+
+  state.activeEdges = [];
+  for (const edge of state.edges.values()) {
+    if (!edgeKinds.has(edge.kind)) continue;
+    if (!state.activeNodes.has(edge.sourceId) || !state.activeNodes.has(edge.targetId)) continue;
+    state.activeEdges.push(edge);
+    state.activeNodes.get(edge.sourceId).activeDegree++;
+    state.activeNodes.get(edge.targetId).activeDegree++;
+  }
+}
+
+// ---------------------------------------------------------------- раскладка
+
+function relayout() {
+  if (document.getElementById("layout").value === "radial") radialLayout();
+  else { state.alpha = 1; }
+  fit();
+}
+
+/**
+ * Радиальная раскладка: центр — выбранный узел, каждый следующий уровень связей на своём кольце.
+ * Для графов 1С (модуль и сотни вызываемых процедур) это читается намного лучше силовой укладки.
+ */
+function radialLayout() {
+  if (!state.activeNodes.size) return;
+  const centre = state.selection && state.activeNodes.has(state.selection) ? state.selection : busiestNodeId();
+  if (!centre) return;
+  const adjacency = new Map();
+  for (const id of state.activeNodes.keys()) adjacency.set(id, []);
+  for (const edge of state.activeEdges) {
+    adjacency.get(edge.sourceId).push(edge.targetId);
+    adjacency.get(edge.targetId).push(edge.sourceId);
+  }
+
+  const level = new Map([[centre, 0]]);
+  const parent = new Map([[centre, null]]);
+  const queue = [centre];
+  while (queue.length) {
+    const current = queue.shift();
+    for (const neighbour of adjacency.get(current)) {
+      if (!level.has(neighbour)) { level.set(neighbour, level.get(current) + 1); parent.set(neighbour, current); queue.push(neighbour); }
+    }
+  }
+
+  const unvisited = [...state.activeNodes.keys()].filter(id => !level.has(id));
+  const maxLevel = Math.max(0, ...[...level.values()]) + (unvisited.length ? 1 : 0);
+  for (const id of unvisited) { level.set(id, maxLevel); parent.set(id, centre); }
+
+  const rings = new Map();
+  for (const [id, depth] of level) {
+    if (!rings.has(depth)) rings.set(depth, []);
+    rings.get(depth).push(id);
+  }
+
+  const widest = Math.max(1, ...[...rings.values()].map(r => r.length));
+  const spacing = Math.max(110, 30 * Math.sqrt(widest));
+  const angleOf = new Map([[centre, -Math.PI / 2]]);
+
+  for (const depth of [...rings.keys()].sort((a, b) => a - b)) {
+    const ids = rings.get(depth);
+    if (depth === 0) {
+      const node = state.nodes.get(centre);
+      node.x = 0; node.y = 0; node.vx = 0; node.vy = 0;
+      continue;
+    }
+    // Дети одного родителя держатся рядом: сортируем по углу родителя.
+    const parentAngle = id => angleOf.get(parent.get(id)) ?? 0;
+    ids.sort((a, b) => parentAngle(a) - parentAngle(b) || String(a).localeCompare(String(b)));
+    const step = (2 * Math.PI) / ids.length;
+    const radius = spacing * depth * 0.55;
+    ids.forEach((id, index) => {
+      const angle = index * step - Math.PI / 2;
+      angleOf.set(id, angle);
+      const node = state.nodes.get(id);
+      node.x = Math.cos(angle) * radius;
+      node.y = Math.sin(angle) * radius;
+      node.vx = 0; node.vy = 0;
+      node.ring = angle;
+    });
+  }
+
+  state.alpha = 0;
+}
+
+function busiestNodeId() {
+  let best = null, bestDegree = -1;
+  for (const node of state.activeNodes.values()) if (node.activeDegree > bestDegree) { best = node; bestDegree = node.activeDegree; }
+  return best ? best.id : null;
+}
+
+function fit() {
+  const nodes = [...state.activeNodes.values()];
+  if (!nodes.length) { state.view = { scale: 1, ox: 0, oy: 0 }; render(); return; }
+  const xs = nodes.map(n => n.x), ys = nodes.map(n => n.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const width = Math.max(1, maxX - minX), height = Math.max(1, maxY - minY);
+  const rect = canvas.getBoundingClientRect();
+  const scale = Math.max(0.05, Math.min(rect.width / (width + 200), rect.height / (height + 160), 2.5));
+  state.view = { scale, ox: rect.width / 2 - ((minX + maxX) / 2) * scale, oy: rect.height / 2 - ((minY + maxY) / 2) * scale };
+  render();
+}
+
+// ---------------------------------------------------------------- поиск
+
+let searchTimer = null;
+
+document.getElementById("search").addEventListener("input", event => {
+  clearTimeout(searchTimer);
+  const query = event.target.value.trim();
+  if (!query) { results.style.display = "none"; return; }
+  searchTimer = setTimeout(() => runSearch(query), 250);
+});
+
+document.getElementById("search").addEventListener("keydown", event => {
+  if (event.key === "Escape") results.style.display = "none";
+  if (event.key === "Enter") { const first = results.querySelector("div.item"); if (first) { results.style.display = "none"; focusNode(first.dataset.id); } }
+});
+
+document.addEventListener("click", event => {
+  if (!document.getElementById("search-box").contains(event.target)) results.style.display = "none";
+});
+
+async function runSearch(query) {
+  let hits;
+  if (state.mode === "static") {
+    const needle = query.toLowerCase();
+    hits = [...state.nodes.values()]
+      .filter(n => n.id.toLowerCase().includes(needle) || (n.name || "").toLowerCase().includes(needle))
+      .slice(0, 40)
+      .map(n => ({ id: n.id, kind: n.kind, name: n.name, metadataKind: n.metadataKind, sourcePath: n.sourcePath, synonym: n.tags && n.tags.synonym }));
+  } else {
+    hits = await api("/api/search", { q: query, limit: 40 });
+  }
+  renderResults(hits);
+}
+
+function renderResults(hits) {
+  results.innerHTML = "";
+  if (!hits.length) { results.innerHTML = "<div class='item empty'>Ничего не найдено</div>"; results.style.display = "block"; return; }
+  for (const hit of hits) {
+    const row = document.createElement("div");
+    row.className = "item";
+    row.dataset.id = hit.id;
+    const title = hit.kind === "MetadataObject" && hit.metadataKind ? hit.metadataKind + "." + hit.name : hit.name;
+    row.innerHTML = "<div>" + escapeHtml(title) + (hit.synonym ? " <span class='kind'>— " + escapeHtml(hit.synonym) + "</span>" : "") + "</div>" +
+      "<div class='kind'>" + NODE_LABELS[hit.kind] + " · " + escapeHtml(hit.id) + "</div>";
+    row.addEventListener("click", () => { results.style.display = "none"; focusNode(hit.id); });
+    results.appendChild(row);
+  }
+  results.style.display = "block";
+}
+
+// ---------------------------------------------------------------- API
+
+function filters() {
+  const edgeKinds = Object.keys(EDGE_COLORS).filter(k => document.getElementById("e-" + k).checked);
+  const nodeKinds = NODE_KIND_NAMES.filter(k => document.getElementById("n-" + k).checked);
+  return {
+    depth: document.getElementById("depth").value,
+    incoming: document.getElementById("dir-in").checked,
+    outgoing: document.getElementById("dir-out").checked,
+    edgeKinds: edgeKinds.length ? edgeKinds : Object.keys(EDGE_COLORS),
+    nodeKinds: nodeKinds.length ? nodeKinds : NODE_KIND_NAMES,
+    max: document.getElementById("max").value
+  };
+}
+
+async function api(path, params) {
+  const url = new URL(path, location.origin);
+  for (const [key, value] of Object.entries(params || {})) if (value !== undefined && value !== null) url.searchParams.set(key, value);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+
+async function loadStats() {
+  if (state.mode === "static") return;
+  try {
+    const stats = await api("/api/stats");
+    state.totals = { nodes: stats.nodeCount, edges: stats.edgeCount };
+    render();
+  } catch (error) { /* статистика не критична */ }
+}
+
+async function expand(nodeId, reset) {
+  const options = filters();
+  if (state.mode === "static") { await selectNode(nodeId); relayout(); return; }
+  const subgraph = await api("/api/expand", {
+    id: nodeId,
+    depth: options.depth,
+    in: options.incoming,
+    out: options.outgoing,
+    edges: options.edgeKinds.join(","),
+    nodes: options.nodeKinds.join(","),
+    max: options.max
+  });
+  mergeSubgraph(subgraph, reset);
+  await selectNode(nodeId);
+}
+
+function focusNode(nodeId) {
+  state.selection = nodeId;
+  expand(nodeId, true);
+}
+
+async function selectNode(nodeId) {
+  state.selection = nodeId;
+  refreshActive();
+  if (state.mode === "static") {
+    const node = state.nodes.get(nodeId);
+    if (!node) return;
+    renderPanel({
+      node,
+      incoming: [...state.edges.values()].filter(e => e.targetId === nodeId),
+      outgoing: [...state.edges.values()].filter(e => e.sourceId === nodeId)
+    });
+    render();
+    return;
+  }
+  try {
+    renderPanel(await api("/api/node", { id: nodeId }));
+  } catch (error) { renderPanel(null); }
+}
+
+// ---------------------------------------------------------------- панель
+
+function renderPanel(details) {
+  if (!details || !details.node) {
+    panel.innerHTML = "<h2>Узел не выбран</h2><p class='empty'>Найдите объект в строке поиска или щёлкните по узлу на холсте.</p>";
+    return;
+  }
+  const node = details.node;
+  const tags = node.tags || {};
+  const rows = [];
+  rows.push(["идентификатор", "<code>" + escapeHtml(node.id) + "</code>"]);
+  if (node.metadataKind) rows.push(["вид объекта", escapeHtml(node.metadataKind)]);
+  if (tags.synonym) rows.push(["синоним", escapeHtml(tags.synonym)]);
+  if (node.sourcePath) rows.push(["файл", "<code>" + escapeHtml(node.sourcePath) + "</code>"]);
+  if (tags.path) rows.push(["каталог", "<code>" + escapeHtml(tags.path) + "</code>"]);
+  if (tags.uuid) rows.push(["uuid", "<code>" + escapeHtml(tags.uuid) + "</code>"]);
+  if (tags.export) rows.push(["экспорт", escapeHtml(tags.export)]);
+  if (tags.lines) rows.push(["строк", escapeHtml(tags.lines)]);
+  if (tags.region) rows.push(["область", escapeHtml(tags.region)]);
+  if (tags.directives) rows.push(["директивы", escapeHtml(tags.directives)]);
+  if (tags.nameOnly) rows.push(["примечание", "объект известен только по имени из ChildObjects"]);
+
+  const canShowCode = state.mode === "server" && node.sourcePath;
+  const title = canShowCode
+    ? "<span class='node-link' id='act-code-title' title='Показать код'>" + escapeHtml(node.name) + "</span>"
+    : escapeHtml(node.name);
+
+  panel.innerHTML =
+    "<h2>" + title + " <span class='badge' style='background:" + (NODE_COLORS[node.kind] || "#666") + "'>" + NODE_LABELS[node.kind] + "</span></h2>" +
+    "<dl>" + rows.map(r => "<dt>" + r[0] + "</dt><dd>" + r[1] + "</dd>").join("") + "</dl>" +
+    "<div style='display:flex;gap:6px;margin-bottom:10px'>" +
+    "<button id='act-expand'>Раскрыть соседей</button><button id='act-center'>В центр</button>" +
+    (canShowCode ? "<button id='act-code'>Показать код</button>" : "") +
+    "</div>" +
+    "<h2>Входит связей: " + details.incoming.length + "</h2>" + linkList(details.incoming, "sourceId") +
+    "<h2>Исходит связей: " + details.outgoing.length + "</h2>" + linkList(details.outgoing, "targetId");
+
+  const expandButton = document.getElementById("act-expand");
+  if (expandButton) expandButton.addEventListener("click", () => expand(node.id, false));
+  const centreButton = document.getElementById("act-center");
+  if (centreButton) centreButton.addEventListener("click", () => { radialLayout(); fit(); });
+  const codeButton = document.getElementById("act-code");
+  if (codeButton) codeButton.addEventListener("click", () => openCode(node.id));
+  const codeTitle = document.getElementById("act-code-title");
+  if (codeTitle) codeTitle.addEventListener("click", () => openCode(node.id));
+  bindLinks();
+}
+
+function nodeTitle(node) {
+  if (!node) return "";
+  if (node.kind === "MetadataObject" && node.metadataKind) return node.metadataKind + "." + node.name;
+  if (node.kind === "Module") return (node.tags && node.tags.owner) || node.name;
+  return node.name;
+}
+
+function linkList(edges, otherField) {
+  if (!edges.length) return "<p class='empty'>нет</p>";
+  const withCode = state.mode === "server";
+  const items = edges.slice(0, 400).map(edge => {
+    const other = state.nodes.get(edge[otherField]);
+    const name = other ? nodeTitle(other) : edge[otherField];
+    const line = edge.line ? ":" + edge.line : "";
+    const codeButton = withCode ? "<button class='mini' data-code='" + escapeHtml(edge[otherField]) + "' title='Показать код'>код</button>" : "";
+    return "<li data-id='" + escapeHtml(edge[otherField]) + "'>" +
+      "<span class='k'>" + EDGE_LABELS[edge.kind] + line + "</span>" +
+      "<span class='n'>" + escapeHtml(name) + "</span>" + codeButton + "</li>";
+  });
+  const more = edges.length > 400 ? "<p class='empty'>… ещё " + (edges.length - 400) + "</p>" : "";
+  return "<ul class='links'>" + items.join("") + "</ul>" + more;
+}
+
+function bindLinks() {
+  for (const item of panel.querySelectorAll("li[data-id]")) {
+    item.addEventListener("click", () => { selectNode(item.dataset.id); centreOn(item.dataset.id); });
+    item.addEventListener("dblclick", () => expand(item.dataset.id, false));
+  }
+  for (const button of panel.querySelectorAll("button[data-code]")) {
+    button.addEventListener("click", event => {
+      // Клик по «код» не должен уводить фокус графа — только открывает панель кода.
+      event.stopPropagation();
+      openCode(button.dataset.code);
+    });
+  }
+}
+
+function centreOn(nodeId) {
+  const node = state.nodes.get(nodeId);
+  if (!node) return;
+  const rect = canvas.getBoundingClientRect();
+  state.view.ox = rect.width / 2 - node.x * state.view.scale;
+  state.view.oy = rect.height / 2 - node.y * state.view.scale;
+  render();
+}
+
+// ---------------------------------------------------------------- силовая укладка
+
+function simulate() {
+  const nodes = [...state.activeNodes.values()];
+  const count = nodes.length;
+  if (!count) { state.alpha = 0; return; }
+  const k = Math.sqrt((900 * 900) / count);
+
+  for (let i = 0; i < count; i++) {
+    const a = nodes[i];
+    for (let j = i + 1; j < count; j++) {
+      const b = nodes[j];
+      let dx = a.x - b.x, dy = a.y - b.y;
+      let d2 = dx * dx + dy * dy;
+      if (d2 < 1) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 1; }
+      const force = (k * k) / d2;
+      const fx = (dx / Math.sqrt(d2)) * force, fy = (dy / Math.sqrt(d2)) * force;
+      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+    }
+    a.vx -= a.x * 0.002; a.vy -= a.y * 0.002;
+  }
+
+  for (const edge of state.activeEdges) {
+    const a = state.nodes.get(edge.sourceId), b = state.nodes.get(edge.targetId);
+    if (!a || !b) continue;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+    // Сила делится на степень узлов: иначе «хаб» с сотнями связей разлетается.
+    const force = (d * d) / (k * 20);
+    const fx = (dx / d) * force / Math.max(1, Math.sqrt(a.degree));
+    const fy = (dy / d) * force / Math.max(1, Math.sqrt(a.degree));
+    const gx = (dx / d) * force / Math.max(1, Math.sqrt(b.degree));
+    const gy = (dy / d) * force / Math.max(1, Math.sqrt(b.degree));
+    a.vx += fx; a.vy += fy; b.vx -= gx; b.vy -= gy;
+  }
+
+  const cooling = 0.85 * state.alpha;
+  const limit = 4 + 30 * state.alpha;
+  for (const node of nodes) {
+    if (state.drag && state.drag.id === node.id) { node.vx = 0; node.vy = 0; continue; }
+    let dx = node.vx * state.alpha, dy = node.vy * state.alpha;
+    const speed = Math.hypot(dx, dy);
+    if (speed > limit) { dx = dx / speed * limit; dy = dy / speed * limit; }
+    node.x += dx;
+    node.y += dy;
+    node.vx *= cooling; node.vy *= cooling;
+  }
+
+  state.alpha = state.alpha < 0.02 ? 0 : state.alpha * 0.985;
+}
+
+// ---------------------------------------------------------------- отрисовка
+
+function resize() {
+  const rect = canvas.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.floor(rect.width * ratio);
+  canvas.height = Math.floor(rect.height * ratio);
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  render();
+}
+
+function toScreen(node) { return { x: node.x * state.view.scale + state.view.ox, y: node.y * state.view.scale + state.view.oy }; }
+
+function radiusOf(node) {
+  if (node.kind === "Configuration") return 9;
+  if (node.kind === "MetadataObject") return 5.5;
+  if (node.kind === "Module") return 4.5;
+  if (node.kind === "Routine") return 3.2;
+  return 3;
+}
+
+function render() {
+  const rect = canvas.getBoundingClientRect();
+  ctx.clearRect(0, 0, rect.width, rect.height);
+
+  const nodes = state.activeNodes;
+  const edges = state.activeEdges;
+
+  const neighbours = new Set();
+  if (state.selection) {
+    for (const edge of edges) {
+      if (edge.sourceId === state.selection) neighbours.add(edge.targetId);
+      if (edge.targetId === state.selection) neighbours.add(edge.sourceId);
+    }
+  }
+
+  ctx.lineWidth = 1;
+  for (const edge of edges) {
+    const a = nodes.get(edge.sourceId), b = nodes.get(edge.targetId);
+    if (!a || !b) continue;
+    const touching = state.selection && (edge.sourceId === state.selection || edge.targetId === state.selection);
+    ctx.strokeStyle = EDGE_COLORS[edge.kind] || "#999";
+    ctx.globalAlpha = state.selection ? (touching ? 0.9 : 0.1) : 0.45;
+    const pa = toScreen(a), pb = toScreen(b);
+    ctx.beginPath();
+    ctx.moveTo(pa.x, pa.y);
+    ctx.lineTo(pb.x, pb.y);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  const zoomed = state.view.scale;
+  const order = [...nodes.values()].sort(labelPriority);
+  for (const node of order) node.labelBox = null;
+
+  // 1) Кружки узлов.
+  for (const node of nodes.values()) {
+    const point = toScreen(node);
+    const radius = radiusOf(node);
+    const dimmed = state.selection && node.id !== state.selection && !neighbours.has(node.id);
+    ctx.globalAlpha = dimmed ? 0.22 : 1;
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = NODE_COLORS[node.kind] || "#666";
+    ctx.fill();
+    if (node.id === state.selection) { ctx.lineWidth = 2; ctx.strokeStyle = "#111"; ctx.stroke(); }
+    if (node.id === state.hover) { ctx.lineWidth = 1.5; ctx.strokeStyle = "#111"; ctx.stroke(); }
+    ctx.globalAlpha = 1;
+  }
+
+  // 2) Подписи-ссылки: без наложений, чтобы клик по тексту был однозначным.
+  const occupied = [];
+  for (const node of order) {
+    if (!shouldLabel(node, zoomed)) continue;
+    const point = toScreen(node);
+    const box = drawLabel(node, point, radiusOf(node), occupied);
+    if (box) occupied.push(box);
+  }
+
+  const shown = state.activeNodes.size, shownEdges = state.activeEdges.length;
+  status.textContent = "узлов: " + shown.toLocaleString("ru-RU") + ", связей: " + shownEdges.toLocaleString("ru-RU") +
+    (state.nodes.size !== shown ? " (загружено " + state.nodes.size.toLocaleString("ru-RU") + ")" : "") +
+    (state.totals.nodes ? " · всего в выгрузке: " + state.totals.nodes.toLocaleString("ru-RU") + " / " + state.totals.edges.toLocaleString("ru-RU") : "") +
+    (state.truncated ? " · соседи обрезаны лимитом" : "");
+}
+
+function shouldLabel(node, zoom) {
+  if (node.id === state.selection || node.id === state.hover) return true;
+  if (node.kind === "Routine") return zoom > 1.4 || node.activeDegree > 4;
+  if (node.kind === "External") return zoom > 1.6;
+  return zoom > 0.55;
+}
+
+/** Порядок размещения подписей: сначала выбранный и подсвеченный узел, затем самые связанные. */
+function labelPriority(a, b) {
+  const rank = node => (node.id === state.selection ? 0 : node.id === state.hover ? 1 : 2);
+  const byRank = rank(a) - rank(b);
+  if (byRank !== 0) return byRank;
+  return b.activeDegree - a.activeDegree || String(a.id).localeCompare(String(b.id));
+}
+
+function intersects(a, b) {
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+/**
+ * Рисует подпись узла и возвращает её прямоугольник (в координатах холста).
+ * Если места нет и узел не выбран, подпись не рисуется — так клик по тексту всегда однозначен.
+ */
+function drawLabel(node, point, radius, occupied) {
+  const label = nodeTitle(node);
+  const text = label.length > 42 ? label.slice(0, 41) + "…" : label;
+  const priority = node.id === state.selection || node.id === state.hover;
+  const asLink = state.hoverLabel === node.id && state.mode === "server";
+  const clickable = state.mode === "server" && node.sourcePath;
+
+  // Подпись уходит наружу от центра: на радиальной раскладке так не бывает наложений в кучу.
+  const centre = toScreen({ x: 0, y: 0 });
+  const toRight = point.x >= centre.x;
+  ctx.font = (node.id === state.selection ? "600 " : "") + "11px 'Segoe UI', sans-serif";
+  const width = ctx.measureText(text).width;
+  const x = toRight ? point.x + radius + 4 : point.x - radius - 4;
+  const box = { x: (toRight ? x : x - width) - 3, y: point.y - 8, w: width + 6, h: 16 };
+
+  if (!priority && occupied.some(other => intersects(other, box))) {
+    return null;
+  }
+
+  if (clickable) {
+    // Прямоугольник подписи — кликабельная область, как у ссылки в HTML.
+    node.labelBox = box;
+  }
+
+  ctx.textAlign = toRight ? "left" : "right";
+  ctx.textBaseline = "middle";
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgba(255,255,255,0.85)";
+  ctx.strokeText(text, x, point.y);
+  ctx.fillStyle = asLink ? "#0b57d0" : (node.id === state.selection ? "#111" : "#33383d");
+  ctx.fillText(text, x, point.y);
+
+  if (asLink) {
+    ctx.strokeStyle = "#0b57d0";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(toRight ? x : x - width, point.y + 6.5);
+    ctx.lineTo(toRight ? x + width : x, point.y + 6.5);
+    ctx.stroke();
+  }
+
+  return box;
+}
+
+function loop() {
+  if (state.alpha > 0) { simulate(); render(); }
+  requestAnimationFrame(loop);
+}
+
+// ---------------------------------------------------------------- панель кода
+
+const codePanel = document.getElementById("code-panel");
+const codePre = document.getElementById("code-pre");
+const codeTitle = document.getElementById("code-title");
+const codeMeta = document.getElementById("code-meta");
+const codeWhole = document.getElementById("code-whole");
+const codeToRoutine = document.getElementById("code-to-routine");
+const CODE_FULL_LIMIT = 6000;
+let codeRequest = 0;
+
+/** Гарантирует, что панель кода видна целиком: если она не помещается, высота ужимается. */
+function ensurePanelVisible() {
+  const rect = codePanel.getBoundingClientRect();
+  const overflow = rect.bottom - window.innerHeight;
+  if (overflow > 0) {
+    codePanel.style.height = Math.max(120, Math.round(rect.height - overflow)) + "px";
+  }
+
+  codePanel.scrollIntoView({ block: "end" });
+  resize();
+}
+
+/** Открывает панель кода под холстом: модуль целиком, если он небольшой, иначе окно вокруг процедуры. */
+async function openCode(nodeId, wholeFile) {
+  if (!nodeId) return;
+  codePanel.classList.add("open");
+  ensurePanelVisible();
+  if (state.mode === "static") {
+    codeTitle.textContent = "Код";
+    codeMeta.textContent = "";
+    codeWhole.hidden = true;
+    codeToRoutine.hidden = true;
+    codePre.innerHTML = "<div id='code-hint'>В статичной странице исходников нет — файл не имеет доступа к выгрузке. " +
+      "Код открывается в режиме сервера: <code>data1c view &lt;каталог выгрузки&gt;</code>.</div>";
+    return;
+  }
+
+  const request = ++codeRequest;
+  codeTitle.textContent = "Загрузка…";
+  codeMeta.textContent = "";
+  codePre.innerHTML = "";
+  try {
+    let payload = await api("/api/code", { id: nodeId });
+    if (wholeFile) {
+      payload = await api("/api/code", { id: nodeId, all: 1 });
+    } else if (payload.totalLines <= CODE_FULL_LIMIT && (payload.startLine > 1 || payload.endLine < payload.totalLines)) {
+      payload = await api("/api/code", { id: nodeId, all: 1 });
+    }
+    if (request !== codeRequest) return;
+    state.code = { nodeId, payload };
+    renderCode();
+  } catch (error) {
+    if (request !== codeRequest) return;
+    codeTitle.textContent = "Код недоступен";
+    codeMeta.textContent = "";
+    codeWhole.hidden = true;
+    codeToRoutine.hidden = true;
+    codePre.innerHTML = "<div id='code-hint'>" + escapeHtml(error.message || String(error)) + "</div>";
+  }
+}
+
+/** Догружает файл целиком (для модулей больше CODE_FULL_LIMIT строк). */
+async function loadWholeModule() {
+  if (!state.code || state.mode === "static") return;
+  const request = ++codeRequest;
+  try {
+    const payload = await api("/api/code", { id: state.code.nodeId, all: 1 });
+    if (request !== codeRequest) return;
+    state.code.payload = payload;
+    renderCode();
+  } catch (error) {
+    /* Оставляем уже показанный фрагмент. */
+  }
+}
+
+function renderCode() {
+  const payload = state.code.payload;
+  codeTitle.textContent = payload.title || payload.id;
+  codeMeta.innerHTML = "<code>" + escapeHtml(payload.path) + "</code> · строки " + payload.startLine + "–" + payload.endLine +
+    " из " + payload.totalLines + (payload.truncated ? " (обрезано лимитом)" : "");
+  codeWhole.hidden = !(payload.startLine > 1 || payload.endLine < payload.totalLines);
+  codeToRoutine.hidden = !payload.highlightFrom;
+
+  const parts = [];
+  for (let i = 0; i < payload.lines.length; i++) {
+    const number = payload.startLine + i;
+    const inRoutine = payload.highlightFrom && number >= payload.highlightFrom && number <= payload.highlightTo;
+    const cls = number === payload.highlightFrom ? "cl decl" : (inRoutine ? "cl hl" : "cl");
+    parts.push("<div class='" + cls + "'><span class='no'>" + number + "</span><span class='tx'>" +
+      escapeHtml(payload.lines[i]) + "</span></div>");
+  }
+
+  codePre.innerHTML = parts.join("");
+  const anchor = codePre.querySelector(".decl") || codePre.firstElementChild;
+  if (anchor) anchor.scrollIntoView({ block: "center" });
+  const body = document.getElementById("code-body");
+  if (!payload.highlightFrom) body.scrollTop = 0;
+  ensurePanelVisible();
+}
+
+function closeCode() {
+  codePanel.classList.remove("open");
+  state.code = null;
+  codeRequest++;
+  resize();
+}
+
+const resizer = document.getElementById("code-resizer");
+let codeResize = null;
+resizer.addEventListener("mousedown", event => {
+  codeResize = { startY: event.clientY, height: codePanel.getBoundingClientRect().height };
+  event.preventDefault();
+});
+window.addEventListener("mousemove", event => {
+  if (!codeResize) return;
+  const next = Math.max(90, Math.min(window.innerHeight * 0.8, codeResize.height + (codeResize.startY - event.clientY)));
+  codePanel.style.height = next + "px";
+  resize();
+});
+window.addEventListener("mouseup", () => { codeResize = null; });
+
+document.getElementById("code-close").addEventListener("click", closeCode);
+codeWhole.addEventListener("click", loadWholeModule);
+codeToRoutine.addEventListener("click", () => {
+  const anchor = codePre.querySelector(".decl");
+  if (anchor) anchor.scrollIntoView({ block: "center" });
+});
+
+document.addEventListener("keydown", event => {
+  const tag = event.target && event.target.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  if (event.key === "Escape") { closeCode(); return; }
+  const key = event.key.toLowerCase();
+  if ((event.key === "Enter" || key === "c" || key === "с" || key === "к") && state.selection) {
+    event.preventDefault();
+    openCode(state.selection);
+  }
+});
+
+// ---------------------------------------------------------------- взаимодействие
+
+/** Что находится под курсором: кружок узла или его подпись-ссылка. */
+function pick(mx, my) {
+  let nearest = null, nearestDistance = Infinity;
+  for (const node of state.activeNodes.values()) {
+    const point = toScreen(node);
+    const distance = Math.hypot(point.x - mx, point.y - my);
+    if (distance <= radiusOf(node) + 6 && distance < nearestDistance) { nearest = node; nearestDistance = distance; }
+  }
+
+  if (nearest) return { node: nearest, onLabel: false };
+
+  // Подписи могут перекрываться: берём ту, чей узел ближе к точке клика —
+  // это ровно та подпись, по которой визуально щёлкнули.
+  let labelNode = null, labelDistance = Infinity;
+  for (const node of state.activeNodes.values()) {
+    const box = node.labelBox;
+    if (!box || mx < box.x || mx > box.x + box.w || my < box.y || my > box.y + box.h) continue;
+    const point = toScreen(node);
+    const distance = Math.hypot(point.x - mx, point.y - my);
+    if (distance < labelDistance) { labelNode = node; labelDistance = distance; }
+  }
+
+  return labelNode ? { node: labelNode, onLabel: true } : null;
+}
+
+canvas.addEventListener("mousedown", event => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = event.clientX - rect.left, my = event.clientY - rect.top;
+  const hit = pick(mx, my);
+  if (hit) state.drag = { id: hit.node.id, dx: hit.node.x - (mx - state.view.ox) / state.view.scale, dy: hit.node.y - (my - state.view.oy) / state.view.scale };
+  else { state.panning = { mx, my, ox: state.view.ox, oy: state.view.oy }; canvas.classList.add("dragging"); }
+});
+
+canvas.addEventListener("mousemove", event => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = event.clientX - rect.left, my = event.clientY - rect.top;
+  if (state.drag) {
+    const node = state.nodes.get(state.drag.id);
+    node.x = (mx - state.view.ox) / state.view.scale - state.drag.dx;
+    node.y = (my - state.view.oy) / state.view.scale - state.drag.dy;
+    render();
+    return;
+  }
+  if (state.panning) {
+    state.view.ox = state.panning.ox + (mx - state.panning.mx);
+    state.view.oy = state.panning.oy + (my - state.panning.my);
+    render();
+    return;
+  }
+
+  const hit = pick(mx, my);
+  const id = hit ? hit.node.id : null;
+  const labelId = hit && hit.onLabel ? hit.node.id : null;
+  if (id !== state.hover || labelId !== state.hoverLabel) {
+    state.hover = id;
+    state.hoverLabel = labelId;
+    render();
+  }
+
+  canvas.style.cursor = labelId && state.mode === "server" ? "pointer" : "grab";
+  canvas.title = hit ? hit.node.id : "";
+});
+
+window.addEventListener("mouseup", () => { state.drag = null; state.panning = null; canvas.classList.remove("dragging"); });
+
+canvas.addEventListener("click", event => {
+  const rect = canvas.getBoundingClientRect();
+  const hit = pick(event.clientX - rect.left, event.clientY - rect.top);
+  if (!hit) return;
+  selectNode(hit.node.id);
+  // Подпись узла — ссылка: клик по ней открывает код в панели снизу.
+  if (hit.onLabel) openCode(hit.node.id);
+});
+
+canvas.addEventListener("dblclick", event => {
+  const rect = canvas.getBoundingClientRect();
+  const hit = pick(event.clientX - rect.left, event.clientY - rect.top);
+  if (hit) expand(hit.node.id, false);
+});
+
+canvas.addEventListener("wheel", event => {
+  event.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mx = event.clientX - rect.left, my = event.clientY - rect.top;
+  const factor = event.deltaY < 0 ? 1.15 : 1 / 1.15;
+  const scale = Math.max(0.05, Math.min(8, state.view.scale * factor));
+  state.view.ox = mx - (mx - state.view.ox) * (scale / state.view.scale);
+  state.view.oy = my - (my - state.view.oy) * (scale / state.view.scale);
+  state.view.scale = scale;
+  render();
+}, { passive: false });
+
+document.getElementById("fit").addEventListener("click", fit);
+document.getElementById("clear").addEventListener("click", clearGraph);
+document.getElementById("layout").addEventListener("change", relayout);
+for (const id of ["depth", "dir-in", "dir-out", "max"]) {
+  document.getElementById(id).addEventListener("change", () => { if (state.selection) expand(state.selection, true); else relayout(); });
+}
+for (const id of ["e-Calls", "e-UsesMetadata", "e-References", "e-Contains", "e-Defines", ...NODE_KIND_NAMES.map(k => "n-" + k)]) {
+  document.getElementById(id).addEventListener("change", () => {
+    refreshActive();
+    if (state.selection) expand(state.selection, true); else { relayout(); render(); }
+  });
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+window.addEventListener("resize", resize);
+resize();
+
+if (payload && payload.center) selectNode(payload.center);
+
+// Ссылку можно передать коллеге: /?id=<идентификатор узла> сразу раскрывает нужный узел,
+// а /?id=...&code=1 дополнительно открывает панель с его кодом.
+const query = new URLSearchParams(location.search);
+const requested = query.get("id");
+if (requested && state.mode === "server") focusNode(requested);
+if (query.get("code") === "1" || query.get("code") === "full") {
+  const target = requested || (payload && payload.center);
+  if (target) openCode(target, query.get("code") === "full");
+}
+
+relayout();
+loadStats();
+loop();
+</script>
+</body>
+</html>

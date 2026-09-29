@@ -1,0 +1,20 @@
+## Каталоги сборки
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+*.user
+*.suo
+
+## Rider / Visual Studio
+.idea/
+.vs/
+*.sln.iml
+
+## Результаты разбора
+*.dot
+graph.json
+
+## Выгрузка 1С (тяжёлые данные, в репозиторий не попадают)
+1c_files/

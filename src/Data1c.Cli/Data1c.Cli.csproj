@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <RootNamespace>Data1c.Cli</RootNamespace>
+        <AssemblyName>data1c</AssemblyName>
+        <Description>Консольная реализация библиотеки Data1c.Core.</Description>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Data1c.Core\Data1c.Core.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <EmbeddedResource Include="Viewer\index.html" />
+    </ItemGroup>
+
+</Project>

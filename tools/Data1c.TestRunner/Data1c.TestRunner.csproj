@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <RootNamespace>Data1c.TestRunner</RootNamespace>
+        <AssemblyName>data1c-test</AssemblyName>
+        <Description>Минимальный раннер тестов: в этом окружении dotnet test не может запустить testhost.</Description>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="xunit" Version="2.9.3" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\tests\Data1c.Tests\Data1c.Tests.csproj" />
+    </ItemGroup>
+
+</Project>
