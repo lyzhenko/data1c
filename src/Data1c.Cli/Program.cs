@@ -5,6 +5,7 @@ using System.Text;
 using Data1c.Core.Analysis;
 using Data1c.Core.Dump;
 using Data1c.Core.Graph;
+using Data1c.Core.Platform;
 
 namespace Data1c.Cli;
 
@@ -30,6 +31,7 @@ internal static class Program
                 "scan" => RunScan(options),
                 "stats" => RunStats(options),
                 "view" => RunView(options),
+                "platform" => RunPlatform(options),
                 _ => Fail($"Неизвестная команда «{args[0]}». Запустите: data1c help"),
             };
         }
@@ -74,6 +76,102 @@ internal static class Program
     }
 
     /// <summary>
+    /// Показывает модель платформы из установленной 1С: найденные версии и справочные файлы,
+    /// поиск по синтакс-помощнику или тему целиком.
+    /// </summary>
+    private static int RunPlatform(CliOptions options)
+    {
+        Version? preferred = null;
+        if (options.PlatformVersion is { } versionText)
+        {
+            if (!Version.TryParse(versionText, out var parsed))
+            {
+                return Fail($"Не разобран номер версии «{versionText}»: ожидается вид 8.3.27.2214.");
+            }
+
+            preferred = parsed;
+        }
+
+        var source = new FileSystemPlatformSource();
+        var index = new PlatformHelpIndex(source, new PlatformHelpOptions { PreferredVersion = preferred });
+
+        WriteLine($"Источник:   {index.DisplayName}");
+
+        // Позиционный аргумент команды — имя темы или поисковый запрос.
+        var topicName = options.PlatformTopic;
+        var query = options.PlatformSearch;
+        if (topicName is null && query is null && options.Path is { } argument)
+        {
+            topicName = argument;
+            query = argument;
+        }
+
+        if (topicName is { } name)
+        {
+            var topic = index.Find(name) ?? index.Search(name, 1).FirstOrDefault();
+            if (topic is null && query is null)
+            {
+                return Fail($"Тема «{name}» не найдена в справке платформы.");
+            }
+
+            if (topic is not null && options.PlatformSearch is null)
+            {
+                WriteLine($"Тема:       {topic.Title}");
+                WriteLine($"Путь темы:  {topic.Name}");
+                WriteLine($"Версия:     {topic.Version} ({topic.Kind})");
+                WriteLine($"Файл:       {topic.Path}");
+                WriteLine(string.Empty);
+                WriteLine(topic.Text);
+                return 0;
+            }
+        }
+
+        if (query is { } text)
+        {
+            var results = index.Search(text, Math.Max(1, options.Top));
+            WriteLine($"Платформа:  {Describe(index.Version)}");
+            WriteLine($"Тем:        {N(index.TopicCount)}");
+            WriteLine($"Поиск:      «{text}» — найдено {N(results.Count)}");
+            WriteLine(string.Empty);
+            foreach (var topic in results)
+            {
+                WriteLine(topic.Title);
+                WriteLine($"    тема: {topic.Name}");
+                WriteLine("    " + (topic.Text.Length > 240 ? topic.Text[..240] + "…" : topic.Text));
+            }
+
+            return results.Count > 0 ? 0 : 1;
+        }
+
+        WriteLine($"Платформа:  {Describe(index.Version)}");
+        WriteLine($"Тем:        {N(index.TopicCount)}");
+        if (index.TopicCount > 0)
+        {
+            WriteLine($"Файлы:      {string.Join(", ", index.Installation!.Files.Select(static f => $"{Path.GetFileName(f.RelativePath)} ({f.Kind})"))}");
+        }
+
+        WriteLine(string.Empty);
+        WriteLine("Установки:");
+        foreach (var installation in index.Installations)
+        {
+            WriteLine($"  {installation.Version}  {installation.RootPath}");
+            foreach (var file in installation.Files)
+            {
+                WriteLine($"    {file.RelativePath} — {file.Size / 1024.0 / 1024.0:F1} МБ");
+            }
+        }
+
+        foreach (var warning in index.Warnings)
+        {
+            WriteLine("Предупреждение: " + warning);
+        }
+
+        return index.IsAvailable ? 0 : 1;
+    }
+
+    private static string Describe(Version? version) => version?.ToString() ?? "не найдена";
+
+    /// <summary>
     /// Запускает интерактивный просмотрщик графа: по умолчанию — локальный сервер с поиском
     /// и раскрытием соседей, с ключом <c>--static</c> — самодостаточная страница с подграфом.
     /// </summary>
@@ -92,7 +190,15 @@ internal static class Program
         using var server = StartViewerServer(query, options, source);
         WriteLine(string.Empty);
         WriteLine($"Просмотрщик запущен: {server.Url}");
-        WriteLine("Остановить — Ctrl+C.");
+        WriteLine($"Процесс {Environment.ProcessId}. Остановить — Ctrl+C или: Get-Process data1c | Stop-Process");
+
+        if (IsRunningFromBuildOutput())
+        {
+            WriteLine(string.Empty);
+            WriteLine("ВНИМАНИЕ: просмотрщик запущен прямо из каталога сборки (bin). Пока он работает,");
+            WriteLine("dotnet build и Rider не смогут перезаписать эти файлы. Для длительной работы");
+            WriteLine(@"запускайте через tools\view.ps1 — он публикует сборку в artifacts\viewer.");
+        }
 
         if (options.Open)
         {
@@ -209,6 +315,17 @@ internal static class Program
         }
     }
 
+    /// <summary>
+    /// Признак того, что просмотрщик запущен из каталога сборки: такой процесс блокирует
+    /// пересборку проекта, поэтому о нём стоит предупредить.
+    /// </summary>
+    private static bool IsRunningFromBuildOutput()
+    {
+        var directory = AppContext.BaseDirectory;
+        return directory.Contains(@"\bin\", StringComparison.OrdinalIgnoreCase)
+            || directory.Contains("/bin/", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static void OpenBrowser(string target)
     {
         try
@@ -242,6 +359,7 @@ internal static class Program
         var analysisOptions = new AnalysisOptions
         {
             IncludeBsl = options.IncludeBsl,
+            PlatformSource = options.Platform ? new FileSystemPlatformSource() : null,
             MaxDegreeOfParallelism = options.MaxDop,
             Progress = progress,
             Metadata = new Data1c.Core.Metadata.MetadataReadOptions
@@ -286,6 +404,11 @@ internal static class Program
         WriteLine($"Процедуры:     {N(stats.Procedures)} процедур, {N(stats.Functions)} функций, всего {N(stats.Routines)}");
         WriteLine($"Граф:          {N(graph.NodeCount)} узлов, {N(graph.EdgeCount)} связей");
         WriteLine($"Внешние цели:  {N(graph.ExternalNodeCount)} узлов, {N(graph.UnresolvedEdgeCount)} связей без объекта в выгрузке");
+        if (result.Platform is { } platform)
+        {
+            var platformNodes = graph.NodesByKind.GetValueOrDefault("Platform");
+            WriteLine($"Платформа:     {Describe(platform.Version)}, тем {N(platform.TopicCount)}, узлов платформы {N(platformNodes)}");
+        }
 
         WriteLine(string.Empty);
         WriteLine("Узлы по типам: " + string.Join(", ", graph.NodesByKind.OrderByDescending(static p => p.Value).Select(static p => $"{p.Key}={N(p.Value)}")));
@@ -299,6 +422,20 @@ internal static class Program
             foreach (var (name, count) in top)
             {
                 WriteLine($"  {N(count),8}  {name}");
+            }
+        }
+
+        if (result.Platform is { TopicCount: > 0 })
+        {
+            var topPlatform = TopTargets(result.Graph, 8, GraphNodeKind.Platform);
+            if (topPlatform.Count > 0)
+            {
+                WriteLine(string.Empty);
+                WriteLine("Самые вызываемые методы платформы:");
+                foreach (var (name, count) in topPlatform)
+                {
+                    WriteLine($"  {N(count),8}  {name}");
+                }
             }
         }
 
@@ -321,7 +458,7 @@ internal static class Program
         WriteLine($"Время: {result.Duration:hh\\:mm\\:ss\\.ff}");
     }
 
-    private static List<(string Name, int Count)> TopTargets(DependencyGraph graph, int take)
+    private static List<(string Name, int Count)> TopTargets(DependencyGraph graph, int take, GraphNodeKind? kind = null)
     {
         var incoming = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var edge in graph.Edges)
@@ -334,10 +471,13 @@ internal static class Program
             incoming[edge.TargetId] = incoming.GetValueOrDefault(edge.TargetId) + 1;
         }
 
+        // Для отфильтрованного списка нужно просмотреть больше кандидатов: редкие типы узлов
+        // не попадают в общую верхушку.
+        var candidates = incoming.OrderByDescending(static p => p.Value).Take(kind is null ? take * 3 : take * 40);
         var result = new List<(string, int)>();
-        foreach (var (id, count) in incoming.OrderByDescending(static p => p.Value).Take(take * 3))
+        foreach (var (id, count) in candidates)
         {
-            if (!graph.TryGetNode(id, out var node) || node.IsExternal)
+            if (!graph.TryGetNode(id, out var node) || node.IsExternal || (kind is not null && node.Kind != kind))
             {
                 continue;
             }
@@ -423,7 +563,15 @@ internal static class Program
               data1c stats <каталог-выгрузки> [опции]     сводка по выгрузке и графу
               data1c scan  <каталог-выгрузки> [опции]     разобрать и сохранить граф
               data1c view  <каталог-выгрузки> [опции]     интерактивный просмотрщик графа
+              data1c platform [тема|запрос] [опции]       справка установленной платформы 1С (.hbk)
               data1c help                                 эта справка
+
+            Опции команды platform:
+              --search <текст>    найти темы справки по имени, заголовку и тексту
+              --topic <имя>       показать тему целиком (например, «Массив.Добавить»)
+              --version X.Y.Z.N   нужная версия платформы (по умолчанию — самая свежая)
+              --top N             сколько результатов показать (по умолчанию 20)
+              (без опций)         список установленных платформ и найденных справочных файлов
 
             Опции просмотрщика (view):
               --port N            порт локального сервера: 0 — любой свободный (по умолчанию 0);
@@ -446,12 +594,18 @@ internal static class Program
               --no-external       не создавать узлы для отсутствующих целей
               --nested            включить вложенные реквизиты и табличные части
               --role-rights       разбирать права ролей (Ext/Rights.xml), граф сильно растёт
+              --platform          подключить модель платформы: вызовы методов 1С получают
+                                  отдельный тип узла вместо безымянной внешней цели
               --dot-max-nodes N   ограничение числа узлов для формата dot (по умолчанию 500)
               --max-dop N         степень параллелизма (по умолчанию — число ядер)
               --quiet             без индикатора прогресса
 
             Примеры:
               data1c stats C:\dump\1c_files
+              data1c stats C:\dump\1c_files --platform
+              data1c platform
+              data1c platform "Массив.Добавить"
+              data1c platform --search "ТаблицаЗначений" --top 10
               data1c scan C:\dump\1c_files --out graph.json
               data1c view C:\dump\1c_files --open
               data1c view C:\dump\1c_files --sections CommonModules --no-routines --open
@@ -485,6 +639,21 @@ internal sealed record CliOptions
     public bool IncludeNested { get; init; }
 
     public bool RoleRights { get; init; }
+
+    /// <summary>Подключить модель платформы: неразрешённые вызовы проверяются по синтакс-помощнику.</summary>
+    public bool Platform { get; init; }
+
+    /// <summary>Поиск по справке платформы (команда platform).</summary>
+    public string? PlatformSearch { get; init; }
+
+    /// <summary>Тема справки платформы (команда platform).</summary>
+    public string? PlatformTopic { get; init; }
+
+    /// <summary>Нужная версия платформы (команда platform).</summary>
+    public string? PlatformVersion { get; init; }
+
+    /// <summary>Сколько результатов показывать.</summary>
+    public int Top { get; init; } = 20;
 
     public bool Quiet { get; init; }
 
@@ -582,6 +751,21 @@ internal sealed record CliOptions
                     break;
                 case "--role-rights":
                     options = options with { RoleRights = true };
+                    break;
+                case "--platform":
+                    options = options with { Platform = true };
+                    break;
+                case "--search":
+                    options = options with { PlatformSearch = Next(queue, arg) };
+                    break;
+                case "--topic":
+                    options = options with { PlatformTopic = Next(queue, arg) };
+                    break;
+                case "--version":
+                    options = options with { PlatformVersion = Next(queue, arg) };
+                    break;
+                case "--top":
+                    options = options with { Top = ParseInt(Next(queue, arg), arg) };
                     break;
                 case "--quiet":
                     options = options with { Quiet = true };

@@ -10,6 +10,9 @@ public enum GraphNodeKind
 
     /// <summary>Узел-заглушка для цели, которой нет в разобранной выгрузке.</summary>
     External,
+
+    /// <summary>Метод или свойство платформы 1С, подтверждённые справкой установленной версии.</summary>
+    Platform,
 }
 
 /// <summary>Тип связи между узлами.</summary>

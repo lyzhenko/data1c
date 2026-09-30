@@ -5,6 +5,7 @@ using Data1c.Core.Bsl;
 using Data1c.Core.Dump;
 using Data1c.Core.Graph;
 using Data1c.Core.Metadata;
+using Data1c.Core.Platform;
 
 namespace Data1c.Core.Analysis;
 
@@ -17,6 +18,12 @@ public sealed record AnalysisOptions
 
     /// <summary>Разбирать модули BSL.</summary>
     public bool IncludeBsl { get; init; } = true;
+
+    /// <summary>
+    /// Источник справки установленной платформы. Если задан, неразрешённые вызовы проверяются
+    /// по синтакс-помощнику и получают собственный тип узла вместо безымянной заглушки.
+    /// </summary>
+    public IPlatformSource? PlatformSource { get; init; }
 
     public int MaxDegreeOfParallelism { get; init; } = Environment.ProcessorCount;
 
@@ -47,7 +54,8 @@ public sealed record AnalysisResult(
     AnalysisStatistics Statistics,
     IReadOnlyList<string> Warnings,
     TimeSpan Duration,
-    string SourceName);
+    string SourceName,
+    PlatformHelpIndex? Platform = null);
 
 /// <summary>Точка входа библиотеки: разбирает выгрузку и строит граф зависимостей.</summary>
 public sealed class DumpAnalyzer
@@ -104,7 +112,8 @@ public sealed class DumpAnalyzer
             ? ParseModules(source, read.ModuleFiles, options, warnings, cancellationToken)
             : [];
 
-        var graph = new DependencyGraphBuilder().Build(read.Model, modules, options.Graph);
+        var platform = CreatePlatformIndex(options, warnings);
+        var graph = new DependencyGraphBuilder().Build(read.Model, modules, options.Graph, platform);
         stopwatch.Stop();
 
         var statistics = new AnalysisStatistics(
@@ -128,7 +137,25 @@ public sealed class DumpAnalyzer
             statistics,
             warnings,
             stopwatch.Elapsed,
-            source.DisplayName);
+            source.DisplayName,
+            platform);
+    }
+
+    /// <summary>Загружает модель платформы, если задан источник справки.</summary>
+    private static PlatformHelpIndex? CreatePlatformIndex(AnalysisOptions options, List<string> warnings)
+    {
+        if (options.PlatformSource is null)
+        {
+            return null;
+        }
+
+        var index = new PlatformHelpIndex(options.PlatformSource);
+        foreach (var warning in index.Warnings)
+        {
+            warnings.Add("Модель платформы: " + warning);
+        }
+
+        return index;
     }
 
     private List<BslModuleInfo> ParseModules(

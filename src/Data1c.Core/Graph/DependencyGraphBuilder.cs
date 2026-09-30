@@ -1,5 +1,6 @@
 using Data1c.Core.Bsl;
 using Data1c.Core.Metadata;
+using Data1c.Core.Platform;
 
 namespace Data1c.Core.Graph;
 
@@ -16,15 +17,22 @@ public sealed class DependencyGraphBuilder
     private readonly Dictionary<string, string> _moduleByOwner = new(StringComparer.Ordinal);
 
     private DependencyGraphOptions _options = new();
+    private PlatformHelpIndex? _platform;
 
+    /// <summary>
+    /// Строит граф. Если передан <paramref name="platform"/>, неразрешённые вызовы проверяются
+    /// по справке платформы и получают собственный тип узла вместо безымянной заглушки.
+    /// </summary>
     public DependencyGraph Build(
         MdObjectModel metadata,
         IReadOnlyList<BslModuleInfo> modules,
-        DependencyGraphOptions? options = null)
+        DependencyGraphOptions? options = null,
+        PlatformHelpIndex? platform = null)
     {
         ArgumentNullException.ThrowIfNull(metadata);
         ArgumentNullException.ThrowIfNull(modules);
         _options = options ?? new DependencyGraphOptions();
+        _platform = platform is { IsAvailable: true } ? platform : null;
 
         _nodes.Clear();
         _edges.Clear();
@@ -273,6 +281,12 @@ public sealed class DependencyGraphBuilder
                 return localTarget;
             }
 
+            // Глобальная функция платформы: СтрНайти, ЧислоВСтроку, ТипЗнч и т. п.
+            if (_platform?.ContainsMember(call.Method) == true)
+            {
+                return AddPlatformNode(call.Method);
+            }
+
             return _options.IncludeExternalNodes
                 ? AddExternalCallNode($"{module.OwnerId ?? module.Path}.{call.Method}")
                 : null;
@@ -291,6 +305,12 @@ public sealed class DependencyGraphBuilder
             return ownerTarget;
         }
 
+        // Метод платформы: Массив.Добавить, ТаблицаЗначений.Свернуть и т. п.
+        if (_platform?.ContainsMember(call.Callee) == true)
+        {
+            return AddPlatformNode(call.Callee);
+        }
+
         if (_options.IncludeExternalNodes)
         {
             // Квалификатор может быть переменной (Объект.Метод), а может быть общим модулем
@@ -299,6 +319,27 @@ public sealed class DependencyGraphBuilder
         }
 
         return null;
+    }
+
+    /// <summary>Создаёт узел метода платформы, подтверждённый справкой установленной версии.</summary>
+    private string AddPlatformNode(string callee)
+    {
+        var id = "platform:" + callee;
+        var topic = _platform?.Find(callee);
+        AddNode(new GraphNode(
+            id,
+            GraphNodeKind.Platform,
+            callee,
+            Tags: topic is null
+                ? null
+                : new Dictionary<string, string?>(StringComparer.Ordinal)
+                {
+                    ["platformVersion"] = topic.Version.ToString(),
+                    ["platformTopic"] = topic.Name,
+                    ["platformTitle"] = topic.Title,
+                }));
+
+        return id;
     }
 
     private string AddExternalCallNode(string callee)

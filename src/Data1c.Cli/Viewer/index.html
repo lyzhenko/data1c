@@ -101,6 +101,7 @@
     <label><input type="checkbox" id="n-Module" checked> модули</label>
     <label><input type="checkbox" id="n-Routine" checked> процедуры</label>
     <label><input type="checkbox" id="n-External"> внешние</label>
+    <label><input type="checkbox" id="n-Platform" checked title="Методы и свойства платформы 1С, подтверждённые справкой установленной версии"> платформа</label>
     <label><input type="checkbox" id="n-Configuration" title="У конфигурации десятки тысяч детей: при раскрытии она затапливает картину"> конфигурация</label>
     <span class="sep"></span>
     <span>макс. узлов</span>
@@ -137,11 +138,11 @@
 <script>
 "use strict";
 
-const NODE_COLORS = { Configuration: "#1f4e79", MetadataObject: "#2e7d32", Module: "#ef6c00", Routine: "#1565c0", External: "#9e9e9e" };
+const NODE_COLORS = { Configuration: "#1f4e79", MetadataObject: "#2e7d32", Module: "#ef6c00", Routine: "#1565c0", External: "#9e9e9e", Platform: "#5e35b1" };
 const EDGE_COLORS = { Calls: "#c62828", UsesMetadata: "#6a1b9a", References: "#2e7d32", Contains: "#b9bfc7", Defines: "#ef6c00" };
 const EDGE_LABELS = { Calls: "вызов", UsesMetadata: "обращение", References: "ссылка", Contains: "вложенность", Defines: "объявление" };
-const NODE_LABELS = { Configuration: "конфигурация", MetadataObject: "объект", Module: "модуль", Routine: "процедура", External: "внешний" };
-const NODE_KIND_NAMES = ["MetadataObject", "Module", "Routine", "External", "Configuration"];
+const NODE_LABELS = { Configuration: "конфигурация", MetadataObject: "объект", Module: "модуль", Routine: "процедура", External: "внешний", Platform: "метод платформы" };
+const NODE_KIND_NAMES = ["MetadataObject", "Module", "Routine", "External", "Platform", "Configuration"];
 
 const payload = JSON.parse(document.getElementById("graph-data").textContent || "null");
 const state = {
@@ -679,6 +680,7 @@ function shouldLabel(node, zoom) {
   if (node.id === state.selection || node.id === state.hover) return true;
   if (node.kind === "Routine") return zoom > 1.4 || node.activeDegree > 4;
   if (node.kind === "External") return zoom > 1.6;
+  if (node.kind === "Platform") return zoom > 1.2;
   return zoom > 0.55;
 }
 

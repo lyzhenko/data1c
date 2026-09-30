@@ -295,6 +295,7 @@ public static class GraphDotWriter
         GraphNodeKind.MetadataObject => "#2e7d32",
         GraphNodeKind.Module => "#ef6c00",
         GraphNodeKind.Routine => "#1565c0",
+        GraphNodeKind.Platform => "#5e35b1",
         _ => "#9e9e9e",
     };
 
