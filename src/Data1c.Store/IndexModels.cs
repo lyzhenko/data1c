@@ -1,0 +1,81 @@
+namespace Data1c.Store;
+
+/// <summary>Строка таблицы узлов.</summary>
+public sealed record NodeRow(
+    string Id,
+    string Kind,
+    string Name,
+    string? SourcePath = null,
+    string? MetadataKind = null,
+    bool IsExternal = false,
+    string? PlatformTitle = null,
+    string? PlatformVersion = null);
+
+/// <summary>Строка таблицы связей.</summary>
+public sealed record EdgeRow(string SourceId, string TargetId, string Kind, int? Line = null, string? Detail = null);
+
+/// <summary>Процедура или функция в индексе.</summary>
+public sealed record SymbolRow(
+    long Id,
+    string NodeId,
+    string ModulePath,
+    string? OwnerId,
+    string Name,
+    string Kind,
+    bool IsExport,
+    int StartLine,
+    int EndLine,
+    string? Region = null,
+    string? Parameters = null,
+    string? CommentHead = null);
+
+/// <summary>Вложенный объект метаданных: реквизит, табличная часть, форма, макет, команда.</summary>
+public sealed record MetadataItemRow(
+    string ObjectId,
+    string Kind,
+    string Name,
+    string? TypeInfo = null,
+    string? ParentId = null);
+
+/// <summary>Обращение к объекту метаданных: из кода, из текста запроса, тип реквизита, право роли.</summary>
+public sealed record MetadataRefRow(
+    string SourceId,
+    string TargetId,
+    string Context,
+    int? Line = null,
+    string? Detail = null);
+
+/// <summary>Результат обхода связей в базе.</summary>
+public sealed record ReachRow(string Id, int Depth);
+
+/// <summary>Сводка по индексу.</summary>
+public sealed record IndexStatistics(
+    long Nodes,
+    long Edges,
+    long Symbols,
+    long Calls,
+    long MetadataObjects,
+    long MetadataItems,
+    long MetadataRefs,
+    long Files,
+    long PlatformNodes,
+    long ExternalNodes,
+    string? DumpPath,
+    DateTimeOffset? IndexedAt)
+{
+    public override string ToString() =>
+        $"узлов {Nodes:N0}, связей {Edges:N0}, символов {Symbols:N0}, вызовов {Calls:N0}, " +
+        $"объектов метаданных {MetadataObjects:N0}, реквизитов {MetadataItems:N0}, обращений {MetadataRefs:N0}";
+}
+
+/// <summary>Итог записи индекса.</summary>
+public sealed record IndexWriteResult(
+    int Nodes,
+    int Edges,
+    int Symbols,
+    int Calls,
+    int MetadataObjects,
+    int MetadataItems,
+    int MetadataRefs,
+    int Files,
+    TimeSpan Duration);

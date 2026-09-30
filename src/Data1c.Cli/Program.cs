@@ -7,6 +7,7 @@ using Data1c.Core.Dump;
 using Data1c.Core.Graph;
 using Data1c.Core.Platform;
 using Data1c.FileSystem;
+using Data1c.Store;
 
 namespace Data1c.Cli;
 
@@ -31,6 +32,7 @@ internal static class Program
             {
                 "scan" => RunScan(options),
                 "stats" => RunStats(options),
+                "index" => RunIndex(options),
                 "view" => RunView(options),
                 "platform" => RunPlatform(options),
                 _ => Fail($"Неизвестная команда «{args[0]}». Запустите: data1c help"),
@@ -73,6 +75,47 @@ internal static class Program
         var (source, analyzer, progress) = Prepare(options);
         var result = Analyze(analyzer, source, options, progress);
         PrintSummary(result);
+        return 0;
+    }
+
+    /// <summary>
+    /// Разбирает выгрузку и сохраняет результат в SQLite-индекс: узлы, связи, символы, метаданные
+    /// и полнотекстовые таблицы. По умолчанию индекс лежит в <c>&lt;выгрузка&gt;/.data1c/index.db</c>.
+    /// </summary>
+    private static int RunIndex(CliOptions options)
+    {
+        if (options.Path is null)
+        {
+            return Fail("Укажите каталог выгрузки: data1c index <каталог-выгрузки> [--out индекс.db]");
+        }
+
+        var (source, analyzer, progress) = Prepare(options);
+        var result = Analyze(analyzer, source, options, progress);
+
+        var path = options.Output ?? Path.Combine(options.Path, ".data1c", "index.db");
+        if (File.Exists(path) && !SqliteIndex.LooksLikeIndex(path))
+        {
+            WriteLine($"Индекс «{path}» несовместим с текущей схемой — пересобираю заново.");
+            foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+            {
+                var file = path + suffix;
+                if (File.Exists(file))
+                {
+                    File.Delete(file);
+                }
+            }
+        }
+
+        using var index = SqliteIndex.Open(path);
+        var write = new IndexWriter(index).Write(source, result);
+        var statistics = new IndexReader(index).GetStatistics();
+
+        WriteLine(string.Empty);
+        WriteLine($"Записано:      {write.Nodes:N0} узлов, {write.Edges:N0} связей, {write.Symbols:N0} символов, {write.Calls:N0} вызовов");
+        WriteLine($"Метаданные:    {write.MetadataObjects:N0} объектов, {write.MetadataItems:N0} вложенных, {write.MetadataRefs:N0} обращений");
+        WriteLine($"Время записи:  {write.Duration:hh\\:mm\\:ss\\.ff}");
+        WriteLine($"В индексе:     {statistics}");
+        WriteLine($"Файл индекса:  {Path.GetFullPath(path)} ({new FileInfo(path).Length / 1024.0 / 1024.0:F1} МБ)");
         return 0;
     }
 
@@ -563,9 +606,14 @@ internal static class Program
             Использование:
               data1c stats <каталог-выгрузки> [опции]     сводка по выгрузке и графу
               data1c scan  <каталог-выгрузки> [опции]     разобрать и сохранить граф
+              data1c index <каталог-выгрузки> [опции]     разобрать и сохранить SQLite-индекс
               data1c view  <каталог-выгрузки> [опции]     интерактивный просмотрщик графа
               data1c platform [тема|запрос] [опции]       справка установленной платформы 1С (.hbk)
               data1c help                                 эта справка
+
+            Опции команды index:
+              --out <файл>        куда положить индекс (по умолчанию <выгрузка>/.data1c/index.db)
+              остальные опции разбора: --platform, --sections, --no-bsl, --no-calls, --max-dop, --quiet
 
             Опции команды platform:
               --search <текст>    найти темы справки по имени, заголовку и тексту

@@ -10,6 +10,7 @@
     <ItemGroup>
         <ProjectReference Include="..\Data1c.Core\Data1c.Core.csproj" />
         <ProjectReference Include="..\Data1c.FileSystem\Data1c.FileSystem.csproj" />
+        <ProjectReference Include="..\Data1c.Store\Data1c.Store.csproj" />
     </ItemGroup>
 
     <ItemGroup>

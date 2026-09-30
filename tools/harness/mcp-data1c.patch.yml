@@ -20,7 +20,7 @@
         transport: stdio
         command: 'C:\Program Files\dotnet\dotnet.exe'
         args:
-          - 'D:\dev\data1c\src\Data1c.Mcp\bin\Release\net10.0\Data1c.Mcp.dll'
+          - 'C:\Users\alexa\RiderProjects\Data1C\src\Data1c.Mcp\bin\Release\net10.0\Data1c.Mcp.dll'
           - '--platform'
         # Разбор большой выгрузки на первом запросе занимает десятки секунд.
         toolCallTimeoutMs: 300000

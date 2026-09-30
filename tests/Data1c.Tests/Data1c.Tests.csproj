@@ -15,6 +15,7 @@
     <ItemGroup>
         <ProjectReference Include="..\..\src\Data1c.Core\Data1c.Core.csproj" />
         <ProjectReference Include="..\..\src\Data1c.Mcp\Data1c.Mcp.csproj" />
+        <ProjectReference Include="..\..\src\Data1c.Store\Data1c.Store.csproj" />
     </ItemGroup>
 
 </Project>
