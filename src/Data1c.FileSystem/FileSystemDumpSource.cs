@@ -1,6 +1,6 @@
 using Data1c.Core.Dump;
 
-namespace Data1c.Cli;
+namespace Data1c.FileSystem;
 
 /// <summary>Выгрузка, лежащая в каталоге файловой системы.</summary>
 public sealed class FileSystemDumpSource : IDumpSource

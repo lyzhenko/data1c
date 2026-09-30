@@ -1,0 +1,92 @@
+using System.Text;
+
+namespace Data1c.Mcp;
+
+/// <summary>
+/// Точка входа MCP-сервера. Сервер запускается MCP-клиентом (например, harness) как дочерний процесс:
+/// stdin и stdout заняты протоколом, диагностика идёт в stderr.
+/// </summary>
+internal static class Program
+{
+    private static int Main(string[] args)
+    {
+        var parsed = ServerOptions.Parse(args);
+        if (parsed.Help)
+        {
+            Console.Error.WriteLine(ServerOptions.Usage);
+            return 0;
+        }
+
+        if (parsed.Options is null)
+        {
+            Console.Error.WriteLine("data1c-mcp: " + parsed.Error);
+            Console.Error.WriteLine();
+            Console.Error.WriteLine(ServerOptions.Usage);
+            return 2;
+        }
+
+        var options = parsed.Options;
+        using var stdin = new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false));
+        using var stdout = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = false };
+        using var stderr = new StreamWriter(Console.OpenStandardError(), new UTF8Encoding(false)) { AutoFlush = true };
+        using var cancellation = new CancellationTokenSource();
+
+        Console.CancelKeyPress += (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            cancellation.Cancel();
+        };
+
+        var session = new AnalysisSession(new AnalysisRequest
+        {
+            DumpPath = options.DumpPath ?? string.Empty,
+            IncludeBsl = options.IncludeBsl,
+            IncludeCalls = options.IncludeCalls,
+            Sections = options.Sections,
+            MaxDegreeOfParallelism = options.MaxDegreeOfParallelism,
+            PlatformHelp = options.PlatformHelp,
+            PlatformLocale = options.PlatformLocale,
+            PlatformRoots = options.PlatformRoots,
+        });
+
+        stderr.WriteLine($"data1c-mcp {McpServer.ServerVersion}: выгрузка {session.DumpPath}; состояние: {session.State}");
+        if (!options.Lazy && session.IsOpen)
+        {
+            StartInBackground(session, stderr);
+        }
+
+        var server = new McpServer(new ToolCatalog(session), stdin, stdout, stderr);
+        try
+        {
+            server.RunAsync(cancellation.Token).GetAwaiter().GetResult();
+        }
+        catch (Exception exception)
+        {
+            stderr.WriteLine("data1c-mcp: сбой сервера: " + exception);
+            return 1;
+        }
+
+        stderr.WriteLine("data1c-mcp: stdin закрыт, сервер остановлен");
+        return 0;
+    }
+
+    /// <summary>
+    /// Разбор стартует сразу: пока агент читает задачу, граф уже строится. Ошибку разбора
+    /// не роняем — её покажет инструмент status, а сам сервер продолжит отвечать.
+    /// </summary>
+    private static void StartInBackground(AnalysisSession session, TextWriter log)
+    {
+        try
+        {
+            _ = session.Start().ContinueWith(
+                task => log.WriteLine("data1c-mcp: разбор не удался: " + task.Exception?.GetBaseException().Message),
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+        }
+        catch (ToolException exception)
+        {
+            log.WriteLine("data1c-mcp: " + exception.Message);
+        }
+    }
+}

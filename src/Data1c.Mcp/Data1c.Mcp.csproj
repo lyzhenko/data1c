@@ -2,18 +2,14 @@
 
     <PropertyGroup>
         <OutputType>Exe</OutputType>
-        <RootNamespace>Data1c.Cli</RootNamespace>
-        <AssemblyName>data1c</AssemblyName>
-        <Description>Консольная реализация библиотеки Data1c.Core.</Description>
+        <RootNamespace>Data1c.Mcp</RootNamespace>
+        <AssemblyName>Data1c.Mcp</AssemblyName>
+        <Description>MCP-сервер (stdio) над библиотекой Data1c.Core: навигация по выгрузке конфигурации 1С для ИИ-агентов.</Description>
     </PropertyGroup>
 
     <ItemGroup>
         <ProjectReference Include="..\Data1c.Core\Data1c.Core.csproj" />
         <ProjectReference Include="..\Data1c.FileSystem\Data1c.FileSystem.csproj" />
-    </ItemGroup>
-
-    <ItemGroup>
-        <EmbeddedResource Include="Viewer\index.html" />
     </ItemGroup>
 
 </Project>

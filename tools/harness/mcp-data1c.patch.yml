@@ -1,0 +1,27 @@
+# Подключение MCP-сервера Data1c.Mcp к harness (плагин @deepseek-ai/dsh-mcp-client).
+#
+# Этот фрагмент — элемент массива из файла патча профиля:
+#   %USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml   (приложение-оболочка)
+#   %USERPROFILE%\.dsh\profiles\web\cordis.patch.yml       (режим dsh web)
+# Вставьте его в конец файла (в web-профиле замените им пустой массив `[]`).
+# После правки профиль нужно перечитать: перезапустите harness.
+#
+# Инструменты сервера появятся у модели как mcp__data1c__<имя>:
+#   status, open, search, node, neighbors, code, metadata, platform, check, reload.
+#
+# Путь к выгрузке здесь намеренно не указан: агент открывает нужную выгрузку
+# инструментом open, поэтому одна и та же строка работает для любого проекта.
+# Чтобы зафиксировать конкретную выгрузку, добавьте в args: "--dump", "<путь>".
+- insert:
+    - id: mcp-data1c
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: data1c
+        transport: stdio
+        command: 'C:\Program Files\dotnet\dotnet.exe'
+        args:
+          - 'D:\dev\data1c\src\Data1c.Mcp\bin\Release\net10.0\Data1c.Mcp.dll'
+          - '--platform'
+        # Разбор большой выгрузки на первом запросе занимает десятки секунд.
+        toolCallTimeoutMs: 300000
+        failOnStartupError: false

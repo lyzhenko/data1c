@@ -6,6 +6,7 @@ using Data1c.Core.Analysis;
 using Data1c.Core.Dump;
 using Data1c.Core.Graph;
 using Data1c.Core.Platform;
+using Data1c.FileSystem;
 
 namespace Data1c.Cli;
 

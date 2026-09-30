@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <RootNamespace>Data1c.FileSystem</RootNamespace>
+        <AssemblyName>Data1c.FileSystem</AssemblyName>
+        <Description>Реализации абстракций Data1c.Core поверх файловой системы: каталог выгрузки конфигурации и установленные платформы 1С.</Description>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Data1c.Core\Data1c.Core.csproj" />
+    </ItemGroup>
+
+</Project>

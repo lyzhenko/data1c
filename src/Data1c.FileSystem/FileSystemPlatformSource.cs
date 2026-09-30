@@ -1,6 +1,6 @@
 using Data1c.Core.Platform;
 
-namespace Data1c.Cli;
+namespace Data1c.FileSystem;
 
 /// <summary>
 /// Справочные файлы .hbk установленных платформ 1С на диске.
