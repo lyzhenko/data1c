@@ -262,7 +262,7 @@ public sealed class ToolCatalog
             {
                 var query = await QueryAsync(token);
                 var id = arguments.RequireString("id");
-                var node = query.Graph.FindNode(id) ?? throw new ToolException(
+                var node = query.FindNode(id) ?? throw new ToolException(
                     $"Узел «{id}» не найден. Уточните идентификатор инструментом search.");
 
                 path = node.SourcePath;
@@ -475,7 +475,7 @@ public sealed class ToolCatalog
             {
                 var query = await QueryAsync(token);
                 var id = arguments.RequireString("id");
-                var node = query.Graph.FindNode(id) ?? throw new ToolException(
+                var node = query.FindNode(id) ?? throw new ToolException(
                     $"Узел «{id}» не найден. Уточните идентификатор инструментом search.");
 
                 path = node.SourcePath ?? throw new ToolException($"У узла «{id}» нет файла модуля.");
@@ -559,6 +559,23 @@ public sealed class ToolCatalog
             state = Session.State,
             running = Session.IsRunning,
             completedAt = Session.CompletedAt,
+            indexMode = Session.IsIndexMode,
+            indexReady = Session.IsIndexReady,
+            indexPath = Session.IndexPath,
+            indexStatistics = Session.GetIndexStatistics() is { } index
+                ? new
+                {
+                    nodes = index.Nodes,
+                    edges = index.Edges,
+                    symbols = index.Symbols,
+                    metadataObjects = index.MetadataObjects,
+                    metadataItems = index.MetadataItems,
+                    metadataRefs = index.MetadataRefs,
+                    platformNodes = index.PlatformNodes,
+                    externalNodes = index.ExternalNodes,
+                    indexedAt = index.IndexedAt,
+                }
+                : null,
             durationSeconds = result is null ? (double?)null : Math.Round(result.Duration.TotalSeconds, 1),
             source = result?.SourceName,
             statistics = result is null
@@ -580,8 +597,8 @@ public sealed class ToolCatalog
         });
     }
 
-    private async Task<GraphQueryService> QueryAsync(CancellationToken cancellationToken) =>
-        new((await AnalysisAsync(cancellationToken)).Graph);
+    private Task<IGraphQuery> QueryAsync(CancellationToken cancellationToken) =>
+        Session.QueryAsync(cancellationToken);
 
     private async Task<AnalysisResult> AnalysisAsync(CancellationToken cancellationToken)
     {
@@ -634,9 +651,9 @@ public sealed class ToolCatalog
         tags = node.Tags is { Count: > 0 } ? node.Tags : null,
     };
 
-    private static object EdgeView(GraphEdge edge, string otherId, GraphQueryService query)
+    private static object EdgeView(GraphEdge edge, string otherId, IGraphQuery query)
     {
-        var other = query.Graph.FindNode(otherId);
+        var other = query.FindNode(otherId);
         return new
         {
             kind = edge.Kind.ToString(),

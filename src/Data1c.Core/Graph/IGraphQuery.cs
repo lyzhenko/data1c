@@ -25,4 +25,7 @@ public interface IGraphQuery
 
     /// <summary>Карточка узла: сам узел и связи в обе стороны.</summary>
     GraphNodeDetails? GetNode(string? id);
+
+    /// <summary>Узел по идентификатору без загрузки связей.</summary>
+    GraphNode? FindNode(string? id);
 }

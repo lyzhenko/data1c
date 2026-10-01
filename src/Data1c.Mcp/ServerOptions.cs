@@ -42,6 +42,15 @@ public sealed record ServerOptions
     /// <summary>Не начинать разбор при старте: первый вызов инструмента запустит его сам.</summary>
     public bool Lazy { get; init; }
 
+    /// <summary>
+    /// Путь к файлу SQLite-индекса. По умолчанию — <c>&lt;выгрузка&gt;/.data1c/index.db</c>:
+    /// если индекса нет, сервер соберёт его один раз и дальше будет только читать.
+    /// </summary>
+    public string? IndexPath { get; init; }
+
+    /// <summary>Отвечать из индекса. Выключено — работает разбор в память на каждый запуск.</summary>
+    public bool UseIndex { get; init; } = true;
+
     public const string Usage = """
         Data1c.Mcp — MCP-сервер над библиотекой Data1c.Core (stdio, JSON-RPC 2.0).
 
@@ -51,6 +60,9 @@ public sealed record ServerOptions
         Ключи:
           --dump <путь>          каталог выгрузки конфигурации 1С; можно не задавать и открыть
                                  выгрузку позже инструментом open
+          --index <путь>         путь к файлу индекса (по умолчанию <выгрузка>/.data1c/index.db);
+                                 если индекса нет, сервер соберёт его один раз
+          --no-index             не использовать индекс: разбирать выгрузку в память при каждом запуске
           --platform             подключить справку установленной платформы 1С (.hbk)
           --locale <код>         язык справочных файлов платформы (по умолчанию ru)
           --platform-root <путь> каталог установленных платформ (можно повторять)
@@ -77,6 +89,8 @@ public sealed record ServerOptions
         var includeCalls = true;
         var maxDop = 0;
         var lazy = false;
+        string? indexPath = null;
+        var useIndex = true;
 
         for (var index = 0; index < args.Length; index++)
         {
@@ -108,6 +122,19 @@ public sealed record ServerOptions
 
                 case "--lazy":
                     lazy = true;
+                    break;
+
+                case "--index":
+                    if (!TryValue(args, ref index, inline, name, out var indexPathValue, out var indexPathError))
+                    {
+                        return new ServerOptionsParse(null, false, indexPathError);
+                    }
+
+                    indexPath = indexPathValue;
+                    break;
+
+                case "--no-index":
+                    useIndex = false;
                     break;
 
                 case "--locale":
@@ -177,6 +204,8 @@ public sealed record ServerOptions
                 PlatformLocale = locale,
                 PlatformRoots = roots,
                 Lazy = lazy,
+                IndexPath = indexPath,
+                UseIndex = useIndex,
             },
             false,
             null);

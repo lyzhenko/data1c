@@ -47,10 +47,23 @@ internal static class Program
             PlatformHelp = options.PlatformHelp,
             PlatformLocale = options.PlatformLocale,
             PlatformRoots = options.PlatformRoots,
+            IndexPath = options.IndexPath,
+            UseIndex = options.UseIndex,
         });
 
-        stderr.WriteLine($"data1c-mcp {McpServer.ServerVersion}: выгрузка {session.DumpPath}; состояние: {session.State}");
-        if (!options.Lazy && session.IsOpen)
+        // Готовый индекс означает, что разбор в память при старте не нужен: инструменты
+        // ответят из базы. Разбор запускаем только когда индекс нужно собрать.
+        var indexReady = options.UseIndex
+            && !string.IsNullOrWhiteSpace(session.IndexPath)
+            && File.Exists(session.IndexPath);
+
+        stderr.WriteLine(
+            $"data1c-mcp {McpServer.ServerVersion}: выгрузка {session.DumpPath}; состояние: {session.State}" +
+            (options.UseIndex
+                ? $"; индекс: {session.IndexPath}{(indexReady ? " (готов)" : " (будет собран при первом запросе)")}"
+                : "; индекс выключен, разбор в память"));
+
+        if (!options.Lazy && !indexReady)
         {
             StartInBackground(session, stderr);
         }

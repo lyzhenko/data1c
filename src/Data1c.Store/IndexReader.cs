@@ -39,6 +39,42 @@ public sealed class IndexReader
         return (IReadOnlyDictionary<string, int>)result;
     });
 
+    /// <summary>Сколько связей ведёт в отсутствующие узлы: то же, что «неразрешённые» в графе.</summary>
+    public long CountUnresolvedEdges() => _index.WithLock(() => _index.QueryScalar(
+        "SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id = e.target_id WHERE n.is_external = 1"));
+
+    /// <summary>Число входящих связей для набора узлов (нужно карточкам поиска).</summary>
+    public IReadOnlyDictionary<string, int> CountIncoming(IReadOnlyList<string> ids) => CountPerNode(ids, "target_id");
+
+    /// <summary>Число исходящих связей для набора узлов.</summary>
+    public IReadOnlyDictionary<string, int> CountOutgoing(IReadOnlyList<string> ids) => CountPerNode(ids, "source_id");
+
+    private IReadOnlyDictionary<string, int> CountPerNode(IReadOnlyList<string> ids, string column)
+    {
+        var result = new Dictionary<string, int>(StringComparer.Ordinal);
+        if (ids.Count == 0)
+        {
+            return result;
+        }
+
+        return _index.WithLock(() =>
+        {
+            foreach (var chunk in Chunk([.. ids], 400))
+            {
+                using var command = _index.CreateCommand(
+                    $"SELECT {column}, COUNT(*) FROM edges WHERE {column} IN ({Placeholders(chunk.Count, "@c")}) GROUP BY {column}");
+                AddIdParameters(command, chunk, "@c");
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    result[reader.GetString(0)] = reader.GetInt32(1);
+                }
+            }
+
+            return (IReadOnlyDictionary<string, int>)result;
+        });
+    }
+
     /// <summary>Сводка по индексу.</summary>
     public IndexStatistics GetStatistics() => _index.WithLock(() =>
     {

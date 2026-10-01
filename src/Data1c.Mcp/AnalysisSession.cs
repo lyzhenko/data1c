@@ -4,6 +4,8 @@ using Data1c.Core.Graph;
 using Data1c.Core.Metadata;
 using Data1c.Core.Platform;
 using Data1c.FileSystem;
+using Data1c.Store;
+using Microsoft.Data.Sqlite;
 
 namespace Data1c.Mcp;
 
@@ -25,6 +27,15 @@ public sealed record AnalysisRequest
     public string PlatformLocale { get; init; } = "ru";
 
     public IReadOnlyList<string>? PlatformRoots { get; init; }
+
+    /// <summary>Путь к файлу индекса. По умолчанию — <c>&lt;выгрузка&gt;/.data1c/index.db</c>.</summary>
+    public string? IndexPath { get; init; }
+
+    /// <summary>
+    /// Отвечать из SQLite-индекса: если его нет, сервер соберёт его один раз и дальше будет
+    /// только читать. Выключено — работает старый путь с разбором в память.
+    /// </summary>
+    public bool UseIndex { get; init; } = true;
 }
 
 /// <summary>
@@ -32,7 +43,7 @@ public sealed record AnalysisRequest
 /// Разбор идёт один раз и переиспользуется всеми инструментами; <see cref="Reload"/> сбрасывает
 /// его — это нужно, когда агент правит модули в выгрузке и хочет видеть новое содержимое.
 /// </summary>
-public sealed class AnalysisSession
+public sealed class AnalysisSession : IDisposable
 {
     private readonly AnalysisRequest _request;
     private readonly Lock _gate = new();
@@ -42,6 +53,10 @@ public sealed class AnalysisSession
 
     private SourceCodeReader? _code;
     private Task<AnalysisResult>? _analysis;
+    private SqliteIndex? _index;
+    private IGraphQuery? _indexGraph;
+    private string? _indexPath;
+    private bool _forceRebuild;
     private volatile string _state = "ожидание";
     private Exception? _failure;
     private DateTimeOffset? _completedAt;
@@ -111,6 +126,51 @@ public sealed class AnalysisSession
 
     public bool IsRunning => _analysis is { IsCompleted: false };
 
+    /// <summary>Сервер настроен отвечать из индекса (или собирать его).</summary>
+    public bool IsIndexMode => _request.UseIndex;
+
+    /// <summary>Путь к файлу индекса, если он определён для этой выгрузки.</summary>
+    public string? IndexPath => _indexPath ?? ResolveIndexPath();
+
+    /// <summary>Индекс открыт и готов отвечать без разбора в память.</summary>
+    public bool IsIndexReady => _indexGraph is not null;
+
+    /// <summary>
+    /// Сводка по индексу — для инструмента status, когда разбора в память нет.
+    /// Если индекс ещё не открыт, читается кратковременно и только на чтение.
+    /// </summary>
+    public IndexStatistics? GetIndexStatistics()
+    {
+        var path = IndexPath;
+        if (path is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            lock (_gate)
+            {
+                if (_index is not null)
+                {
+                    return new IndexReader(_index).GetStatistics();
+                }
+            }
+
+            if (!IsUsableIndex(path))
+            {
+                return null;
+            }
+
+            using var index = SqliteIndex.OpenReadOnly(path);
+            return new IndexReader(index).GetStatistics();
+        }
+        catch (Exception exception) when (exception is SqliteException or InvalidOperationException or IOException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Результат разбора, если он уже готов.</summary>
     public AnalysisResult? Result =>
         _analysis is { IsCompletedSuccessfully: true } task ? task.Result : null;
@@ -141,6 +201,109 @@ public sealed class AnalysisSession
     public Task<AnalysisResult> GetAsync(CancellationToken cancellationToken) =>
         Start().WaitAsync(cancellationToken);
 
+    /// <summary>
+    /// Отдаёт запросы к графу. Если индекс включён и выгрузка лежит на диске, сервер открывает
+    /// <c>.data1c/index.db</c>, а при его отсутствии собирает индекс один раз и дальше только читает.
+    /// Иначе работает прежний путь: полный разбор в память.
+    /// </summary>
+    public async Task<IGraphQuery> QueryAsync(CancellationToken cancellationToken)
+    {
+        if (_source is null)
+        {
+            throw new ToolException(_sourceError ?? "Выгрузка недоступна.");
+        }
+
+        lock (_gate)
+        {
+            if (_indexGraph is not null && !_forceRebuild)
+            {
+                return _indexGraph;
+            }
+        }
+
+        var path = ResolveIndexPath();
+        if (path is null)
+        {
+            // Индекс некуда положить (например, выгрузка в памяти) — считаем граф в память.
+            var memory = await GetAsync(cancellationToken).ConfigureAwait(false);
+            return new GraphQueryService(memory.Graph);
+        }
+
+        if (!_forceRebuild && IsUsableIndex(path))
+        {
+            return OpenIndex(path);
+        }
+
+        var result = await GetAsync(cancellationToken).ConfigureAwait(false);
+        _state = "индексация";
+        await Task.Run(() => BuildIndex(path, result), cancellationToken).ConfigureAwait(false);
+        return OpenIndex(path);
+    }
+
+    private string? ResolveIndexPath()
+    {
+        if (!_request.UseIndex)
+        {
+            return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_request.IndexPath))
+        {
+            return Path.GetFullPath(_request.IndexPath);
+        }
+
+        return _source is FileSystemDumpSource ? Path.Combine(_dumpPath, ".data1c", "index.db") : null;
+    }
+
+    private static bool IsUsableIndex(string path) => File.Exists(path) && SqliteIndex.LooksLikeIndex(path);
+
+    private void BuildIndex(string path, AnalysisResult result)
+    {
+        var directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        if (File.Exists(path) && !SqliteIndex.LooksLikeIndex(path))
+        {
+            // Схема индекса другой версии — пересобираем с нуля.
+            foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+            {
+                var file = path + suffix;
+                if (File.Exists(file))
+                {
+                    File.Delete(file);
+                }
+            }
+        }
+
+        using var index = SqliteIndex.Open(path);
+        new IndexWriter(index).Write(_source!, result);
+        _indexPath = path;
+        _state = "индекс собран";
+    }
+
+    private IGraphQuery OpenIndex(string path)
+    {
+        lock (_gate)
+        {
+            if (_indexGraph is not null && !_forceRebuild)
+            {
+                return _indexGraph;
+            }
+
+            _index?.Dispose();
+            _index = SqliteIndex.OpenReadOnly(path);
+            _indexGraph = new IndexGraphQuery(new IndexReader(_index));
+            _indexPath = path;
+            _forceRebuild = false;
+            _state = "готов (индекс)";
+            _completedAt ??= DateTimeOffset.Now;
+            return _indexGraph;
+        }
+    }
+
     /// <summary>Сбрасывает разбор и кеш исходников: нужен после правки файлов выгрузки.</summary>
     public void Reload()
     {
@@ -152,6 +315,10 @@ public sealed class AnalysisSession
             }
 
             _code = new SourceCodeReader(_source);
+            _index?.Dispose();
+            _index = null;
+            _indexGraph = null;
+            _forceRebuild = true;
             _failure = null;
             _completedAt = null;
             _state = "ожидание";
@@ -215,5 +382,13 @@ public sealed class AnalysisSession
         };
 
         _state = progress.Total > 0 ? $"{stage} {progress.Processed} из {progress.Total}" : stage;
+    }
+
+    /// <summary>Освобождает соединение с индексом.</summary>
+    public void Dispose()
+    {
+        _index?.Dispose();
+        _index = null;
+        _indexGraph = null;
     }
 }

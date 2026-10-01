@@ -71,6 +71,9 @@ public sealed class GraphQueryService : IGraphQuery
 
     public GraphStatistics Statistics => _graph.Statistics;
 
+    /// <summary>Узел по идентификатору без загрузки связей.</summary>
+    public GraphNode? FindNode(string? id) => string.IsNullOrWhiteSpace(id) ? null : _graph.FindNode(id.Trim());
+
     /// <summary>
     /// Ищет узлы по идентификатору, имени, синониму, виду объекта или пути файла.
     /// Ранжирование: точное совпадение, затем совпадение с начала строки, затем вхождение.
