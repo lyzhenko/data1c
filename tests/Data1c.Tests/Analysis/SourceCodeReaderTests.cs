@@ -110,4 +110,32 @@ public sealed class SourceCodeReaderTests
     {
         Assert.Null(CreateReader().Read("Catalogs/НетТакого/Ext/Module.bsl"));
     }
+
+    [Fact]
+    public void Читает_модуль_в_CP1251()
+    {
+        var source = SampleDump.Create();
+        source.AddBytes(SampleDump.CommonModuleBslPath, DumpTextReader.Fallback.GetBytes(SampleDump.CommonModuleBsl));
+
+        var fragment = new SourceCodeReader(source).Read(SampleDump.CommonModuleBslPath, 1, 2);
+
+        Assert.NotNull(fragment);
+        Assert.StartsWith("Процедура МояПроцедура", fragment.Lines[0], StringComparison.Ordinal);
+        Assert.Contains("РаботаСДанными.ЗагрузитьДанные", fragment.Lines[1], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Читает_модуль_в_UTF8_с_BOM()
+    {
+        var source = SampleDump.Create();
+        var bytes = new List<byte> { 0xEF, 0xBB, 0xBF };
+        bytes.AddRange(new System.Text.UTF8Encoding(false).GetBytes(SampleDump.CommonModuleBsl));
+        source.AddBytes(SampleDump.CommonModuleBslPath, [.. bytes]);
+
+        var fragment = new SourceCodeReader(source).Read(SampleDump.CommonModuleBslPath, 1, 1);
+
+        Assert.NotNull(fragment);
+        Assert.StartsWith("Процедура МояПроцедура", fragment.Lines[0], StringComparison.Ordinal);
+        Assert.DoesNotContain('\uFEFF', fragment.Lines[0]);
+    }
 }

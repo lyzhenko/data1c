@@ -142,14 +142,8 @@ public sealed class SourceCodeReader
     {
         var file = new DumpFile(path, 0, DateTimeOffset.UnixEpoch);
         using var stream = _source.OpenRead(file);
-        using var reader = new StreamReader(stream, System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
 
-        var lines = new List<string>(1024);
-        while (reader.ReadLine() is { } line)
-        {
-            lines.Add(line);
-        }
-
-        return [.. lines];
+        // Читатель сам выбирает кодировку: UTF-8 (с BOM или без) либо запасная CP1251.
+        return DumpTextReader.ReadLines(stream);
     }
 }

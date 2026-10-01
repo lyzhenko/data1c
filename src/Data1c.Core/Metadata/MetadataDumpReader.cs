@@ -419,7 +419,7 @@ public sealed class MetadataDumpReader
 
     private static MdObject? ParseMetaDataFile(Stream stream, string sourcePath, ConcurrentBag<string> warnings)
     {
-        using var reader = XmlReader.Create(stream, ReaderSettings);
+        using var reader = XmlReader.Create(DumpTextReader.CreateTextReader(stream), ReaderSettings);
         if (!MoveToElement(reader) || !string.Equals(reader.LocalName, "MetaDataObject", StringComparison.Ordinal))
         {
             return null;
@@ -799,7 +799,7 @@ public sealed class MetadataDumpReader
     private static List<MdReference> ParseRights(Stream stream, string sourcePath)
     {
         var references = new List<MdReference>();
-        using var reader = XmlReader.Create(stream, ReaderSettings);
+        using var reader = XmlReader.Create(DumpTextReader.CreateTextReader(stream), ReaderSettings);
         if (!MoveToElement(reader))
         {
             return references;

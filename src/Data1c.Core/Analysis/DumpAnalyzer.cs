@@ -216,9 +216,5 @@ public sealed class DumpAnalyzer
         return [.. results.Where(static r => r is not null).Select(static r => r!)];
     }
 
-    private static string ReadText(Stream stream)
-    {
-        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-        return reader.ReadToEnd();
-    }
+    private static string ReadText(Stream stream) => DumpTextReader.ReadAllText(stream);
 }

@@ -1051,8 +1051,9 @@ public sealed class ToolCatalog
         try
         {
             using var stream = Session.Source.OpenRead(file);
-            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-            return reader.ReadToEnd();
+
+            // Кодировка определяется по содержимому: UTF-8 либо запасная CP1251.
+            return DumpTextReader.ReadAllText(stream);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or FileNotFoundException)
         {
