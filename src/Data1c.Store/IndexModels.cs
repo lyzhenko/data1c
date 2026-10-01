@@ -55,6 +55,30 @@ public sealed record MetadataItemRow(
 /// <summary>Страница состава объекта: показанные дети и их общее число.</summary>
 public sealed record MetadataChildrenPage(IReadOnlyList<MetadataItemRow> Items, int Total);
 
+/// <summary>
+/// Обработчик события формы из индекса: форма, элемент, событие и назначенная процедура модуля формы.
+/// Нужен точкам входа (Э3-2): платформа вызывает эти процедуры сама, явных вызовов у них нет.
+/// </summary>
+/// <param name="FormId">Идентификатор формы: «Catalog.Товары/Form.ФормаЭлемента».</param>
+/// <param name="FormName">Имя формы.</param>
+/// <param name="ObjectId">Объект-владелец формы: «Catalog.Товары». У общей формы владельца нет.</param>
+/// <param name="SourcePath">Путь файла описания формы (<c>Ext/Form.xml</c>).</param>
+/// <param name="Event">Имя события так, как оно записано в XML («OnOpen», «OnChange»).</param>
+/// <param name="Element">Элемент формы, у которого объявлено событие; null — событие самой формы.</param>
+/// <param name="Procedure">Имя процедуры модуля формы.</param>
+/// <param name="Line">Строка процедуры в модуле формы, если она найдена.</param>
+/// <param name="Resolved">Процедура найдена в модуле формы.</param>
+public sealed record FormHandlerRow(
+    string FormId,
+    string FormName,
+    string? ObjectId,
+    string? SourcePath,
+    string Event,
+    string? Element,
+    string Procedure,
+    int? Line,
+    bool Resolved);
+
 /// <summary>Виды строк состава формы в индексе (<c>form_items.kind</c>).</summary>
 internal static class FormItemKinds
 {

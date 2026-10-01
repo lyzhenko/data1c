@@ -649,6 +649,134 @@ public sealed class IndexReader
         return result;
     }
 
+    /// <summary>
+    /// Объекты метаданных указанных видов вместе со свойствами: нужны точкам входа — подпискам
+    /// на события и регламентным заданиям.
+    /// </summary>
+    /// <param name="kinds">Виды объектов: EventSubscription, ScheduledJob.</param>
+    /// <param name="metadataId">
+    /// Идентификатор объекта, с которым должна быть связана точка входа: сама точка входа,
+    /// объект-источник подписки (связь контекста type или event) или общий модуль-обработчик
+    /// (связь контекста other). Null — без фильтра.
+    /// </param>
+    /// <param name="limit">Предел числа строк: фильтр применяется до него, поэтому подходящие точки входа не теряются.</param>
+    public IReadOnlyList<MetadataObjectRow> FindEntryPointObjects(
+        IReadOnlyCollection<string> kinds,
+        string? metadataId = null,
+        int limit = 50)
+    {
+        if (kinds is not { Count: > 0 })
+        {
+            return [];
+        }
+
+        return _index.WithLock(() =>
+        {
+            var sql = new StringBuilder(
+                """
+                SELECT id, kind, name, synonym, uuid, source_path, comment, is_top_level, parent_id, properties
+                FROM metadata_objects
+                WHERE kind IN (
+                """);
+            sql.Append(Placeholders(kinds.Count, "@k")).Append(')');
+
+            if (!string.IsNullOrWhiteSpace(metadataId))
+            {
+                // Связь ищется по metadata_refs: у подписки это её источники и обработчик, у задания — обработчик.
+                sql.Append(
+                    """
+
+                     AND (id = @metadata OR EXISTS (
+                         SELECT 1 FROM metadata_refs r
+                         WHERE r.source_id = metadata_objects.id AND r.target_id = @metadata
+                           AND r.context IN ('type', 'event', 'other')))
+                    """);
+            }
+
+            sql.Append(" ORDER BY kind, name_lower, id LIMIT @limit");
+
+            using var command = _index.CreateCommand(sql.ToString());
+            AddKindParameters(command, kinds, "@k");
+            if (!string.IsNullOrWhiteSpace(metadataId))
+            {
+                command.Parameters.AddWithValue("@metadata", metadataId.Trim());
+            }
+
+            command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 5000));
+            using var reader = command.ExecuteReader();
+            var result = new List<MetadataObjectRow>();
+            while (reader.Read())
+            {
+                result.Add(new MetadataObjectRow(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    reader.IsDBNull(3) ? null : reader.GetString(3),
+                    reader.IsDBNull(4) ? null : reader.GetString(4),
+                    reader.IsDBNull(5) ? null : reader.GetString(5),
+                    reader.IsDBNull(6) ? null : reader.GetString(6),
+                    reader.GetInt32(7) != 0,
+                    reader.IsDBNull(8) ? null : reader.GetString(8),
+                    reader.IsDBNull(9) ? null : reader.GetString(9)));
+            }
+
+            return (IReadOnlyList<MetadataObjectRow>)result;
+        });
+    }
+
+    /// <summary>
+    /// Обработчики событий форм: форма, элемент, событие и процедура модуля формы со строкой.
+    /// Описания форм лежат в <c>form_models</c>, их состав — в <c>form_items</c>.
+    /// </summary>
+    /// <param name="metadataId">
+    /// Идентификатор объекта метаданных: сама форма или объект-владелец формы («Catalog.Товары»).
+    /// Null — без фильтра.
+    /// </param>
+    /// <param name="limit">Предел числа строк: фильтр применяется до него.</param>
+    public IReadOnlyList<FormHandlerRow> FormHandlers(string? metadataId = null, int limit = 50) => _index.WithLock(() =>
+    {
+        var sql = new StringBuilder(
+            """
+            SELECT fi.form_id, fm.name, fm.object_id, fm.source_path, fi.name, fi.element_name,
+                   fi.handler, fi.line, fi.is_resolved
+            FROM form_items fi JOIN form_models fm ON fm.id = fi.form_id
+            WHERE fi.kind = 'Handler'
+            """);
+
+        if (!string.IsNullOrWhiteSpace(metadataId))
+        {
+            // У общей формы владельца нет (object_id пуст), поэтому фильтр идёт и по самой форме.
+            sql.Append(" AND (fm.object_id = @metadata OR fi.form_id = @metadata)");
+        }
+
+        sql.Append(" ORDER BY fm.name_lower, fi.id LIMIT @limit");
+
+        using var command = _index.CreateCommand(sql.ToString());
+        if (!string.IsNullOrWhiteSpace(metadataId))
+        {
+            command.Parameters.AddWithValue("@metadata", metadataId.Trim());
+        }
+
+        command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 5000));
+        using var reader = command.ExecuteReader();
+        var result = new List<FormHandlerRow>();
+        while (reader.Read())
+        {
+            result.Add(new FormHandlerRow(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.IsDBNull(2) ? null : reader.GetString(2),
+                reader.IsDBNull(3) ? null : reader.GetString(3),
+                reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                reader.IsDBNull(6) ? string.Empty : reader.GetString(6),
+                reader.IsDBNull(7) ? null : reader.GetInt32(7),
+                reader.GetInt32(8) != 0));
+        }
+
+        return (IReadOnlyList<FormHandlerRow>)result;
+    });
+
     /// <summary>Процедура, накрывающая указанную строку модуля.</summary>
     public SymbolRow? FindSymbolAt(string modulePath, int line)
     {
