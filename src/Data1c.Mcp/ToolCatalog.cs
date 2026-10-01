@@ -141,8 +141,7 @@ public sealed class ToolCatalog
         ],
         async (arguments, token) =>
         {
-            var result = await AnalysisAsync(token);
-            var query = new GraphQueryService(result.Graph);
+            var query = await QueryAsync(token);
             var text = arguments.RequireString("query");
             var limit = arguments.GetInt("limit", 20, 1, 100);
             var kinds = ParseKinds(arguments.GetStringList("kinds"));
@@ -167,10 +166,22 @@ public sealed class ToolCatalog
                 .ToList();
 
             // Вложенные объекты (реквизиты, табличные части) в графе не представлены, но есть в модели
-            // метаданных — иначе по имени реквизита ничего не находится.
-            var nested = includeNested ? SearchNested(result.Metadata, text, metadataKinds, limit) : [];
+            // метаданных или в таблицах состава индекса — иначе по имени реквизита ничего не находится.
+            var nested = includeNested ? query.SearchNested(text, limit, metadataKinds) : [];
+            var nestedView = nested
+                .Select(static hit => new
+                {
+                    id = hit.Id,
+                    kind = hit.Kind,
+                    name = hit.Name,
+                    synonym = hit.Synonym,
+                    objectId = hit.ObjectId,
+                    parent = hit.ParentId,
+                    types = hit.Types,
+                })
+                .ToList();
 
-            if (filtered.Count == 0 && nested.Count == 0)
+            if (filtered.Count == 0 && nestedView.Count == 0)
             {
                 return $"Ничего не найдено по запросу «{text}». Попробуйте часть имени, синоним или путь файла.";
             }
@@ -181,107 +192,10 @@ public sealed class ToolCatalog
                 found = filtered.Count,
                 total = hits.Count,
                 results = filtered,
-                nestedFound = nested.Count,
-                nested,
+                nestedFound = nestedView.Count,
+                nested = nestedView,
             });
         });
-
-    /// <summary>Поиск по вложенным объектам модели метаданных: реквизиты, табличные части, формы, команды.</summary>
-    private static List<object> SearchNested(
-        MdObjectModel model,
-        string text,
-        IReadOnlyList<string>? kinds,
-        int limit)
-    {
-        var hits = new List<(int Score, MdObject Object)>();
-
-        foreach (var obj in model.Objects)
-        {
-            // Верхний уровень ищется в графе: здесь только вложенное.
-            if (obj.Parent is null || obj.Parent.Kind == MdKind.Configuration)
-            {
-                continue;
-            }
-
-            if (kinds is { Count: > 0 } && !kinds.Contains(obj.Kind.Name, StringComparer.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            var score = RankMetadata(obj, text);
-            if (score >= 0)
-            {
-                hits.Add((score, obj));
-            }
-        }
-
-        return hits
-            .OrderBy(static hit => hit.Score)
-            .ThenBy(static hit => hit.Object.Id, StringComparer.Ordinal)
-            .Take(limit)
-            .Select(static hit => (object)new
-            {
-                id = hit.Object.Id,
-                kind = hit.Object.Kind.Name,
-                name = hit.Object.Name,
-                synonym = hit.Object.Synonym,
-                objectId = TopLevelId(hit.Object),
-                parent = hit.Object.Parent?.Id,
-                types = hit.Object.References
-                    .Where(static reference => reference.Kind == MdReferenceKind.Type)
-                    .Select(static reference => reference.TargetId)
-                    .Distinct(StringComparer.Ordinal)
-                    .Take(5)
-                    .ToList(),
-            })
-            .ToList();
-    }
-
-    private static string TopLevelId(MdObject obj)
-    {
-        var current = obj;
-        while (current.Parent is not null && current.Parent.Kind != MdKind.Configuration)
-        {
-            current = current.Parent;
-        }
-
-        return current.Id;
-    }
-
-    private static int RankMetadata(MdObject obj, string text)
-    {
-        if (string.Equals(obj.Name, text, StringComparison.OrdinalIgnoreCase))
-        {
-            return 0;
-        }
-
-        if (string.Equals(obj.Synonym, text, StringComparison.OrdinalIgnoreCase))
-        {
-            return 1;
-        }
-
-        if (obj.Name.StartsWith(text, StringComparison.OrdinalIgnoreCase))
-        {
-            return 2;
-        }
-
-        if (obj.Name.Contains(text, StringComparison.OrdinalIgnoreCase))
-        {
-            return 3;
-        }
-
-        if (obj.Id.Contains(text, StringComparison.OrdinalIgnoreCase))
-        {
-            return 4;
-        }
-
-        if (obj.Synonym is not null && obj.Synonym.Contains(text, StringComparison.OrdinalIgnoreCase))
-        {
-            return 5;
-        }
-
-        return -1;
-    }
 
     private ToolSpec GrepTool() => new(
         "grep",

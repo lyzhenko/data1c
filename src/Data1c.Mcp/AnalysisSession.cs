@@ -234,7 +234,7 @@ public sealed class AnalysisSession : IDisposable
         {
             // Индекс некуда положить (например, выгрузка в памяти) — считаем граф в память.
             var memory = await GetAsync(cancellationToken).ConfigureAwait(false);
-            return new GraphQueryService(memory.Graph);
+            return new GraphQueryService(memory.Graph, memory.Metadata);
         }
 
         if (!_forceRebuild && IsUsableIndex(path))

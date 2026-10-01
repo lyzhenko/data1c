@@ -1,3 +1,5 @@
+using Data1c.Core.Metadata;
+
 namespace Data1c.Core.Graph;
 
 /// <summary>Результат поиска узла по имени.</summary>
@@ -60,11 +62,13 @@ public sealed record GraphNodeDetails(GraphNode Node, IReadOnlyList<GraphEdge> I
 public sealed class GraphQueryService : IGraphQuery
 {
     private readonly DependencyGraph _graph;
+    private readonly MdObjectModel? _metadata;
 
-    public GraphQueryService(DependencyGraph graph)
+    public GraphQueryService(DependencyGraph graph, MdObjectModel? metadata = null)
     {
         ArgumentNullException.ThrowIfNull(graph);
         _graph = graph;
+        _metadata = metadata;
     }
 
     public DependencyGraph Graph => _graph;
@@ -73,6 +77,103 @@ public sealed class GraphQueryService : IGraphQuery
 
     /// <summary>Узел по идентификатору без загрузки связей.</summary>
     public GraphNode? FindNode(string? id) => string.IsNullOrWhiteSpace(id) ? null : _graph.FindNode(id.Trim());
+
+    /// <summary>
+    /// Поиск вложенных объектов по модели метаданных. Если модель не передана (сервис построен
+    /// только по графу), поиск ничего не находит: вложенные объекты в графе не представлены.
+    /// </summary>
+    public IReadOnlyList<GraphNestedHit> SearchNested(string? query, int limit = 20, IReadOnlyCollection<string>? metadataKinds = null)
+    {
+        if (_metadata is null || string.IsNullOrWhiteSpace(query))
+        {
+            return [];
+        }
+
+        var text = query.Trim();
+        var bounded = Math.Clamp(limit, 1, 200);
+        var hits = new List<(int Score, MdObject Object)>();
+
+        foreach (var obj in _metadata.Objects)
+        {
+            // Верхний уровень ищется в графе: здесь только вложенное.
+            if (obj.Parent is null || obj.Parent.Kind == MdKind.Configuration)
+            {
+                continue;
+            }
+
+            if (metadataKinds is { Count: > 0 } && !metadataKinds.Contains(obj.Kind.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var score = RankNested(obj, text);
+            if (score >= 0)
+            {
+                hits.Add((score, obj));
+            }
+        }
+
+        return
+        [
+            .. hits
+                .OrderBy(static hit => hit.Score)
+                .ThenBy(static hit => hit.Object.Id, StringComparer.Ordinal)
+                .Take(bounded)
+                .Select(static hit => new GraphNestedHit(
+                    hit.Object.Id,
+                    hit.Object.Kind.Name,
+                    hit.Object.Name,
+                    hit.Object.Synonym,
+                    TopLevelId(hit.Object),
+                    hit.Object.Parent?.Id,
+                    [.. hit.Object.References
+                        .Where(static reference => reference.Kind == MdReferenceKind.Type)
+                        .Select(static reference => reference.TargetId)
+                        .Distinct(StringComparer.Ordinal)
+                        .Take(5)]))
+        ];
+    }
+
+    private static string TopLevelId(MdObject obj)
+    {
+        var current = obj;
+        while (current.Parent is not null && current.Parent.Kind != MdKind.Configuration)
+        {
+            current = current.Parent;
+        }
+
+        return current.Id;
+    }
+
+    private static int RankNested(MdObject obj, string text)
+    {
+        if (string.Equals(obj.Name, text, StringComparison.OrdinalIgnoreCase))
+        {
+            return 0;
+        }
+
+        if (string.Equals(obj.Synonym, text, StringComparison.OrdinalIgnoreCase))
+        {
+            return 1;
+        }
+
+        if (obj.Name.StartsWith(text, StringComparison.OrdinalIgnoreCase))
+        {
+            return 2;
+        }
+
+        if (obj.Name.Contains(text, StringComparison.OrdinalIgnoreCase))
+        {
+            return 3;
+        }
+
+        if (obj.Id.Contains(text, StringComparison.OrdinalIgnoreCase))
+        {
+            return 4;
+        }
+
+        return obj.Synonym is not null && obj.Synonym.Contains(text, StringComparison.OrdinalIgnoreCase) ? 5 : -1;
+    }
 
     /// <summary>
     /// Ищет узлы по идентификатору, имени, синониму, виду объекта или пути файла.

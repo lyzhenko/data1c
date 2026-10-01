@@ -39,6 +39,79 @@ public sealed class IndexReader
         return (IReadOnlyDictionary<string, int>)result;
     });
 
+    /// <summary>Синонимы объектов метаданных по идентификаторам: нужны выдаче поиска.</summary>
+    public IReadOnlyDictionary<string, string?> GetSynonyms(IReadOnlyList<string> ids)
+    {
+        var result = new Dictionary<string, string?>(StringComparer.Ordinal);
+        if (ids.Count == 0)
+        {
+            return result;
+        }
+
+        return _index.WithLock(() =>
+        {
+            foreach (var chunk in Chunk([.. ids], 400))
+            {
+                using var command = _index.CreateCommand(
+                    $"SELECT id, synonym FROM metadata_objects WHERE id IN ({Placeholders(chunk.Count, "@s")})");
+                AddIdParameters(command, chunk, "@s");
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    result[reader.GetString(0)] = reader.IsDBNull(1) ? null : reader.GetString(1);
+                }
+            }
+
+            return (IReadOnlyDictionary<string, string?>)result;
+        });
+    }
+
+    /// <summary>
+    /// Поиск по вложенным объектам: реквизиты, табличные части, формы, команды, макеты.
+    /// В графе их нет — они лежат в таблице состава объектов.
+    /// </summary>
+    public IReadOnlyList<MetadataItemRow> SearchMetadataItems(string query, int limit = 20, IReadOnlyCollection<string>? kinds = null)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return [];
+        }
+
+        var lower = query.Trim().ToLowerInvariant();
+        return _index.WithLock(() =>
+        {
+            var sql = new StringBuilder("SELECT object_id, kind, name, type_info, parent_id FROM metadata_items WHERE ");
+            if (kinds is { Count: > 0 })
+            {
+                sql.Append("kind IN (").Append(Placeholders(kinds.Count, "@k")).Append(") AND ");
+            }
+
+            sql.Append(@" (name_lower = @lower OR name_lower LIKE @prefix ESCAPE '\' OR name_lower LIKE @like ESCAPE '\')")
+                .Append(@" ORDER BY CASE WHEN name_lower = @lower THEN 0 WHEN name_lower LIKE @prefix ESCAPE '\' THEN 1 ELSE 2 END, length(name), name LIMIT @limit");
+
+            using var command = _index.CreateCommand(sql.ToString());
+            AddKindParameters(command, kinds, "@k");
+            command.Parameters.AddWithValue("@lower", lower);
+            command.Parameters.AddWithValue("@prefix", EscapeLike(lower) + "%");
+            command.Parameters.AddWithValue("@like", "%" + EscapeLike(lower) + "%");
+            command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 200));
+
+            using var reader = command.ExecuteReader();
+            var result = new List<MetadataItemRow>();
+            while (reader.Read())
+            {
+                result.Add(new MetadataItemRow(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    reader.IsDBNull(3) ? null : reader.GetString(3),
+                    reader.IsDBNull(4) ? null : reader.GetString(4)));
+            }
+
+            return (IReadOnlyList<MetadataItemRow>)result;
+        });
+    }
+
     /// <summary>Сколько связей ведёт в отсутствующие узлы: то же, что «неразрешённые» в графе.</summary>
     public long CountUnresolvedEdges() => _index.WithLock(() => _index.QueryScalar(
         "SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id = e.target_id WHERE n.is_external = 1"));

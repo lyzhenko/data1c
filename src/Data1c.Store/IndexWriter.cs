@@ -388,23 +388,38 @@ public sealed class IndexWriter
         _ => "other",
     };
 
-    /// <summary>Тип реквизита берётся из ссылок самого объекта: в XML тип лежит рядом с реквизитом.</summary>
+    /// <summary>
+    /// Тип реквизита: сначала собственные ссылки вложенного объекта (в XML тип описан внутри самого
+    /// реквизита), затем — ссылки владельца, отобранные по имени реквизита.
+    /// </summary>
     private static string? TypeInfo(MdObject owner, MdObject child)
     {
-        if (owner.References.Count == 0)
-        {
-            return null;
-        }
-
-        var types = owner.References
-            .Where(r => r.Kind == MdReferenceKind.Type)
-            .Where(r => string.IsNullOrEmpty(r.Detail) || r.Detail!.Contains(child.Name, StringComparison.OrdinalIgnoreCase))
-            .Select(static r => r.TargetId)
-            .Distinct(StringComparer.Ordinal)
-            .Take(8)
-            .ToList();
+        var types = new List<string>();
+        Collect(child.References, static _ => true);
+        Collect(
+            owner.References,
+            reference => string.IsNullOrEmpty(reference.Detail)
+                || reference.Detail!.Contains(child.Name, StringComparison.OrdinalIgnoreCase));
 
         return types.Count == 0 ? null : string.Join(", ", types);
+
+        void Collect(IReadOnlyList<MdReference> references, Func<MdReference, bool> matches)
+        {
+            foreach (var reference in references)
+            {
+                if (types.Count >= 8)
+                {
+                    return;
+                }
+
+                if (reference.Kind == MdReferenceKind.Type
+                    && matches(reference)
+                    && !types.Contains(reference.TargetId, StringComparer.Ordinal))
+                {
+                    types.Add(reference.TargetId);
+                }
+            }
+        }
     }
 
     private static string[]? ReadLines(IDumpSource source, string path)

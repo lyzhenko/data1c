@@ -1,5 +1,22 @@
 namespace Data1c.Core.Graph;
 
+/// <summary>Найденный вложенный объект: реквизит, табличная часть, форма, команда, макет.</summary>
+/// <param name="Id">Полный идентификатор вида <c>Catalog.Товары/Attribute.Артикул</c>.</param>
+/// <param name="Kind">Вид вложенного объекта (Attribute, TabularSection, Form, …).</param>
+/// <param name="Name">Имя.</param>
+/// <param name="Synonym">Синоним, если есть.</param>
+/// <param name="ObjectId">Идентификатор объекта-владельца верхнего уровня.</param>
+/// <param name="ParentId">Идентификатор родителя, если вложенность глубже одного уровня.</param>
+/// <param name="Types">Типы значения (для реквизитов) в виде идентификаторов объектов метаданных.</param>
+public sealed record GraphNestedHit(
+    string Id,
+    string Kind,
+    string Name,
+    string? Synonym,
+    string ObjectId,
+    string? ParentId,
+    IReadOnlyList<string> Types);
+
 /// <summary>
 /// Запросы к графу зависимостей независимо от того, где он лежит: собран в памяти
 /// (<see cref="GraphQueryService"/>) или прочитан из SQLite-индекса.
@@ -28,4 +45,11 @@ public interface IGraphQuery
 
     /// <summary>Узел по идентификатору без загрузки связей.</summary>
     GraphNode? FindNode(string? id);
+
+    /// <summary>
+    /// Поиск по вложенным объектам: реквизиты, табличные части, формы, команды. В графе их нет —
+    /// они живут в модели метаданных (или в таблицах состава индекса), но находятся по имени,
+    /// поэтому поиск вынесен в общий контракт.
+    /// </summary>
+    IReadOnlyList<GraphNestedHit> SearchNested(string? query, int limit = 20, IReadOnlyCollection<string>? metadataKinds = null);
 }

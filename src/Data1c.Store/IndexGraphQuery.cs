@@ -55,6 +55,7 @@ public sealed class IndexGraphQuery : IGraphQuery
         var ids = rows.Select(static row => row.Id).ToList();
         var incoming = _reader.CountIncoming(ids);
         var outgoing = _reader.CountOutgoing(ids);
+        var synonyms = _reader.GetSynonyms(ids);
 
         return
         [
@@ -64,10 +65,42 @@ public sealed class IndexGraphQuery : IGraphQuery
                 row.Name,
                 row.MetadataKind,
                 row.SourcePath,
-                Synonym: null,
+                synonyms.GetValueOrDefault(row.Id),
                 incoming.GetValueOrDefault(row.Id),
                 outgoing.GetValueOrDefault(row.Id)))
         ];
+    }
+
+    /// <summary>Поиск вложенных объектов: реквизиты, табличные части, формы, команды, макеты.</summary>
+    public IReadOnlyList<GraphNestedHit> SearchNested(string? query, int limit = 20, IReadOnlyCollection<string>? metadataKinds = null)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return [];
+        }
+
+        return
+        [
+            .. _reader
+                .SearchMetadataItems(query, Math.Clamp(limit, 1, 200), metadataKinds)
+                .Select(static row => new GraphNestedHit(
+                    $"{row.ObjectId}/{row.Kind}.{row.Name}",
+                    row.Kind,
+                    row.Name,
+                    Synonym: null,
+                    ObjectId: TopLevelId(row.ObjectId),
+                    ParentId: row.ParentId,
+                    Types: row.TypeInfo is null
+                        ? []
+                        : [.. row.TypeInfo.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)]))
+        ];
+    }
+
+    /// <summary>Идентификатор объекта верхнего уровня: «Catalog.Товары/TabularSection.Строки» → «Catalog.Товары».</summary>
+    private static string TopLevelId(string id)
+    {
+        var separator = id.IndexOf('/');
+        return separator < 0 ? id : id[..separator];
     }
 
     public IReadOnlyList<GraphNode> Resolve(string? reference, int limit = 10)
