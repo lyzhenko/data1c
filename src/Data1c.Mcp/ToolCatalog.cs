@@ -429,16 +429,24 @@ public sealed class ToolCatalog
         "Карточка узла конфигурации: вид, имя, файл, теги и связи со строками кода. "
         + "Кто вызывает процедуру и что вызывает она сама — в neighbors с edgeKinds=[\"Calls\"]. "
         + "У объекта метаданных показана короткая сводка обращений (usages): сколько раз и в каком "
-        + "контексте его читают, а читатели и примеры строк — в metadata.",
+        + "контексте его читают, а читатели и примеры строк — в metadata. "
+        + "Аргумент usageContext оставляет в сводке один контекст, например только запросы.",
         [
             new ToolParameter("id", "string", "Идентификатор узла: Catalog.Товары, module:CommonModules/.../Module.bsl, routine:module:...#Имя.", Required: true),
             new ToolParameter("edges", "integer", "Сколько связей показать в каждую сторону (1–200, по умолчанию 40)."),
+            new ToolParameter(
+                "usageContext",
+                "string",
+                "Оставить в usages только один контекст обращений: code — в коде, query — в запросах, "
+                + "type — в типах и так далее. Счётчики пересчитываются по фильтру; без аргумента — все контексты.",
+                Values: MetadataRefContexts.All),
         ],
         async (arguments, token) =>
         {
             var query = await QueryAsync(token);
             var id = arguments.RequireString("id");
             var edges = arguments.GetInt("edges", 40, 1, 200);
+            var usageContext = UsageContext(arguments);
 
             var details = query.GetNode(id) ?? throw new ToolException(
                 $"Узел «{id}» не найден. Уточните идентификатор инструментом search.");
@@ -450,7 +458,7 @@ public sealed class ToolCatalog
             // а полный список читателей и примеров отдаёт metadata. Списки здесь не нужны — только
             // счётчики, поэтому лимит примеров минимальный.
             var usages = details.Node.Kind == GraphNodeKind.MetadataObject
-                ? UsageBrief(query.GetMetadataUsages(id, limit: 1), id)
+                ? UsageBrief(query.GetMetadataUsages(id, limit: 1, usageContext), id)
                 : null;
 
             return Render.JsonOf(new
@@ -622,12 +630,21 @@ public sealed class ToolCatalog
         + "Раздел usages показывает, кто и где читает объект: счётчики по контекстам (в коде, в запросах, "
         + "в типах, в составе) и видам связи, топ модулей-читателей и примеры обращений со строками — "
         + "по ним агент находит образцы работы с объектом. "
+        + "Аргумент usageContext оставляет в usages один контекст, например только чтение в запросах: "
+        + "счётчики, читатели и примеры тогда пересчитываются по нему. "
         + "Нужен, чтобы писать код по реальной структуре объекта. Пример: id=\"Catalog.Товары\".",
         [
             new ToolParameter("id", "string", "Идентификатор: Catalog.Товары, Document.Заказ, Document.Заказ/TabularSection.Строки.", Required: true),
             new ToolParameter("depth", "integer", "Глубина дерева состава (1–4, по умолчанию 3)."),
             new ToolParameter("maxChildren", "integer", "Сколько детей показывать у одного узла (1–500, по умолчанию 200)."),
             new ToolParameter("usages", "integer", "Сколько обращений показать в разделе usages (1–500, по умолчанию 20); счётчики всегда полные."),
+            new ToolParameter(
+                "usageContext",
+                "string",
+                "Оставить в usages только один контекст обращений: code — в коде, query — в запросах, "
+                + "type — в типах и так далее. Счётчики, читатели и примеры пересчитываются по фильтру; "
+                + "без аргумента — все контексты.",
+                Values: MetadataRefContexts.All),
         ],
         async (arguments, token) =>
         {
@@ -636,6 +653,7 @@ public sealed class ToolCatalog
             var depth = arguments.GetInt("depth", 3, 1, 4);
             var maxChildren = arguments.GetInt("maxChildren", 200, 1, 500);
             var usages = arguments.GetInt("usages", 20, 1, 500);
+            var usageContext = UsageContext(arguments);
 
             var card = query.GetMetadata(id, depth, maxChildren);
             if (card is null)
@@ -647,7 +665,7 @@ public sealed class ToolCatalog
 
             // Обращения к объекту идут в начало карточки, до дерева состава: у крупных объектов
             // ответ обрезается пределом длины, и раздел usages должен пережить обрезку.
-            var usageView = UsageView(query.GetMetadataUsages(card.Id, usages));
+            var usageView = UsageView(query.GetMetadataUsages(card.Id, usages, usageContext));
 
             var root = MetadataNode(card, usageView);
             root["uuid"] = card.Uuid;
@@ -695,8 +713,33 @@ public sealed class ToolCatalog
         });
 
     /// <summary>
+    /// Контекст обращений из аргумента <c>usageContext</c>: <see langword="null"/> — фильтра нет,
+    /// иначе известный контекст из <see cref="MetadataRefContexts.All"/>. Неизвестное значение
+    /// отвергается со списком допустимых, чтобы агент выбрал правильное.
+    /// </summary>
+    private static string? UsageContext(ToolArguments arguments)
+    {
+        var value = arguments.GetString("usageContext");
+        if (value is null)
+        {
+            return null;
+        }
+
+        if (MetadataRefContexts.TryParse(value, out var context))
+        {
+            return context;
+        }
+
+        var allowed = string.Join(
+            ", ",
+            MetadataRefContexts.All.Select(static known => $"{known} ({MetadataRefContexts.Label(known)})"));
+        throw new ToolException($"Недопустимое значение usageContext: «{value}». Возможные контексты: {allowed}.");
+    }
+
+    /// <summary>
     /// Раздел ответа «usages»: сколько раз и в каком контексте читают объект, кто читает и где
     /// это видно. Счётчики берутся из полного набора обращений, а списки уже обрезаны лимитом.
+    /// При фильтре по контексту раздел помечается: видно, что счётчики описывают только его.
     /// </summary>
     private static JsonObject UsageView(MetadataUsageSummary usage)
     {
@@ -704,6 +747,11 @@ public sealed class ToolCatalog
         {
             ["total"] = usage.Total,
         };
+
+        if (usage.Context is not null)
+        {
+            view["filter"] = FilterView(usage.Context);
+        }
 
         if (usage.ByContext.Count > 0)
         {
@@ -766,6 +814,11 @@ public sealed class ToolCatalog
             ["total"] = usage.Total,
         };
 
+        if (usage.Context is not null)
+        {
+            brief["filter"] = FilterView(usage.Context);
+        }
+
         if (usage.ByContext.Count > 0)
         {
             brief["byContext"] = ContextsView(usage.ByContext);
@@ -773,11 +826,21 @@ public sealed class ToolCatalog
 
         if (usage.Total > 0)
         {
-            brief["hint"] = $"Подробнее — metadata с id=\"{id}\": читатели и примеры обращений.";
+            // Подсказка несёт тот же фильтр: иначе агент пойдёт в metadata за всеми контекстами.
+            var filter = usage.Context is null ? string.Empty : $" и usageContext=\"{usage.Context}\"";
+            brief["hint"] = $"Подробнее — metadata с id=\"{id}\"{filter}: читатели и примеры обращений.";
         }
 
         return brief;
     }
+
+    /// <summary>Пометка о включённом фильтре обращений: контекст, его подпись и вид связи.</summary>
+    private static JsonObject FilterView(string context) => new()
+    {
+        ["context"] = context,
+        ["label"] = MetadataRefContexts.Label(context),
+        ["kind"] = MetadataRefContexts.KindOf(context),
+    };
 
     /// <summary>Разбивка по контекстам с человеческими подписями: «в коде», «в запросах», «в типах».</summary>
     private static JsonArray ContextsView(IReadOnlyList<MetadataUsageCount> contexts)

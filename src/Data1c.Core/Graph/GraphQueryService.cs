@@ -149,9 +149,14 @@ public sealed class GraphQueryService : IGraphQuery
     /// <summary>
     /// Обращения к объекту метаданных по разбору в памяти. Источников два, как и в индексе:
     /// связи <see cref="GraphEdgeKind.UsesMetadata"/> дают обращения из кода и текстов запросов,
-    /// а перекрёстные ссылки модели метаданных — типы, состав, формы и права.
+    /// а перекрёстные ссылки модели метаданных — типы, состав, формы и права. Фильтр по контексту
+    /// отсекает ненужный источник целиком: обращения из кода и запросов живут только в графе,
+    /// а перекрёстные ссылки — только в модели метаданных.
     /// </summary>
-    public MetadataUsageSummary GetMetadataUsages(string? id, int limit = 20)
+    /// <param name="id">Идентификатор объекта метаданных.</param>
+    /// <param name="limit">Предел числа примеров обращений.</param>
+    /// <param name="context">Контекст для фильтра из <see cref="MetadataRefContexts.All"/> или <see langword="null"/>.</param>
+    public MetadataUsageSummary GetMetadataUsages(string? id, int limit = 20, string? context = null)
     {
         if (string.IsNullOrWhiteSpace(id))
         {
@@ -161,24 +166,36 @@ public sealed class GraphQueryService : IGraphQuery
         var target = id.Trim();
         var usages = new List<MetadataUsage>();
 
-        foreach (var edge in _graph.Incoming(target))
+        // Код и тексты запросов — это связи графа; фильтр на другой контекст избавляет от их обхода.
+        var needsGraph = context is null || MetadataRefContexts.IsCodeOrQuery(context);
+        if (needsGraph)
         {
-            if (edge.Kind != GraphEdgeKind.UsesMetadata)
+            foreach (var edge in _graph.Incoming(target))
             {
-                continue;
-            }
+                if (edge.Kind != GraphEdgeKind.UsesMetadata)
+                {
+                    continue;
+                }
 
-            var reader = _graph.FindNode(edge.SourceId);
-            usages.Add(new MetadataUsage(
-                edge.SourceId,
-                reader?.Name,
-                reader?.SourcePath,
-                string.IsNullOrEmpty(edge.Context) ? MetadataRefContexts.Code : edge.Context,
-                edge.Line,
-                edge.Detail));
+                var edgeContext = string.IsNullOrEmpty(edge.Context) ? MetadataRefContexts.Code : edge.Context;
+                if (context is not null && !string.Equals(edgeContext, context, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var reader = _graph.FindNode(edge.SourceId);
+                usages.Add(new MetadataUsage(
+                    edge.SourceId,
+                    reader?.Name,
+                    reader?.SourcePath,
+                    edgeContext,
+                    edge.Line,
+                    edge.Detail));
+            }
         }
 
-        if (_metadata is not null)
+        // Перекрёстные ссылки метаданных контекстов code и query не дают: при таком фильтре модель не нужна.
+        if (_metadata is not null && (context is null || !MetadataRefContexts.IsCodeOrQuery(context)))
         {
             foreach (var obj in _metadata.Objects)
             {
@@ -189,18 +206,24 @@ public sealed class GraphQueryService : IGraphQuery
                         continue;
                     }
 
+                    var referenceContext = MetadataRefContexts.FromReference(reference.Kind);
+                    if (context is not null && !string.Equals(referenceContext, context, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
                     usages.Add(new MetadataUsage(
                         obj.Id,
                         obj.Name,
                         obj.SourcePath,
-                        MetadataRefContexts.FromReference(reference.Kind),
+                        referenceContext,
                         Line: null,
                         reference.Detail));
                 }
             }
         }
 
-        return MetadataUsageSummary.From(usages, limit);
+        return MetadataUsageSummary.From(usages, limit, context);
     }
 
     private static MetadataCard Card(MdObject obj, int depth, int maxChildren)

@@ -96,5 +96,10 @@ public interface IGraphQuery
     /// </summary>
     /// <param name="id">Идентификатор объекта метаданных.</param>
     /// <param name="limit">Предел числа примеров обращений; счётчики остаются полными.</param>
-    MetadataUsageSummary GetMetadataUsages(string? id, int limit = 20);
+    /// <param name="context">
+    /// Контекст из <see cref="MetadataRefContexts.All"/>: тогда в сводку попадают только такие
+    /// обращения, а счётчики, читатели и примеры пересчитываются по ним. <see langword="null"/> —
+    /// все контексты.
+    /// </param>
+    MetadataUsageSummary GetMetadataUsages(string? id, int limit = 20, string? context = null);
 }

@@ -480,7 +480,11 @@ public sealed class IndexReader
     /// </summary>
     /// <param name="targetId">Идентификатор объекта метаданных.</param>
     /// <param name="limit">Предел числа примеров обращений в ответе.</param>
-    public MetadataUsageSummary GetMetadataUsages(string targetId, int limit = 20)
+    /// <param name="context">
+    /// Контекст для фильтра из <see cref="MetadataRefContexts.All"/>: сужение уходит в SQL,
+    /// поэтому из таблицы читаются только нужные строки. <see langword="null"/> — все контексты.
+    /// </param>
+    public MetadataUsageSummary GetMetadataUsages(string targetId, int limit = 20, string? context = null)
     {
         if (string.IsNullOrWhiteSpace(targetId))
         {
@@ -489,13 +493,26 @@ public sealed class IndexReader
 
         return _index.WithLock(() =>
         {
+            // Фильтр по контексту — обычное равенство по столбцу: индекс idx_refs_target(target_id)
+            // ищет строки объекта, а context отсекается на них же, без второго прохода.
             using var command = _index.CreateCommand(
-                """
-                SELECT r.source_id, n.name, n.source_path, r.context, r.line, r.detail
-                FROM metadata_refs r LEFT JOIN nodes n ON n.id = r.source_id
-                WHERE r.target_id = @id
-                """);
+                context is null
+                    ? """
+                      SELECT r.source_id, n.name, n.source_path, r.context, r.line, r.detail
+                      FROM metadata_refs r LEFT JOIN nodes n ON n.id = r.source_id
+                      WHERE r.target_id = @id
+                      """
+                    : """
+                      SELECT r.source_id, n.name, n.source_path, r.context, r.line, r.detail
+                      FROM metadata_refs r LEFT JOIN nodes n ON n.id = r.source_id
+                      WHERE r.target_id = @id AND r.context = @context
+                      """);
             command.Parameters.AddWithValue("@id", targetId.Trim());
+            if (context is not null)
+            {
+                command.Parameters.AddWithValue("@context", context);
+            }
+
             using var reader = command.ExecuteReader();
             var usages = new List<MetadataUsage>();
             while (reader.Read())
@@ -509,7 +526,7 @@ public sealed class IndexReader
                     reader.IsDBNull(5) ? null : reader.GetString(5)));
             }
 
-            return MetadataUsageSummary.From(usages, limit);
+            return MetadataUsageSummary.From(usages, limit, context);
         });
     }
 
