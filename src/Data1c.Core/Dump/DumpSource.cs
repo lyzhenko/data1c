@@ -36,6 +36,18 @@ public interface IDumpSource
     Stream OpenRead(DumpFile file);
 }
 
+/// <summary>
+/// Источник, у которого один и тот же путь может существовать в нескольких версиях: база
+/// конфигурации и расширения. Нужен поиску по тексту, чтобы показать обе версии файла
+/// и прочитать каждую из своего источника.
+/// </summary>
+public interface IVersionedDumpSource : IDumpSource
+{
+    /// <summary>Все версии файлов с указанием источника, из которого читается версия.</summary>
+    IEnumerable<(int SourceIndex, IDumpSource Source, DumpFile File)> EnumerateVersions(
+        CancellationToken cancellationToken = default);
+}
+
 /// <summary>Операции над путями внутри выгрузки (всегда «/», без ведущего слэша).</summary>
 public static class DumpPath
 {

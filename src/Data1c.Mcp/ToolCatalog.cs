@@ -21,9 +21,6 @@ public sealed class ToolCatalog
     /// <summary>Расширения, по которым ищет grep, если агент не задал свои.</summary>
     private static readonly IReadOnlyCollection<string> DefaultGrepExtensions = [".bsl", ".xml"];
 
-    /// <summary>Предел строк, читаемых из одного файла при поиске: защита от гигантских модулей.</summary>
-    private const int MaxLinesPerFile = 60_000;
-
     private readonly Lock _sessionGate = new();
     private readonly List<ToolSpec> _tools;
     private AnalysisSession _session;
@@ -675,9 +672,6 @@ public sealed class ToolCatalog
             return Task.FromResult($"Разбор запущен заново. Состояние: {Session.State}");
         });
 
-    /// <summary>Совпадение без сведений об объекте: их добавляет вызывающий, когда знает владельца.</summary>
-    private sealed record RawHit(int Line, string Text, List<string> Context);
-
     /// <summary>Готовое совпадение: где найдено, из какого источника и какому объекту принадлежит файл.</summary>
     private sealed record GrepHit(
         string? Owner,
@@ -702,86 +696,58 @@ public sealed class ToolCatalog
         var contextLines = arguments.GetInt("context", 1, 0, 3);
         var waitMs = arguments.GetInt("waitMs", 60_000, 0, 600_000);
 
-        var matcher = BuildMatcher(pattern, isRegex, ignoreCase);
+        CodeSearchResult found;
+        try
+        {
+            // Поиск по тексту живёт в ядре (CodeSearchService): своей реализации сканирования у сервера нет.
+            // Список файлов берётся из индекса — обход каталога выгрузки стоил несколько секунд.
+            // У составного источника список не подставляем: нужно показать обе версии перекрытых файлов.
+            var reader = source is IVersionedDumpSource ? null : Session.GetIndexReader();
+            found = new CodeSearchService(source).Search(
+                pattern,
+                new CodeSearchOptions
+                {
+                    MaxResults = limit,
+                    MaxMatchesPerFile = 10,
+                    ContextLines = contextLines,
+                    Regex = isRegex,
+                    CaseSensitive = !ignoreCase,
+                    Extensions = extensions,
+                    PathPrefixes = prefixes,
+                    Paths = reader?.FilePaths(extensions, prefixes),
+                },
+                cancellationToken);
+        }
+        catch (ArgumentException exception)
+        {
+            throw new ToolException($"Шаблон поиска не разобран: {exception.Message}");
+        }
+
         var composite = source as CompositeDumpSource;
+        var files = found.Hits.Select(static entry => entry.Path).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
-        // Разбор нужен только ради имён владельцев, поэтому ждём его ограниченное время:
-        // на большой выгрузке первый вызов иначе упирается в таймаут клиента.
-        var (owners, ownersResolved) = await OwnerIndexAsync(waitMs, cancellationToken);
+        // Владельцы: в режиме индекса они берутся из базы сразу, иначе ждём разбор не дольше waitMs.
+        var (owners, ownersResolved) = await OwnersAsync(files, waitMs, cancellationToken);
 
-        var files = new List<SourcedDumpFile>();
-        if (composite is not null)
-        {
-            files.AddRange(composite
-                .EnumerateAll(cancellationToken)
-                .Where(entry => Accept(entry.File, extensions, prefixes)));
-        }
-        else
-        {
-            files.AddRange(source
-                .EnumerateFiles(cancellationToken)
-                .Where(file => Accept(file, extensions, prefixes))
-                .Select(file => new SourcedDumpFile(0, source, file)));
-        }
-
-        var hits = new List<GrepHit>();
-        var gate = new Lock();
-        var scanned = 0;
-        var matchedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var stop = new int[1];
+        var matchedFiles = new HashSet<string>(files, StringComparer.OrdinalIgnoreCase);
         var overriddenFound = false;
-
-        Parallel.ForEach(
-            files,
-            new ParallelOptions
-            {
-                MaxDegreeOfParallelism = Environment.ProcessorCount,
-                CancellationToken = cancellationToken,
-            },
-            (entry, state) =>
-            {
-                if (Volatile.Read(ref stop[0]) == 1)
-                {
-                    state.Stop();
-                    return;
-                }
-
-                Interlocked.Increment(ref scanned);
-                List<RawHit> found;
-                try
-                {
-                    found = ScanFile(source, entry.File, matcher, contextLines, limit, cancellationToken);
-                }
-                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or NotSupportedException)
-                {
-                    // Файл занят выгрузкой 1С или исчез между запросами — поиск продолжается.
-                    return;
-                }
-
-                if (found.Count == 0)
-                {
-                    return;
-                }
-
-                var owner = owners.Find(entry.File.RelativePath);
-                var overridden = composite?.IsOverridden(entry.File.RelativePath) ?? false;
-
-                lock (gate)
-                {
-                    foreach (var hit in found)
-                    {
-                        if (hits.Count >= limit)
-                        {
-                            Volatile.Write(ref stop[0], 1);
-                            break;
-                        }
-
-                        matchedFiles.Add(entry.File.RelativePath);
-                        overriddenFound |= overridden;
-                        hits.Add(new GrepHit(owner, entry.Source.DisplayName, overridden, entry.File.RelativePath, hit.Line, hit.Text, hit.Context));
-                    }
-                }
-            });
+        var hits = new List<GrepHit>(found.Hits.Count);
+        foreach (var entry in found.Hits)
+        {
+            var overridden = composite?.IsOverridden(entry.Path) ?? false;
+            overriddenFound |= overridden;
+            var sourceName = composite is not null && entry.SourceIndex >= 0 && entry.SourceIndex < composite.Sources.Count
+                ? composite.Sources[entry.SourceIndex].DisplayName
+                : source.DisplayName;
+            hits.Add(new GrepHit(
+                owners.TryGetValue(entry.Path, out var owner) ? owner : null,
+                sourceName,
+                overridden,
+                entry.Path,
+                entry.Line,
+                entry.Text,
+                [.. entry.Context]));
+        }
 
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -798,10 +764,10 @@ public sealed class ToolCatalog
             regex = isRegex,
             ignoreCase,
             sources = SourceNames(source),
-            filesScanned = Volatile.Read(ref scanned),
+            filesScanned = found.ScannedFiles,
             filesMatched = matchedFiles.Count,
             matches = hits.Count,
-            truncated = Volatile.Read(ref stop[0]) == 1,
+            truncated = found.Truncated,
             ownersResolved,
             byOwner = ownerSummary,
             note = BuildGrepNote(overriddenFound, ownersResolved),
@@ -835,111 +801,60 @@ public sealed class ToolCatalog
         return parts.Count == 0 ? null : string.Join(' ', parts);
     }
 
-    /// <summary>Читает файл и возвращает совпадения с окружением.</summary>
-    private static List<RawHit> ScanFile(
-        IDumpSource source,
-        DumpFile file,
-        Func<string, bool> matcher,
-        int contextLines,
-        int limit,
-        CancellationToken cancellationToken)
-    {
-        var lines = new List<string>(1024);
-        using (var stream = source.OpenRead(file))
-        using (var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
-        {
-            while (reader.ReadLine() is { } line)
-            {
-                lines.Add(line);
-                if (lines.Count >= MaxLinesPerFile)
-                {
-                    break;
-                }
-            }
-        }
-
-        var found = new List<RawHit>();
-        for (var index = 0; index < lines.Count && found.Count < limit; index++)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!matcher(lines[index]))
-            {
-                continue;
-            }
-
-            var from = Math.Max(0, index - contextLines);
-            var to = Math.Min(lines.Count - 1, index + contextLines);
-            var context = new List<string>(Math.Max(0, to - from));
-            for (var neighbour = from; neighbour <= to; neighbour++)
-            {
-                if (neighbour != index)
-                {
-                    context.Add(lines[neighbour].Trim());
-                }
-            }
-
-            found.Add(new RawHit(index + 1, lines[index].Trim(), context));
-        }
-
-        return found;
-    }
-
     /// <summary>
     /// Карта «файл выгрузки → объект метаданных». Модули сопоставляются точно (по пути модуля),
     /// остальные файлы — по каталогу объекта: у схемы компоновки данных или макета отчёта нет
     /// собственного объекта в модели, но владелец у них всё равно есть — сам отчёт.
     /// </summary>
-    private sealed class OwnerIndex
+    /// <remarks>
+    /// В режиме индекса карта строится по таблицам сразу — ждать разбор не нужно. Без индекса
+    /// приходится ждать разбор, но не дольше <paramref name="waitMs"/>; если он не успел,
+    /// поиск всё равно отдаёт совпадения, просто без имён объектов.
+    /// </remarks>
+    private async Task<(IReadOnlyDictionary<string, string> Owners, bool Resolved)> OwnersAsync(
+        IReadOnlyList<string> files,
+        int waitMs,
+        CancellationToken cancellationToken)
     {
-        private readonly IReadOnlyDictionary<string, string> _byFile;
-        private readonly IReadOnlyList<(string Prefix, string Owner)> _byDirectory;
-
-        public OwnerIndex(
-            IReadOnlyDictionary<string, string> byFile,
-            IReadOnlyList<(string Prefix, string Owner)> byDirectory)
+        var empty = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (files.Count == 0)
         {
-            _byFile = byFile;
-            _byDirectory = byDirectory;
+            return (empty, Session.Result is not null || Session.GetIndexReader() is not null);
         }
 
-        public string? Find(string relativePath)
+        if (Session.GetIndexReader() is { } reader)
         {
-            if (_byFile.TryGetValue(relativePath, out var owner))
-            {
-                return owner;
-            }
+            var owners = new Dictionary<string, string>(reader.OwnersOf(files), StringComparer.OrdinalIgnoreCase);
+            var directories = reader.TopLevelObjectDirectories()
+                .OrderByDescending(static entry => entry.Directory.Length)
+                .ToList();
 
-            string? best = null;
-            var bestLength = 0;
-            foreach (var (prefix, candidate) in _byDirectory)
+            foreach (var file in files)
             {
-                if (prefix.Length > bestLength && relativePath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                if (owners.ContainsKey(file))
                 {
-                    best = candidate;
-                    bestLength = prefix.Length;
+                    continue;
+                }
+
+                var match = directories.FirstOrDefault(entry =>
+                    file.StartsWith(entry.Directory + "/", StringComparison.OrdinalIgnoreCase));
+                if (match.Owner is not null)
+                {
+                    owners[file] = match.Owner;
                 }
             }
 
-            return best;
+            return (owners, true);
         }
-    }
 
-    /// <summary>
-    /// Строит карту владельцев, ожидая разбор не дольше <paramref name="waitMs"/>. Если разбор не успел
-    /// или не удался, поиск всё равно отдаёт совпадения — просто без имён объектов.
-    /// </summary>
-    private async Task<(OwnerIndex Index, bool Resolved)> OwnerIndexAsync(int waitMs, CancellationToken cancellationToken)
-    {
-        var session = Session;
-        var result = session.Result;
-
+        var result = Session.Result;
         if (result is null && waitMs > 0)
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(waitMs);
             try
             {
-                result = await session.GetAsync(timeout.Token);
+                result = await Session.GetAsync(timeout.Token);
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
@@ -954,7 +869,7 @@ public sealed class ToolCatalog
 
         if (result is null)
         {
-            return (new OwnerIndex(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), []), false);
+            return (empty, false);
         }
 
         var byFile = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -966,43 +881,28 @@ public sealed class ToolCatalog
             }
         }
 
-        var byDirectory = new List<(string Prefix, string Owner)>();
-        foreach (var obj in result.Metadata.Objects)
+        var byDirectory = result.Metadata.Objects
+            .Where(static obj => obj.IsTopLevel && !string.IsNullOrEmpty(obj.Directory))
+            .Select(static obj => (Prefix: obj.Directory + "/", Owner: obj.Id))
+            .OrderByDescending(static entry => entry.Prefix.Length)
+            .ToList();
+
+        foreach (var file in files)
         {
-            if (obj.IsTopLevel && !string.IsNullOrEmpty(obj.Directory))
+            if (byFile.ContainsKey(file))
             {
-                byDirectory.Add((obj.Directory + "/", obj.Id));
+                continue;
+            }
+
+            var match = byDirectory.FirstOrDefault(entry =>
+                file.StartsWith(entry.Prefix, StringComparison.OrdinalIgnoreCase));
+            if (match.Owner is not null)
+            {
+                byFile[file] = match.Owner;
             }
         }
 
-        return (new OwnerIndex(byFile, byDirectory), true);
-    }
-
-    private static Func<string, bool> BuildMatcher(string pattern, bool isRegex, bool ignoreCase)
-    {
-        if (!isRegex)
-        {
-            var comparison = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-            return line => line.Contains(pattern, comparison);
-        }
-
-        var options = RegexOptions.CultureInvariant;
-        if (ignoreCase)
-        {
-            options |= RegexOptions.IgnoreCase;
-        }
-
-        Regex regex;
-        try
-        {
-            regex = new Regex(pattern, options);
-        }
-        catch (ArgumentException exception)
-        {
-            throw new ToolException($"Регулярное выражение не разобрано: {exception.Message}");
-        }
-
-        return line => regex.IsMatch(line);
+        return (byFile, true);
     }
 
     private static IReadOnlyCollection<string> NormalizeExtensions(IReadOnlyList<string>? values)
@@ -1019,30 +919,6 @@ public sealed class ToolCatalog
         }
 
         return result;
-    }
-
-    private static bool Accept(DumpFile file, IReadOnlyCollection<string> extensions, IReadOnlyList<string>? prefixes)
-    {
-        if (!extensions.Contains(file.Extension))
-        {
-            return false;
-        }
-
-        if (prefixes is null || prefixes.Count == 0)
-        {
-            return true;
-        }
-
-        foreach (var prefix in prefixes)
-        {
-            var normalized = DumpPath.Normalize(prefix);
-            if (file.RelativePath.StartsWith(normalized, StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     private static IReadOnlyList<string> SourceNames(IDumpSource source) =>

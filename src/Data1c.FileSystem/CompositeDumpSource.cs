@@ -23,7 +23,7 @@ public sealed record SourcedDumpFile(int SourceIndex, IDumpSource Source, DumpFi
 /// что и в базе, и искать надо в обеих версиях.
 /// </para>
 /// </remarks>
-public sealed class CompositeDumpSource : IDumpSource
+public sealed class CompositeDumpSource : IDumpSource, IVersionedDumpSource
 {
     /// <summary>Корневые файлы выгрузки, которые не перекрываются расширением.</summary>
     private static readonly HashSet<string> RootFiles = new(StringComparer.OrdinalIgnoreCase)
@@ -82,6 +82,16 @@ public sealed class CompositeDumpSource : IDumpSource
                 cancellationToken.ThrowIfCancellationRequested();
                 yield return version;
             }
+        }
+    }
+
+    /// <summary>Версии файлов с источником каждой версии: поиск по тексту читает их напрямую.</summary>
+    public IEnumerable<(int SourceIndex, IDumpSource Source, DumpFile File)> EnumerateVersions(
+        CancellationToken cancellationToken = default)
+    {
+        foreach (var entry in EnumerateAll(cancellationToken))
+        {
+            yield return (entry.SourceIndex, entry.Source, entry.File);
         }
     }
 

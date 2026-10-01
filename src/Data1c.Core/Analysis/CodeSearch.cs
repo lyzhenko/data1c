@@ -28,6 +28,15 @@ public sealed record CodeSearchOptions
 
     /// <summary>Расширения файлов, по которым идёт поиск. Пустой набор — текстовые по умолчанию.</summary>
     public IReadOnlyCollection<string>? Extensions { get; init; }
+
+    /// <summary>Ограничить поиск префиксами путей внутри выгрузки: Reports/, Documents/Заказ/.</summary>
+    public IReadOnlyList<string>? PathPrefixes { get; init; }
+
+    /// <summary>
+    /// Готовый список файлов вместо обхода источника: сервер берёт его из индекса, и поиск
+    /// не тратит секунды на обход десятков тысяч файлов выгрузки.
+    /// </summary>
+    public IReadOnlyList<string>? Paths { get; init; }
 }
 
 /// <summary>Одно совпадение в тексте.</summary>
@@ -35,7 +44,8 @@ public sealed record CodeSearchOptions
 /// <param name="Line">Номер строки (1-based).</param>
 /// <param name="Text">Строка, в которой найдено совпадение.</param>
 /// <param name="Context">Строки вокруг совпадения с номерами.</param>
-public sealed record CodeSearchHit(string Path, int Line, string Text, IReadOnlyList<string> Context);
+/// <param name="SourceIndex">Номер источника: у перекрытых файлов база и расширение дают разные номера.</param>
+public sealed record CodeSearchHit(string Path, int Line, string Text, IReadOnlyList<string> Context, int SourceIndex = 0);
 
 /// <summary>Результат поиска по тексту.</summary>
 public sealed record CodeSearchResult(
@@ -87,61 +97,160 @@ public sealed class CodeSearchService
         }
 
         var comparison = options.CaseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
-        var hits = new List<CodeSearchHit>();
-        var scanned = 0;
-        var truncated = false;
-
-        var candidates = _source.EnumerateFiles(cancellationToken)
-            .Where(file => extensions.Contains(Path.GetExtension(file.RelativePath)))
-            .OrderByDescending(static file => file.RelativePath.EndsWith(".bsl", StringComparison.OrdinalIgnoreCase))
+        var prefixes = options.PathPrefixes is { Count: > 0 } ? options.PathPrefixes : null;
+        var candidates = EnumerateCandidates(extensions, prefixes, options.Paths, cancellationToken)
+            .OrderByDescending(static entry => entry.File.RelativePath.EndsWith(".bsl", StringComparison.OrdinalIgnoreCase))
+            .ThenBy(static entry => entry.File.RelativePath, StringComparer.Ordinal)
+            .ThenBy(static entry => entry.SourceIndex)
             .ToList();
 
-        foreach (var file in candidates)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (hits.Count >= options.MaxResults || stopwatch.Elapsed > options.Deadline)
-            {
-                truncated = hits.Count >= options.MaxResults || scanned < candidates.Count;
-                break;
-            }
+        var hits = new List<CodeSearchHit>();
+        var perFile = new List<CodeSearchHit>?[candidates.Count];
+        var scanned = 0;
+        var total = 0;
+        var stop = 0;
 
-            string[] lines;
-            try
+        // Файлы читаются параллельно: сотни мегабайт модулей иначе просматриваются слишком долго.
+        // Порядок выдачи задаётся порядком файлов, поэтому ответ не зависит от расписания потоков.
+        Parallel.For(
+            0,
+            candidates.Count,
+            new ParallelOptions
             {
-                lines = ReadLines(file);
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or NotSupportedException)
+                MaxDegreeOfParallelism = Environment.ProcessorCount,
+                CancellationToken = cancellationToken,
+            },
+            index =>
+            {
+                if (Volatile.Read(ref stop) == 1 || stopwatch.Elapsed > options.Deadline)
+                {
+                    return;
+                }
+
+                var (sourceIndex, fileSource, file) = candidates[index];
+                string[] lines;
+                try
+                {
+                    lines = ReadLines(fileSource, file);
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or NotSupportedException)
+                {
+                    return;
+                }
+
+                Interlocked.Increment(ref scanned);
+                var found = new List<CodeSearchHit>();
+                for (var line = 0; line < lines.Length && found.Count < options.MaxMatchesPerFile; line++)
+                {
+                    if ((line & 0x3FF) == 0 && Volatile.Read(ref stop) == 1)
+                    {
+                        break;
+                    }
+
+                    var isMatch = regex is not null ? regex.IsMatch(lines[line]) : lines[line].Contains(query, comparison);
+                    if (!isMatch)
+                    {
+                        continue;
+                    }
+
+                    found.Add(new CodeSearchHit(
+                        file.RelativePath,
+                        line + 1,
+                        lines[line].Trim(),
+                        BuildContext(lines, line, options.ContextLines),
+                        sourceIndex));
+                }
+
+                if (found.Count == 0)
+                {
+                    return;
+                }
+
+                perFile[index] = found;
+                if (Interlocked.Add(ref total, found.Count) >= options.MaxResults)
+                {
+                    Volatile.Write(ref stop, 1);
+                }
+            });
+
+        for (var index = 0; index < perFile.Length && hits.Count < options.MaxResults; index++)
+        {
+            if (perFile[index] is not { } found)
             {
                 continue;
             }
 
-            scanned++;
-            var inFile = 0;
-            for (var index = 0; index < lines.Length && inFile < options.MaxMatchesPerFile; index++)
+            foreach (var hit in found)
             {
-                var isMatch = regex is not null ? regex.IsMatch(lines[index]) : lines[index].Contains(query, comparison);
-                if (!isMatch)
-                {
-                    continue;
-                }
-
-                hits.Add(new CodeSearchHit(file.RelativePath, index + 1, lines[index].Trim(), BuildContext(lines, index, options.ContextLines)));
-                inFile++;
                 if (hits.Count >= options.MaxResults)
                 {
-                    truncated = true;
                     break;
                 }
+
+                hits.Add(hit);
             }
         }
 
         stopwatch.Stop();
-        return new CodeSearchResult(hits, scanned, truncated, stopwatch.Elapsed);
+        var truncated = hits.Count >= options.MaxResults || Volatile.Read(ref scanned) < candidates.Count;
+        return new CodeSearchResult(hits, Volatile.Read(ref scanned), truncated, stopwatch.Elapsed);
     }
 
-    private string[] ReadLines(DumpFile file)
+    /// <summary>
+    /// Файлы для поиска. У составного источника берутся все версии, включая перекрытые: иначе
+    /// версия из базы не попала бы в выдачу. Каждая версия читается из своего источника.
+    /// </summary>
+    private IEnumerable<(int SourceIndex, IDumpSource Source, DumpFile File)> EnumerateCandidates(
+        IReadOnlySet<string> extensions,
+        IReadOnlyList<string>? prefixes,
+        IReadOnlyList<string>? paths,
+        CancellationToken cancellationToken)
     {
-        using var stream = _source.OpenRead(file);
+        if (_source is IVersionedDumpSource versioned)
+        {
+            foreach (var entry in versioned.EnumerateVersions(cancellationToken))
+            {
+                if (Accept(entry.File, extensions, prefixes))
+                {
+                    yield return entry;
+                }
+            }
+
+            yield break;
+        }
+
+        var files = _source.EnumerateFiles(cancellationToken);
+        if (paths is { Count: > 0 } prepared)
+        {
+            foreach (var path in prepared)
+            {
+                var file = new DumpFile(path, 0, DateTimeOffset.UnixEpoch);
+                if (Accept(file, extensions, prefixes))
+                {
+                    yield return (0, _source, file);
+                }
+            }
+
+            yield break;
+        }
+
+        foreach (var file in files)
+        {
+            if (Accept(file, extensions, prefixes))
+            {
+                yield return (0, _source, file);
+            }
+        }
+    }
+
+    private static bool Accept(DumpFile file, IReadOnlySet<string> extensions, IReadOnlyList<string>? prefixes) =>
+        extensions.Contains(Path.GetExtension(file.RelativePath))
+        && (prefixes is null
+            || prefixes.Any(prefix => file.RelativePath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)));
+
+    private static string[] ReadLines(IDumpSource source, DumpFile file)
+    {
+        using var stream = source.OpenRead(file);
         using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
         return reader.ReadToEnd().Split('\n');
     }

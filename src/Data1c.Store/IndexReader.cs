@@ -715,6 +715,139 @@ public sealed class IndexReader
         return (IReadOnlyList<string>)result;
     });
 
+    /// <summary>
+    /// Пути файлов выгрузки из индекса: поиску по тексту не нужен обход каталога.
+    /// Сначала модули BSL — совпадения в коде нужнее, чем в XML.
+    /// </summary>
+    public IReadOnlyList<string> FilePaths(
+        IReadOnlyCollection<string>? extensions,
+        IReadOnlyList<string>? prefixes,
+        int limit = 200_000) => _index.WithLock(() =>
+    {
+        var sql = new StringBuilder("SELECT path FROM files WHERE 1 = 1");
+        if (extensions is { Count: > 0 })
+        {
+            sql.Append(" AND (").Append(LikeList(extensions.Count, "@ext")).Append(')');
+        }
+
+        if (prefixes is { Count: > 0 })
+        {
+            sql.Append(" AND (").Append(LikeList(prefixes.Count, "@pre")).Append(')');
+        }
+
+        sql.Append(" ORDER BY (path LIKE '%.bsl') DESC, path LIMIT @limit");
+
+        using var command = _index.CreateCommand(sql.ToString());
+        if (extensions is { Count: > 0 })
+        {
+            var index = 0;
+            foreach (var extension in extensions)
+            {
+                command.Parameters.AddWithValue($"@ext{index++}", "%" + EscapeLike(extension));
+            }
+        }
+
+        if (prefixes is { Count: > 0 })
+        {
+            var index = 0;
+            foreach (var prefix in prefixes)
+            {
+                command.Parameters.AddWithValue($"@pre{index++}", EscapeLike(prefix) + "%");
+            }
+        }
+
+        command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 1_000_000));
+
+        using var reader = command.ExecuteReader();
+        var result = new List<string>();
+        while (reader.Read())
+        {
+            result.Add(reader.GetString(0));
+        }
+
+        return (IReadOnlyList<string>)result;
+    });
+
+    /// <summary>Владелец файла выгрузки: для модулей — объект, которому принадлежит файл (связь Contains),
+    /// для XML — объект метаданных с этим путём. Нужно поиску по тексту, чтобы не ждать разбор.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> OwnersOf(IReadOnlyList<string> paths)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (paths.Count == 0)
+        {
+            return result;
+        }
+
+        return _index.WithLock(() =>
+        {
+            foreach (var chunk in Chunk([.. paths], 400))
+            {
+                using (var modules = _index.CreateCommand(
+                    $"""
+                    SELECT n.source_path, e.source_id FROM edges e JOIN nodes n ON n.id = e.target_id
+                    WHERE e.kind = 'Contains' AND n.kind = 'Module' AND n.source_path IN ({Placeholders(chunk.Count, "@p")})
+                    """))
+                {
+                    AddIdParameters(modules, chunk, "@p");
+                    using var reader = modules.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        if (!reader.IsDBNull(0))
+                        {
+                            result[reader.GetString(0)] = TopLevel(reader.GetString(1));
+                        }
+                    }
+                }
+
+                using var objects = _index.CreateCommand(
+                    $"SELECT source_path, id FROM metadata_objects WHERE source_path IN ({Placeholders(chunk.Count, "@p")})");
+                AddIdParameters(objects, chunk, "@p");
+                using var objectReader = objects.ExecuteReader();
+                while (objectReader.Read())
+                {
+                    if (!objectReader.IsDBNull(0))
+                    {
+                        result[objectReader.GetString(0)] = TopLevel(objectReader.GetString(1));
+                    }
+                }
+            }
+
+            return (IReadOnlyDictionary<string, string>)result;
+        });
+    }
+
+    /// <summary>
+    /// Каталоги объектов верхнего уровня: файлы без собственного объекта (макеты, схемы, формы)
+    /// получают владельца по каталогу, в котором лежат.
+    /// </summary>
+    public IReadOnlyList<(string Directory, string Owner)> TopLevelObjectDirectories() => _index.WithLock(() =>
+    {
+        using var command = _index.CreateCommand(
+            "SELECT id, source_path FROM metadata_objects WHERE is_top_level = 1 AND source_path IS NOT NULL");
+        using var reader = command.ExecuteReader();
+        var result = new List<(string, string)>();
+        while (reader.Read())
+        {
+            var path = reader.GetString(1);
+            var separator = path.LastIndexOf('.');
+            var directory = separator > 0 ? path[..separator] : path;
+            if (directory.Length > 0)
+            {
+                result.Add((directory, reader.GetString(0)));
+            }
+        }
+
+        return (IReadOnlyList<(string, string)>)result;
+    });
+
+    /// <summary>Идентификатор объекта верхнего уровня: «Document.Заказ/Form.Форма» → «Document.Заказ».</summary>
+    private static string TopLevel(string id)
+    {
+        var separator = id.IndexOf('/');
+        return separator < 0 ? id : id[..separator];
+    }
+
     /// <summary>Поиск объектов метаданных по имени и синониму.</summary>
     public IReadOnlyList<(string Id, string Kind, string Name, string? Synonym)> FindMetadataObjects(string query, int limit = 20)
     {
@@ -901,6 +1034,10 @@ public sealed class IndexReader
 
     private static string Placeholders(int count, string prefix) =>
         string.Join(", ", Enumerable.Range(0, count).Select(i => prefix + i.ToString(CultureInfo.InvariantCulture)));
+
+    /// <summary>Условие LIKE по каждому значению: <c>path LIKE @ext0 OR path LIKE @ext1</c>.</summary>
+    private static string LikeList(int count, string prefix) =>
+        string.Join(" OR ", Enumerable.Range(0, count).Select(i => $"path LIKE {prefix}{i.ToString(CultureInfo.InvariantCulture)}"));
 
     private static void AddIdParameters(SqliteCommand command, List<string> ids, string prefix)
     {

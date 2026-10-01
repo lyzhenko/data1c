@@ -1,3 +1,4 @@
+using System.IO.Enumeration;
 using Data1c.Core.Dump;
 
 namespace Data1c.FileSystem;
@@ -29,22 +30,25 @@ public sealed class FileSystemDumpSource : IDumpSource
 
     public IEnumerable<DumpFile> EnumerateFiles(CancellationToken cancellationToken = default)
     {
-        foreach (var path in Directory.EnumerateFiles(RootPath, "*", Enumeration))
+        var root = RootPath;
+
+        // FileSystemEnumerable берёт размер и время правки прямо из записи каталога: отдельный
+        // stat на каждый из десятков тысяч файлов выгрузки стоил несколько секунд на ровном месте.
+        var files = new FileSystemEnumerable<DumpFile>(
+            root,
+            (ref FileSystemEntry entry) => new DumpFile(
+                Path.GetRelativePath(root, entry.ToFullPath()).Replace('\\', '/'),
+                entry.Length,
+                entry.LastWriteTimeUtc),
+            Enumeration)
+        {
+            ShouldIncludePredicate = static (ref FileSystemEntry entry) => !entry.IsDirectory,
+        };
+
+        foreach (var file in files)
         {
             cancellationToken.ThrowIfCancellationRequested();
-
-            FileInfo info;
-            try
-            {
-                info = new FileInfo(path);
-            }
-            catch (IOException)
-            {
-                continue;
-            }
-
-            var relative = Path.GetRelativePath(RootPath, path).Replace('\\', '/');
-            yield return new DumpFile(relative, info.Exists ? info.Length : 0, info.Exists ? info.LastWriteTimeUtc : DateTimeOffset.UnixEpoch);
+            yield return file;
         }
     }
 

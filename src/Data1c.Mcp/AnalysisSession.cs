@@ -148,6 +148,31 @@ public sealed class AnalysisSession : IDisposable
     public bool IsIndexReady => _indexGraph is not null;
 
     /// <summary>
+    /// Читатель готового индекса для инструментов. Возвращает null, если индекса ещё нет: сборка
+    /// длится минуты, и инструмент сам решает — ждать её или ответить без индекса. Индекс открывается
+    /// только на чтение и переиспользуется.
+    /// </summary>
+    public IndexReader? GetIndexReader()
+    {
+        var path = IndexPath;
+        if (path is null || !IsUsableIndex(path))
+        {
+            return null;
+        }
+
+        lock (_gate)
+        {
+            if (_index is null)
+            {
+                _index = SqliteIndex.OpenReadOnly(path);
+                _indexGraph = new IndexGraphQuery(new IndexReader(_index));
+            }
+
+            return new IndexReader(_index);
+        }
+    }
+
+    /// <summary>
     /// Сводка по индексу — для инструмента status, когда разбора в память нет.
     /// Если индекс ещё не открыт, читается кратковременно и только на чтение.
     /// </summary>
