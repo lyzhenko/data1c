@@ -43,7 +43,11 @@ public sealed class SimilarCode
         _options = options ?? new SimilarCodeOptions();
     }
 
-    /// <summary>Ищет похожие реализации по тексту черновика.</summary>
+    /// <summary>
+    /// Ищет похожие реализации по тексту черновика. Вызовы процедур конфигурации при этом остаются
+    /// слабым сигналом: разрешить их в узлы-цели можно только по индексу
+    /// (<see cref="Describe(string, string?, RoutineCallResolver?)"/> с разрешителем источника).
+    /// </summary>
     /// <param name="text">Текст черновика или процедуры.</param>
     /// <param name="limit">Сколько кандидатов вернуть (1…<see cref="SimilarCodeOptions.MaxLimit"/>).</param>
     /// <param name="excludeId">Процедура, которую нужно исключить из выдачи (обычно сам черновик).</param>

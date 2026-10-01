@@ -6,6 +6,7 @@ using Data1c.Core.Graph;
 using Data1c.Core.Platform;
 using Data1c.FileSystem;
 using Data1c.Store;
+using Microsoft.Data.Sqlite;
 
 // Замеры индекса на реальной выгрузке: сборка, размер, время запросов и частичная переиндексация.
 //
@@ -19,6 +20,9 @@ using Data1c.Store;
 //   --no-external    не включать внешние узлы в индекс (меньше размер, меньше связей)
 //   --platform       подключать справку платформы при разборе
 //   --conventions    замерить разбор конвенций: рейтинг модулей и процедур, типовые приёмы
+//   --similar <текст> замерить поиск похожего кода (Э2-5) на черновике
+//   --plans          показать планы запросов поиска похожего кода (EXPLAIN QUERY PLAN)
+//   --read-only      ничего не писать в индекс: пропустить частичную переиндексацию
 //
 // Нормы (выгрузка УНФ 2,9 ГБ, 65 045 файлов): разбор ~20 с, запись ~80 с, индекс ~3,0 ГБ;
 // частичная переиндексация модуля ~1 с; поиск по имени единицы миллисекунд, по подстроке — десятки.
@@ -148,9 +152,97 @@ if (withPlatform)
     Console.WriteLine($"  {"справка платформы (загрузка)",-38}{platformWatch.Elapsed.TotalMilliseconds,8:F0} мс   тем {topics:N0}");
 }
 
+if (Value("--similar") is { } draft)
+{
+    Console.WriteLine();
+    Console.WriteLine("поиск похожего кода (Э2-5):");
+    var similarSource = reader.SimilarCodeSource();
+    SimilarCodeFeatures? features = null;
+    var parseBest = double.MaxValue;
+    var resolveBest = double.MaxValue;
+    for (var attempt = 0; attempt < 3; attempt++)
+    {
+        var plainWatch = Stopwatch.StartNew();
+        _ = SimilarCode.Describe(draft);
+        plainWatch.Stop();
+        parseBest = Math.Min(parseBest, plainWatch.Elapsed.TotalMilliseconds);
+
+        var resolveWatch = Stopwatch.StartNew();
+        features = SimilarCode.Describe(draft, null, similarSource.ResolveCall);
+        resolveWatch.Stop();
+        resolveBest = Math.Min(resolveBest, resolveWatch.Elapsed.TotalMilliseconds);
+    }
+
+    Console.WriteLine($"  признаки черновика:            платформа {features!.PlatformCalls.Count}, "
+        + $"метаданные {features.MetadataReferences.Count}, вызовы процедур {features.RoutineCalls.Count}, "
+        + $"неразрешённые вызовы {features.UnresolvedCalls.Count}");
+    Console.WriteLine($"  разбор черновика:            {parseBest,8:F0} мс");
+    Console.WriteLine($"  разбор и разрешение вызовов: {resolveBest,8:F0} мс");
+
+    var engine = new SimilarCode(similarSource);
+    SimilarCodeResult? answer = null;
+    var bestWatch = double.MaxValue;
+    for (var attempt = 0; attempt < 3; attempt++)
+    {
+        var watch = Stopwatch.StartNew();
+        answer = engine.Find(features, 10);
+        watch.Stop();
+        bestWatch = Math.Min(bestWatch, watch.Elapsed.TotalMilliseconds);
+    }
+
+    Console.WriteLine($"  ответ similar (предел 10):   {bestWatch,8:F0} мс   "
+        + $"кандидатов {answer!.Candidates.Count} из {answer.Considered}");
+    foreach (var candidate in answer.Candidates.Take(3))
+    {
+        Console.WriteLine($"    {candidate.Score:0.000}  {candidate.Name,-40} {candidate.ModulePath}");
+    }
+}
+
+if (Has("--plans"))
+{
+    Console.WriteLine();
+    Console.WriteLine("планы запросов поиска похожего кода (копии запросов из IndexSimilarCodeSource):");
+    using var planConnection = new SqliteConnection(new SqliteConnectionStringBuilder
+    {
+        DataSource = indexPath,
+        Mode = SqliteOpenMode.ReadOnly,
+        Pooling = false,
+    }.ToString());
+    planConnection.Open();
+    Plan(
+        planConnection,
+        "вызовы процедур по цели (стало)",
+        "SELECT source_id FROM edges WHERE kind = 'Calls' AND target_id = @value AND source_id LIKE 'routine:%' LIMIT @cap",
+        ("@value", "routine:module:CommonModules/Общий/Ext/Module.bsl#ОбработатьТовар"),
+        ("@cap", 10000L));
+    Plan(
+        planConnection,
+        "вызовы процедур по тексту (было)",
+        "SELECT source_id FROM edges WHERE kind = 'Calls' AND detail = @value AND source_id LIKE 'routine:%' LIMIT @cap",
+        ("@value", "Общий.ОбработатьТовар"),
+        ("@cap", 10000L));
+    Plan(
+        planConnection,
+        "разрешение вызова: общий модуль",
+        "SELECT node_id FROM symbols WHERE owner_id = @owner AND name_lower = @method LIMIT 1",
+        ("@owner", "CommonModule.Общий"),
+        ("@method", "обработатьтовар"));
+    Plan(
+        planConnection,
+        "разрешение вызова: модуль черновика",
+        "SELECT node_id FROM symbols WHERE module_path = @module AND name_lower = @method LIMIT 1",
+        ("@module", "CommonModules/Общий/Ext/Module.bsl"),
+        ("@method", "обработатьтовар"));
+    Plan(
+        planConnection,
+        "разрешение вызова: единственное имя",
+        "SELECT node_id FROM symbols WHERE name_lower = @method LIMIT 2",
+        ("@method", "обработатьтовар"));
+}
+
 // Частичная переиндексация: правится первый модуль выгрузки, если не задан явно.
 var module = modulePath ?? files.FirstOrDefault(static file => file.RelativePath.EndsWith(".bsl", StringComparison.OrdinalIgnoreCase))?.RelativePath;
-if (module is not null)
+if (module is not null && !Has("--read-only"))
 {
     Console.WriteLine();
     using var writable = SqliteIndex.Open(indexPath);
@@ -195,4 +287,23 @@ void Measure(string title, Func<int> action, int repeat = 3)
     }
 
     Console.WriteLine($"  {title,-38}{best,8:F0} мс   строк {count:N0}");
+}
+
+void Plan(SqliteConnection connection, string title, string sql, params (string Name, object Value)[] parameters)
+{
+    using var command = connection.CreateCommand();
+    command.CommandText = "EXPLAIN QUERY PLAN " + sql;
+    foreach (var (name, value) in parameters)
+    {
+        command.Parameters.AddWithValue(name, value);
+    }
+
+    using var reader = command.ExecuteReader();
+    var steps = new List<string>();
+    while (reader.Read())
+    {
+        steps.Add(reader.GetString(3));
+    }
+
+    Console.WriteLine($"  {title,-38} {string.Join(" → ", steps)}");
 }
