@@ -384,6 +384,25 @@ public sealed class RightsToolTests
         Assert.Contains("Секрет", Text(unresolved["condition"]));
     }
 
+    [Fact]
+    public async Task У_роли_без_RLS_условий_нет()
+    {
+        using var dump = new IndexDump();
+        using var session = new AnalysisSession(
+            new AnalysisRequest { UseIndex = true, IndexPath = dump.IndexPath },
+            dump.Source);
+        await session.QueryAsync(CancellationToken.None);
+
+        var response = await CallAsync(new ToolCatalog(session), new JsonObject { ["role"] = "ПолныеПрава" });
+        var role = response["role"]!;
+
+        Assert.Equal(0, role["rlsObjects"]!.GetValue<int>());
+        var goods = Assert.Single(role["objects"]!.AsArray());
+        Assert.Equal("Catalog.Товары", Text(goods!["object"]));
+        Assert.False(goods["rls"]!.GetValue<bool>());
+        Assert.Null(goods["condition"]);
+    }
+
     /// <summary>Выгрузка с условиями RLS, выложенная на диск, и собранный по ней индекс.</summary>
     private sealed class IndexDump : IDisposable
     {

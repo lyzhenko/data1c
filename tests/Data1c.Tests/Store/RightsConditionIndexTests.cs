@@ -50,6 +50,9 @@ public sealed class RightsConditionIndexTests
             static row => row.TargetId == "Document.Заказ");
         Assert.Equal(MetadataRefContexts.Right, order.Context);
         Assert.Null(order.Condition);
+
+        // У роли без RLS условий нет вовсе.
+        Assert.Empty(reader.RightsConditionsOfRole("Role.ПолныеПрава"));
     }
 
     [Fact]
