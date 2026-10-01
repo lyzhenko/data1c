@@ -84,6 +84,10 @@ public static class MetadataRefContexts
     /// <summary>Обращение из текста запроса: «ИЗ Справочник.Товары».</summary>
     public const string Query = "query";
 
+    /// <summary>Права роли на объект: в <c>detail</c> лежит сжатый перечень прав («Read=true;Insert=false»),
+    /// признак ограничения доступа к данным — метка «RLS».</summary>
+    public const string Right = "right";
+
     /// <summary>
     /// Контекст перекрёстной ссылки объекта метаданных по смыслу ссылки в XML.
     /// Тот же набор значений, что пишет индекс в <c>metadata_refs.context</c> для ссылок.
@@ -97,7 +101,7 @@ public static class MetadataRefContexts
         MdReferenceKind.Form => "form",
         MdReferenceKind.Template => "template",
         MdReferenceKind.Command => "command",
-        MdReferenceKind.RoleRight => "rights",
+        MdReferenceKind.RoleRight => Right,
         MdReferenceKind.EventSource => "event",
         _ => "other",
     };
@@ -123,7 +127,7 @@ public static class MetadataRefContexts
         "form" => "в формах",
         "template" => "в макетах",
         "command" => "в командах",
-        "rights" => "в правах ролей",
+        Right => "в правах ролей",
         "event" => "в подписках на события",
         "other" => "прочее",
         _ => context,

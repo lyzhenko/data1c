@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -30,6 +31,12 @@ public sealed class IndexWriter
     /// <summary>Читать комментарии над процедурами для смыслового поиска (нужно чтение файлов модулей).</summary>
     public bool IncludeComments { get; init; } = true;
 
+    /// <summary>
+    /// Писать права ролей (<c>Roles/&lt;Имя&gt;/Ext/Rights.xml</c>) в <c>metadata_refs</c>.
+    /// Выключено — индекс собирается без прав: на полной выгрузке это десятки тысяч строк.
+    /// </summary>
+    public bool IncludeRights { get; init; } = true;
+
     /// <summary>Полностью перезаписывает индекс данными разбора.</summary>
     public IndexWriteResult Write(IDumpSource source, AnalysisResult result, CancellationToken cancellationToken = default)
     {
@@ -53,6 +60,10 @@ public sealed class IndexWriter
                 WriteSymbols(source, result.Modules, connection, counters, cancellationToken);
                 WriteMetadata(result, connection, counters, cancellationToken);
                 WriteForms(result, connection, counters, cancellationToken);
+                if (IncludeRights)
+                {
+                    WriteRights(source, connection, counters, cancellationToken);
+                }
 
                 _index.SetMeta("dump_path", result.SourceName);
                 _index.SetMeta("indexed_at", DateTimeOffset.UtcNow.ToString("O"));
@@ -1251,6 +1262,88 @@ public sealed class IndexWriter
     }
 
     /// <summary>
+    /// Пишет права ролей в <c>metadata_refs</c>: по строке на пару «роль — объект» с контекстом
+    /// <see cref="MetadataRefContexts.Right"/>, источником — роль, целью — объект, а в <c>detail</c> —
+    /// сжатый перечень прав («Read=true;Insert=false») и метка «RLS».
+    /// </summary>
+    /// <remarks>
+    /// Текст условия RLS в индекс не попадает: условия бывают длинными, а нужны они только когда
+    /// инструмент спрашивает про ограничение конкретной роли, — тогда они читаются из файла роли.
+    /// Файлы прав разбираются параллельно и потоково, а вставка идёт одной подготовленной командой.
+    /// </remarks>
+    private static void WriteRights(
+        IDumpSource source,
+        SqliteConnection connection,
+        Counters counters,
+        CancellationToken cancellationToken)
+    {
+        var paths = new List<string>();
+        foreach (var file in source.EnumerateFiles(cancellationToken))
+        {
+            if (RightsDumpReader.IsRightsFile(file.RelativePath))
+            {
+                paths.Add(file.RelativePath);
+            }
+        }
+
+        if (paths.Count == 0)
+        {
+            return;
+        }
+
+        var reader = new RightsDumpReader();
+        var rows = new ConcurrentBag<(string RoleId, string TargetId, string Detail)>();
+        Parallel.ForEach(
+            paths,
+            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount, CancellationToken = cancellationToken },
+            path =>
+            {
+                try
+                {
+                    using var stream = source.OpenRead(new DumpFile(path, 0, DateTimeOffset.UnixEpoch));
+                    var result = reader.Read(stream, path, includeConditions: false);
+                    foreach (var obj in result.Rights.Objects)
+                    {
+                        if (!obj.IsResolved)
+                        {
+                            continue;
+                        }
+
+                        var detail = RightsDetail.Format(obj.Rights, obj.HasRestriction);
+                        if (detail.Length > 0)
+                        {
+                            rows.Add((result.Rights.RoleId, obj.ObjectId, detail));
+                        }
+                    }
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                    // Права роли не прочитаны: индекс собирается без них, а причину показывает разбор выгрузки.
+                }
+            });
+
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            "INSERT INTO metadata_refs (source_id, target_id, context, line, detail) "
+            + "VALUES (@source, @target, @context, NULL, @detail)";
+        var sourceParam = command.Parameters.Add("@source", SqliteType.Text);
+        var targetParam = command.Parameters.Add("@target", SqliteType.Text);
+        var contextParam = command.Parameters.Add("@context", SqliteType.Text);
+        var detailParam = command.Parameters.Add("@detail", SqliteType.Text);
+        contextParam.Value = MetadataRefContexts.Right;
+
+        foreach (var row in rows)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            sourceParam.Value = row.RoleId;
+            targetParam.Value = row.TargetId;
+            detailParam.Value = row.Detail;
+            command.ExecuteNonQuery();
+            counters.MetadataRefs++;
+        }
+    }
+
+    /// <summary>
     /// Записывает описания форм: саму форму со счётчиками состава и её строки — реквизиты, элементы,
     /// команды и обработчики событий. Реквизиты пишутся раньше элементов, чтобы при чтении обратно
     /// привязка «элемент → реквизит» восстанавливалась по DataPath однозначно.
@@ -1392,7 +1485,6 @@ public sealed class IndexWriter
 
     private static string? Tag(GraphNode node, string key) =>
         node.Tags is not null && node.Tags.TryGetValue(key, out var value) ? value : null;
-
     /// <summary>Свойства объекта метаданных одним JSON-объектом: их читает карточка объекта.</summary>
     private static string? Properties(MdObject obj)
     {
