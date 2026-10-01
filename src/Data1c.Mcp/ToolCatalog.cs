@@ -178,7 +178,28 @@ public sealed class ToolCatalog
                 })
                 .ToList();
 
-            if (filtered.Count == 0 && nestedView.Count == 0)
+            var results = new List<object>(filtered);
+            if (results.Count == 0 && nestedView.Count == 0 && Session.GetIndexReader() is { } reader)
+            {
+                // Запасной путь: смысловой поиск по термам — имя по частям, комментарий, параметры.
+                // Он нужен там, где совпадения по имени нет вовсе («посчитает налог» → процедура).
+                foreach (var symbol in reader.SmartSearch(text, limit))
+                {
+                    results.Add(new
+                    {
+                        id = symbol.NodeId,
+                        kind = "Routine",
+                        name = symbol.Name,
+                        synonym = (string?)null,
+                        metadataKind = (string?)null,
+                        file = symbol.ModulePath,
+                        incoming = (int?)null,
+                        outgoing = (int?)null,
+                    });
+                }
+            }
+
+            if (results.Count == 0 && nestedView.Count == 0)
             {
                 return $"Ничего не найдено по запросу «{text}». Попробуйте часть имени, синоним или путь файла.";
             }
@@ -186,9 +207,9 @@ public sealed class ToolCatalog
             return Render.JsonOf(new
             {
                 query = text,
-                found = filtered.Count,
+                found = results.Count,
                 total = hits.Count,
-                results = filtered,
+                results,
                 nestedFound = nestedView.Count,
                 nested = nestedView,
             });

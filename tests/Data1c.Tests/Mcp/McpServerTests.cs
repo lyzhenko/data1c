@@ -425,6 +425,32 @@ public sealed class McpServerTests
         Assert.Contains("Разбор выгрузки ещё идёт", Text(payload["note"]), StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task Поиск_по_смыслу_находит_процедуру_по_имени_параметра()
+    {
+        // Смысловой поиск по термам работает в режиме индекса: выгрузка раскладывается на диск,
+        // сервер собирает индекс, и уже по нему ищется процедура, у которой «Отказ» — параметр.
+        var root = TestDump.Materialize();
+        try
+        {
+            using var session = new AnalysisSession(new AnalysisRequest { DumpPaths = [root] });
+            await session.QueryAsync(CancellationToken.None);
+
+            var responses = await ExchangeAsync(
+                session,
+                InitializeKnown,
+                ToolCall(2, "search", """{"query":"Отказ"}"""));
+
+            var payload = Json(ContentText(responses, 2));
+            Assert.True(payload["found"]!.GetValue<int>() > 0);
+            Assert.Contains("ПриОткрытии", ContentText(responses, 2), StringComparison.Ordinal);
+        }
+        finally
+        {
+            TestDump.Remove(root);
+        }
+    }
+
     private static async Task<IReadOnlyList<JsonObject>> ExchangeAsync(params string[] messages) =>
         await ExchangeAsync(Session(), messages);
 

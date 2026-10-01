@@ -18,7 +18,7 @@ namespace Data1c.Store;
 internal static class IndexSchema
 {
     /// <summary>Версия схемы. Меняется вместе с DDL.</summary>
-    internal const int Version = 4;
+    internal const int Version = 5;
 
     internal static readonly string[] Statements =
     [
@@ -95,6 +95,7 @@ internal static class IndexSchema
             name TEXT NOT NULL,
             name_lower TEXT NOT NULL,
             synonym TEXT,
+            synonym_lower TEXT,
             uuid TEXT,
             source_path TEXT,
             comment TEXT,
@@ -105,6 +106,10 @@ internal static class IndexSchema
         """,
         "CREATE INDEX IF NOT EXISTS idx_objects_kind ON metadata_objects(kind)",
         "CREATE INDEX IF NOT EXISTS idx_objects_name ON metadata_objects(name_lower)",
+
+        // Синоним ищется так же часто, как имя, а функция lower() в SQLite кириллицу не знает:
+        // приведённое значение хранится рядом и используется индексом.
+        "CREATE INDEX IF NOT EXISTS idx_objects_synonym ON metadata_objects(synonym_lower)",
 
         """
         CREATE TABLE IF NOT EXISTS metadata_items (
@@ -138,10 +143,13 @@ internal static class IndexSchema
 
         // Префиксный поиск по именам узлов: unicode61 с prefix занимает несопоставимо меньше места,
         // чем триграммы, и закрывает обычный случай — имя набирают с начала.
+        // Содержимое берётся из таблицы nodes: копия имён (130 МБ) в индексе не нужна.
         """
         CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-            node_id UNINDEXED,
+            id UNINDEXED,
             name,
+            content='nodes',
+            content_rowid='rowid',
             tokenize='unicode61 remove_diacritics 1',
             prefix='2 3 4'
         )

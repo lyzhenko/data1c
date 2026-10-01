@@ -243,7 +243,7 @@ public sealed class IndexReader
             AppendKindFilter(sql, kinds);
             // Никаких LIKE: они не используют индекс и превращают запрос в скан 564 тысяч строк.
             sql.Append(" (id = @raw OR name_lower = @lower")
-                .Append(" OR id IN (SELECT node_id FROM nodes_fts WHERE nodes_fts MATCH @fts))")
+                .Append(" OR id IN (SELECT id FROM nodes_fts WHERE nodes_fts MATCH @fts))")
                 .Append(" ORDER BY CASE WHEN id = @raw THEN 0 WHEN name_lower = @lower THEN 1 ELSE 2 END, length(name), name LIMIT @limit");
 
             using var command = _index.CreateCommand(sql.ToString());
@@ -932,7 +932,11 @@ public sealed class IndexReader
         return separator < 0 ? id : id[..separator];
     }
 
-    /// <summary>Поиск объектов метаданных по имени и синониму.</summary>
+    /// <summary>
+    /// Поиск объектов метаданных по имени и синониму. Синоним берётся из приведённой колонки:
+    /// функция lower() в SQLite кириллицу не знает, поэтому сравнение в SQL не находило ничего.
+    /// Точное совпадение и префикс ищутся индексом, подстрока — просмотром с ранжированием в памяти.
+    /// </summary>
     public IReadOnlyList<(string Id, string Kind, string Name, string? Synonym)> FindMetadataObjects(string query, int limit = 20)
     {
         if (string.IsNullOrWhiteSpace(query))
@@ -941,28 +945,99 @@ public sealed class IndexReader
         }
 
         var lower = query.Trim().ToLowerInvariant();
+        var bounded = Math.Clamp(limit, 1, 200);
         return _index.WithLock(() =>
         {
-            using var command = _index.CreateCommand(
-                """
-                SELECT id, kind, name, synonym FROM metadata_objects
-                WHERE name_lower LIKE @like OR lower(COALESCE(synonym, '')) LIKE @like
-                ORDER BY CASE WHEN name_lower = @lower THEN 0 WHEN name_lower LIKE @prefix THEN 1 ELSE 2 END, length(name), name
-                LIMIT @limit
-                """);
-            command.Parameters.AddWithValue("@like", "%" + EscapeLike(lower) + "%");
-            command.Parameters.AddWithValue("@prefix", EscapeLike(lower) + "%");
-            command.Parameters.AddWithValue("@lower", lower);
-            command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 200));
-            using var reader = command.ExecuteReader();
-            var result = new List<(string, string, string, string?)>();
-            while (reader.Read())
+            var found = new List<(string Id, string Kind, string Name, string? Synonym)>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            void Collect(string condition, string? pattern, int take)
             {
-                result.Add((reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.IsDBNull(3) ? null : reader.GetString(3)));
+                if (take <= 0)
+                {
+                    return;
+                }
+
+                foreach (var row in QueryMetadataObjects(condition, lower, pattern, take))
+                {
+                    if (seen.Add(row.Id))
+                    {
+                        found.Add(row);
+                    }
+                }
             }
 
-            return (IReadOnlyList<(string, string, string, string?)>)result;
+            Collect("name_lower = @exact OR synonym_lower = @exact", null, bounded);
+            Collect(@"name_lower LIKE @prefix ESCAPE '\' OR synonym_lower LIKE @prefix ESCAPE '\'", EscapeLike(lower) + "%", bounded);
+            Collect(@"name_lower LIKE @like ESCAPE '\' OR synonym_lower LIKE @like ESCAPE '\'", "%" + EscapeLike(lower) + "%", bounded);
+
+            return (IReadOnlyList<(string, string, string, string?)>)
+            [
+                .. found
+                    .OrderBy(row => RankMetadataObject(row.Name, row.Synonym, lower))
+                    .ThenBy(static row => row.Name.Length)
+                    .ThenBy(static row => row.Name, StringComparer.Ordinal)
+                    .Take(bounded)
+            ];
         });
+    }
+
+    /// <summary>Одна ступень поиска объектов метаданных по готовому условию.</summary>
+    private List<(string Id, string Kind, string Name, string? Synonym)> QueryMetadataObjects(
+        string condition,
+        string lower,
+        string? pattern,
+        int limit)
+    {
+        using var command = _index.CreateCommand(
+            $"""
+             SELECT id, kind, name, synonym FROM metadata_objects
+             WHERE {condition}
+             ORDER BY length(name), name LIMIT @limit
+             """);
+        command.Parameters.AddWithValue("@exact", lower);
+        command.Parameters.AddWithValue("@lower", lower);
+        command.Parameters.AddWithValue("@limit", limit);
+        if (pattern is not null)
+        {
+            command.Parameters.AddWithValue(condition.Contains("@prefix", StringComparison.Ordinal) ? "@prefix" : "@like", pattern);
+        }
+
+        using var reader = command.ExecuteReader();
+        var result = new List<(string, string, string, string?)>();
+        while (reader.Read())
+        {
+            result.Add((
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.IsDBNull(3) ? null : reader.GetString(3)));
+        }
+
+        return result;
+    }
+
+    /// <summary>Порядок выдачи: точное имя, точный синоним, префикс имени, префикс синонима.</summary>
+    private static int RankMetadataObject(string name, string? synonym, string lower)
+    {
+        var nameLower = name.ToLowerInvariant();
+        if (string.Equals(nameLower, lower, StringComparison.Ordinal))
+        {
+            return 0;
+        }
+
+        var synonymLower = synonym?.ToLowerInvariant();
+        if (synonymLower is not null && string.Equals(synonymLower, lower, StringComparison.Ordinal))
+        {
+            return 1;
+        }
+
+        if (nameLower.StartsWith(lower, StringComparison.Ordinal))
+        {
+            return 2;
+        }
+
+        return synonymLower is not null && synonymLower.StartsWith(lower, StringComparison.Ordinal) ? 3 : 4;
     }
 
     /// <summary>Обход связей на заданную глубину: рекурсивный запрос вместо обхода графа в памяти.</summary>

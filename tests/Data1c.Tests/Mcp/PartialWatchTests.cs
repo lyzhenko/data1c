@@ -14,13 +14,10 @@ public sealed class PartialWatchTests
     [Fact]
     public async Task Наблюдение_переиндексирует_только_изменённый_модуль()
     {
-        var root = Path.Combine(Path.GetTempPath(), "data1c-watch-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
+        var root = TestDump.Materialize();
 
         try
         {
-            Materialize(root);
-
             using var session = new AnalysisSession(new AnalysisRequest { DumpPaths = [root] });
             await session.QueryAsync(CancellationToken.None);
             Assert.True(session.IsIndexReady);
@@ -53,28 +50,7 @@ public sealed class PartialWatchTests
         }
         finally
         {
-            try
-            {
-                Directory.Delete(root, recursive: true);
-            }
-            catch (IOException)
-            {
-                // Временный каталог останется — это не влияет на проверку.
-            }
-        }
-    }
-
-    /// <summary>Раскладывает синтетическую выгрузку по диску: сервер работает с настоящими файлами.</summary>
-    private static void Materialize(string root)
-    {
-        var source = SampleDump.Create();
-        foreach (var file in source.EnumerateFiles())
-        {
-            var path = Path.Combine(root, file.RelativePath.Replace('/', Path.DirectorySeparatorChar));
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            using var content = source.OpenRead(file);
-            using var target = File.Create(path);
-            content.CopyTo(target);
+            TestDump.Remove(root);
         }
     }
 }

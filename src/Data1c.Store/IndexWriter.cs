@@ -579,7 +579,13 @@ public sealed class IndexWriter
         ExecuteIds(connection, count => $"DELETE FROM edges WHERE kind = 'Contains' AND target_id IN ({Placeholders(count)})", oldNodeIds);
         ExecuteIds(connection, count => $"DELETE FROM edges WHERE target_id IN ({Placeholders(count)})", goneNodeIds);
         ExecuteIds(connection, count => $"DELETE FROM metadata_refs WHERE source_id IN ({Placeholders(count)})", oldNodeIds);
-        ExecuteIds(connection, count => $"DELETE FROM nodes_fts WHERE node_id IN ({Placeholders(count)})", oldNodeIds);
+
+        // nodes_fts объявлена с внешним содержимым: записи поиска удаляются по rowid таблицы nodes,
+        // и сделать это нужно до удаления самих узлов — иначе FTS не найдёт исходные значения.
+        ExecuteIds(
+            connection,
+            count => $"DELETE FROM nodes_fts WHERE rowid IN (SELECT rowid FROM nodes WHERE id IN ({Placeholders(count)}))",
+            oldNodeIds);
         ExecuteIds(connection, count => $"DELETE FROM nodes WHERE id IN ({Placeholders(count)})", oldNodeIds);
         ExecuteIds(connection, count => $"DELETE FROM terms_fts WHERE symbol_id IN ({Placeholders(count)})", symbolIds);
         ExecuteIds(connection, count => $"DELETE FROM symbols WHERE module_path IN ({Placeholders(count)})", paths);
@@ -908,10 +914,10 @@ public sealed class IndexWriter
         var platformTitle = nodes.Parameters.Add("@platformTitle", SqliteType.Text);
         var platformVersion = nodes.Parameters.Add("@platformVersion", SqliteType.Text);
 
-        // Префиксный поиск по именам узлов ведёт таблица nodes_fts: без неё поиск вырождается
-        // в просмотр всех узлов по LIKE.
+        // nodes_fts объявлена с внешним содержимым: имена не дублируются, но поисковые
+        // записи нужно создавать явно, указывая rowid строки из nodes.
         using var fts = connection.CreateCommand();
-        fts.CommandText = "INSERT INTO nodes_fts (node_id, name) VALUES (@id, @name)";
+        fts.CommandText = "INSERT INTO nodes_fts (rowid, id, name) VALUES (last_insert_rowid(), @id, @name)";
         var ftsId = fts.Parameters.Add("@id", SqliteType.Text);
         var ftsName = fts.Parameters.Add("@name", SqliteType.Text);
 
@@ -1052,14 +1058,15 @@ public sealed class IndexWriter
         objects.CommandText =
             """
             INSERT OR REPLACE INTO metadata_objects
-                (id, kind, name, name_lower, synonym, uuid, source_path, comment, is_top_level, parent_id, properties)
-            VALUES (@id, @kind, @name, @nameLower, @synonym, @uuid, @path, @comment, @top, @parent, @properties)
+                (id, kind, name, name_lower, synonym, synonym_lower, uuid, source_path, comment, is_top_level, parent_id, properties)
+            VALUES (@id, @kind, @name, @nameLower, @synonym, @synonymLower, @uuid, @path, @comment, @top, @parent, @properties)
             """;
         var objectId = objects.Parameters.Add("@id", SqliteType.Text);
         var objectKind = objects.Parameters.Add("@kind", SqliteType.Text);
         var objectName = objects.Parameters.Add("@name", SqliteType.Text);
         var objectNameLower = objects.Parameters.Add("@nameLower", SqliteType.Text);
         var synonym = objects.Parameters.Add("@synonym", SqliteType.Text);
+        var synonymLower = objects.Parameters.Add("@synonymLower", SqliteType.Text);
         var uuid = objects.Parameters.Add("@uuid", SqliteType.Text);
         var objectPath = objects.Parameters.Add("@path", SqliteType.Text);
         var objectComment = objects.Parameters.Add("@comment", SqliteType.Text);
@@ -1100,6 +1107,9 @@ public sealed class IndexWriter
             objectName.Value = obj.Name;
             objectNameLower.Value = obj.Name.ToLowerInvariant();
             synonym.Value = (object?)obj.Synonym ?? DBNull.Value;
+            synonymLower.Value = string.IsNullOrWhiteSpace(obj.Synonym)
+                ? DBNull.Value
+                : obj.Synonym.ToLowerInvariant();
             uuid.Value = obj.Uuid is { } value ? value.ToString() : DBNull.Value;
             // Путь файла объекта, как его показывает карточка: по нему агент читает и правит XML.
             objectPath.Value = (object?)obj.SourcePath ?? DBNull.Value;

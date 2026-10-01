@@ -129,6 +129,17 @@ public sealed class IndexGraphQueryTests
         Assert.Contains(symbols, static symbol => symbol.Name == "ЗагрузитьДанные");
     }
 
+    [Fact]
+    public void Смысловой_поиск_находит_процедуру_по_имени_параметра()
+    {
+        using var fixture = new QueryFixture();
+
+        // В имени процедуры нет слова «Отказ»: оно есть только среди параметров.
+        var symbols = fixture.Reader.SmartSearch("Отказ", 5);
+
+        Assert.Contains(symbols, static symbol => symbol.Name == "ПриОткрытии");
+    }
+
     private sealed class QueryFixture : IDisposable
     {
         private readonly SqliteIndex _index;
