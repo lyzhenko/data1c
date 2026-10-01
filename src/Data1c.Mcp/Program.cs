@@ -68,6 +68,13 @@ internal static class Program
             StartInBackground(session, stderr);
         }
 
+        // Справка платформы — самая долгая операция сервера: .hbk разбираются десятки секунд.
+        // Грузим её в фоне сразу, чтобы первый вызов инструмента platform не ждал.
+        if (options.PlatformHelp && !options.Lazy)
+        {
+            StartPlatformWarmup(session, stderr);
+        }
+
         var server = new McpServer(new ToolCatalog(session), stdin, stdout, stderr);
         try
         {
@@ -101,5 +108,25 @@ internal static class Program
         {
             log.WriteLine("data1c-mcp: " + exception.Message);
         }
+    }
+
+    /// <summary>Фоновая загрузка справки платформы с записью итога в журнал сервера.</summary>
+    private static void StartPlatformWarmup(AnalysisSession session, TextWriter log)
+    {
+        session.StartPlatformWarmup();
+        var warmup = session.PlatformWarmup;
+        if (warmup is null)
+        {
+            return;
+        }
+
+        _ = warmup.ContinueWith(
+            _ => log.WriteLine(
+                session.Platform is { } platform
+                    ? $"data1c-mcp: справка платформы готова за {session.PlatformElapsed.TotalSeconds:F1} с ({platform.TopicCount} тем)"
+                    : $"data1c-mcp: справка платформы не загрузилась за {session.PlatformElapsed.TotalSeconds:F1} с: {session.PlatformError}"),
+            CancellationToken.None,
+            TaskContinuationOptions.None,
+            TaskScheduler.Default);
     }
 }

@@ -551,9 +551,27 @@ public sealed class ToolCatalog
         ],
         async (arguments, token) =>
         {
-            var result = await AnalysisAsync(token);
-            var index = result.Platform ?? throw new ToolException(
-                "Справка платформы не подключена. Запустите сервер с ключом --platform (нужна установленная платформа 1С).");
+            if (!Session.PlatformRequested)
+            {
+                throw new ToolException(
+                    "Справка платформы не подключена. Запустите сервер с ключом --platform (нужна установленная платформа 1С).");
+            }
+
+            // Модель платформы грузится в фоне: вместо двадцати секунд ожидания внутри вызова
+            // ждём готовности совсем недолго, а дальше честно говорим, что загрузка ещё идёт.
+            Session.StartPlatformWarmup();
+            var index = Session.Platform ?? await WaitForPlatformAsync(token).ConfigureAwait(false);
+            if (index is null)
+            {
+                if (Session.IsPlatformLoading)
+                {
+                    return $"Справка платформы ещё загружается ({Session.PlatformElapsed.TotalSeconds:F0} с). "
+                        + "Повторите этот же запрос через несколько секунд — дальше ответы будут мгновенными.";
+                }
+
+                throw new ToolException("Справка платформы не загрузилась: "
+                    + (Session.PlatformError ?? "установленная платформа 1С не найдена."));
+            }
 
             var query = arguments.RequireString("query");
             var mode = arguments.GetString("mode") ?? "find";
@@ -1115,6 +1133,22 @@ public sealed class ToolCatalog
 
     private Task<IGraphQuery> QueryAsync(CancellationToken cancellationToken) =>
         Session.QueryAsync(cancellationToken);
+
+    /// <summary>
+    /// Короткое ожидание готовности справки платформы: если загрузка почти закончилась, отвечаем
+    /// сразу; если нет — инструмент вернёт сообщение, что модель ещё грузится.
+    /// </summary>
+    private async Task<PlatformHelpIndex?> WaitForPlatformAsync(CancellationToken cancellationToken)
+    {
+        var warmup = Session.PlatformWarmup;
+        if (warmup is null)
+        {
+            return Session.Platform;
+        }
+
+        await Task.WhenAny(warmup, Task.Delay(TimeSpan.FromSeconds(3), cancellationToken)).ConfigureAwait(false);
+        return Session.Platform;
+    }
 
     private async Task<AnalysisResult> AnalysisAsync(CancellationToken cancellationToken)
     {

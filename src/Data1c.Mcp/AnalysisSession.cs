@@ -62,6 +62,10 @@ public sealed class AnalysisSession : IDisposable
     private IGraphQuery? _indexGraph;
     private string? _indexPath;
     private bool _forceRebuild;
+    private PlatformHelpIndex? _platform;
+    private Task? _platformWarmup;
+    private Exception? _platformError;
+    private DateTimeOffset _platformStarted;
     private volatile string _state = "ожидание";
     private Exception? _failure;
     private DateTimeOffset? _completedAt;
@@ -346,9 +350,7 @@ public sealed class AnalysisSession : IDisposable
                 MaxDegreeOfParallelism = _request.MaxDegreeOfParallelism > 0
                     ? _request.MaxDegreeOfParallelism
                     : Environment.ProcessorCount,
-                PlatformSource = _request.PlatformHelp
-                    ? new FileSystemPlatformSource(_request.PlatformLocale, _request.PlatformRoots)
-                    : null,
+                PlatformSource = CreatePlatformSource(),
                 Progress = new Progress<AnalysisProgress>(Report),
                 Metadata = new MetadataReadOptions
                 {
@@ -399,4 +401,61 @@ public sealed class AnalysisSession : IDisposable
         _index = null;
         _indexGraph = null;
     }
+
+    /// <summary>Справка платформы запрошена ключом <c>--platform</c>.</summary>
+    public bool PlatformRequested => _request.PlatformHelp;
+
+    /// <summary>Модель платформы: null, пока она не загружена.</summary>
+    public PlatformHelpIndex? Platform => _platform ?? Result?.Platform;
+
+    /// <summary>Загрузка модели платформы идёт прямо сейчас.</summary>
+    public bool IsPlatformLoading => _platformWarmup is { IsCompleted: false };
+
+    /// <summary>Сколько уже идёт загрузка модели платформы.</summary>
+    public TimeSpan PlatformElapsed => _platformStarted == default ? TimeSpan.Zero : DateTimeOffset.Now - _platformStarted;
+
+    /// <summary>Ошибка загрузки модели платформы, если она была.</summary>
+    public string? PlatformError => _platformError?.Message;
+
+    /// <summary>Задача фоновой загрузки справки платформы (для журнала сервера).</summary>
+    public Task? PlatformWarmup => _platformWarmup;
+
+    /// <summary>
+    /// Загружает справку платформы в фоне, не дожидаясь разбора выгрузки. Контейнеры <c>.hbk</c>
+    /// разбираются один раз, поэтому вызов инструмента platform не ждёт десятки секунд.
+    /// Повторные вызовы ничего не делают.
+    /// </summary>
+    public void StartPlatformWarmup()
+    {
+        lock (_gate)
+        {
+            if (!_request.PlatformHelp || _platformWarmup is not null || _platform is not null)
+            {
+                return;
+            }
+
+            _platformStarted = DateTimeOffset.Now;
+            _platformWarmup = Task.Run(() =>
+            {
+                try
+                {
+                    var index = new PlatformHelpIndex(CreatePlatformSource()!);
+                    _ = index.TopicCount; // разбирает .hbk и строит словарь тем
+                    lock (_gate)
+                    {
+                        _platform = index;
+                    }
+                }
+                catch (Exception exception)
+                {
+                    _platformError = exception;
+                }
+            });
+        }
+    }
+
+    private IPlatformSource? CreatePlatformSource() =>
+        _request.PlatformHelp
+            ? new FileSystemPlatformSource(_request.PlatformLocale, _request.PlatformRoots)
+            : null;
 }

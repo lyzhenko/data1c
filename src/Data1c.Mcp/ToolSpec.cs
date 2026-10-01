@@ -195,10 +195,31 @@ public static class Render
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
 
-    public static string JsonOf(object value) => Truncate(JsonSerializer.Serialize(value, Json));
+    public static string JsonOf(object value) => TruncateJson(JsonSerializer.Serialize(value, Json));
 
+    /// <summary>
+    /// Обрезка ответа-текста: хвост заменяется пометкой. Для JSON так делать нельзя — там своя обрезка.
+    /// </summary>
     public static string Truncate(string text, int maxChars = MaxChars) =>
         text.Length <= maxChars
             ? text
             : text[..maxChars] + $"\n… ответ обрезан до {maxChars} символов; сузьте запрос (limit, depth, диапазон строк).";
+
+    /// <summary>
+    /// Обрезка JSON-ответа: документ обязан остаться разбираемым, поэтому обрезанный текст уходит
+    /// в поле <c>head</c> строкой, а рядом — пометка. Обрезка самого документа давала обрывок
+    /// строки, который клиент не мог прочитать.
+    /// </summary>
+    private static string TruncateJson(string json) =>
+        json.Length <= MaxChars
+            ? json
+            : JsonSerializer.Serialize(
+                new
+                {
+                    truncated = true,
+                    limit = MaxChars,
+                    message = $"Ответ не поместился в {MaxChars} символов (было {json.Length}); сузьте запрос (limit, depth, диапазон строк).",
+                    head = json[..MaxChars],
+                },
+                Json);
 }
