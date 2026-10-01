@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>data1c-platform-check</AssemblyName>
+    <RootNamespace>Data1c.PlatformCheck</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Data1c.Core\Data1c.Core.csproj" />
+  </ItemGroup>
+
+</Project>
