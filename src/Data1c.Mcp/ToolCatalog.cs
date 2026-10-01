@@ -229,9 +229,11 @@ public sealed class ToolCatalog
         "similar",
         "Поиск похожих реализаций в конфигурации: по черновику кода (text) или по уже существующей процедуре (id/path) "
         + "находит процедуры с теми же вызовами методов платформы, обращениями к объектам метаданных (в том числе "
-        + "из текстов запросов), вызовами процедур конфигурации и близким именем. Нужен, чтобы найти готовую "
-        + "реализацию и переиспользовать её вместо написания заново: код кандидата открывается инструментом code. "
-        + "Работает по индексу выгрузки и отвечает за доли секунды.",
+        + "из текстов запросов), вызовами процедур конфигурации и близким именем. Вызовы процедур сравниваются по "
+        + "идентификатору цели, поэтому квалификация вызова («ОбщийМодуль.Метод» и «Метод» внутри того же модуля) "
+        + "на совпадение не влияет. Вызовы, цель которых не разрешилась, дают только слабое совпадение по имени "
+        + "метода. Нужен, чтобы найти готовую реализацию и переиспользовать её вместо написания заново: код "
+        + "кандидата открывается инструментом code. Работает по индексу выгрузки и отвечает за доли секунды.",
         [
             new ToolParameter("text", "string", "Черновик кода (процедура целиком), которого ещё нет в выгрузке."),
             new ToolParameter("id", "string", "Идентификатор существующей процедуры: routine:module:…#Имя."),
@@ -273,15 +275,23 @@ public sealed class ToolCatalog
 
         var source = "text";
         string? excludeId = null;
+        string? draftModule = null;
         if (draft is null)
         {
-            var (text, routineId) = ReadRoutine(reader, id, path, arguments.GetInt("line", 0, 0, int.MaxValue));
+            var (text, routineId, modulePath) = ReadRoutine(reader, id, path, arguments.GetInt("line", 0, 0, int.MaxValue));
             draft = text;
             excludeId = routineId;
+            draftModule = modulePath;
             source = id is null ? "path" : "id";
         }
 
-        var found = new SimilarCode(reader.SimilarCodeSource()).Find(draft, limit, excludeId);
+        // Признак вызова процедуры конфигурации — идентификатор разрешённой цели, поэтому вызовы
+        // черновика разрешает индекс: по модулю черновика или по имени общего модуля.
+        var candidatesSource = reader.SimilarCodeSource(draftModule);
+        var found = new SimilarCode(candidatesSource).Find(
+            SimilarCode.Describe(draft, draftModule, candidatesSource.ResolveCall),
+            limit,
+            excludeId);
 
         var candidates = found.Candidates
             .Select(static candidate => new
@@ -300,7 +310,7 @@ public sealed class ToolCatalog
                     {
                         signal = SignalName(group.Key),
                         values = group
-                            .Select(static match => match.Detail is null ? match.Value : $"{match.Value} [{match.Detail}]")
+                            .Select(match => FeatureText(group.Key, match.Value, match.Detail))
                             .Take(6)
                             .ToList(),
                     })
@@ -329,6 +339,9 @@ public sealed class ToolCatalog
                 platformCalls = Recognized(found, SimilarCodeSignal.PlatformCall, found.Draft.PlatformCalls),
                 metadataReferences = Recognized(found, SimilarCodeSignal.MetadataReference, found.Draft.MetadataReferences),
                 routineCalls = Recognized(found, SimilarCodeSignal.RoutineCall, found.Draft.RoutineCalls),
+                // Вызовы с неразрешённой целью: их сравнивает только слабый сигнал, поэтому они
+                // показаны отдельно — по ним точного совпадения с кандидатом нет.
+                unresolvedCalls = Recognized(found, SimilarCodeSignal.UnresolvedCall, found.Draft.UnresolvedCalls),
                 terms = found.Draft.Terms,
             },
             considered = found.Considered,
@@ -359,12 +372,25 @@ public sealed class ToolCatalog
         [
             .. features
                 .Where(feature => known is null || known.Contains(feature.Value))
-                .Select(static feature => feature.Detail is null ? feature.Value : $"{feature.Value} [{feature.Detail}]")
+                .Select(feature => FeatureText(signal, feature.Value, feature.Detail))
         ];
     }
 
+    /// <summary>
+    /// Как показать признак в ответе. У вызова процедуры значение — идентификатор цели, и агенту
+    /// полезнее текст вызова, как он записан в коде; у неразрешённого вызова значение и есть имя
+    /// метода, поэтому показывается текст вызова. Остальные признаки показываются со своим
+    /// уточнением (у обращения к метаданным это контекст — <c>code</c> или <c>query</c>).
+    /// </summary>
+    private static string FeatureText(SimilarCodeSignal signal, string value, string? detail) => signal switch
+    {
+        SimilarCodeSignal.RoutineCall or SimilarCodeSignal.UnresolvedCall =>
+            string.IsNullOrEmpty(detail) ? value : detail,
+        _ => detail is null ? value : $"{value} [{detail}]",
+    };
+
     /// <summary>Текст существующей процедуры: по идентификатору узла, по пути модуля или по строке.</summary>
-    private (string Text, string Id) ReadRoutine(IndexReader reader, string? id, string? path, int line)
+    private (string Text, string Id, string ModulePath) ReadRoutine(IndexReader reader, string? id, string? path, int line)
     {
         if (path is null)
         {
@@ -394,7 +420,7 @@ public sealed class ToolCatalog
         var fragment = Session.Code.Read(symbol.ModulePath, symbol.StartLine, symbol.EndLine)
             ?? throw new ToolException($"Файл «{symbol.ModulePath}» не найден в выгрузке или не является текстовым.");
 
-        return (string.Join('\n', fragment.Lines), symbol.NodeId);
+        return (string.Join('\n', fragment.Lines), symbol.NodeId, symbol.ModulePath);
     }
 
     /// <summary>Имя сигнала похожести для ответа агента.</summary>
@@ -404,6 +430,7 @@ public sealed class ToolCatalog
         SimilarCodeSignal.MetadataReference => "metadataReferences",
         SimilarCodeSignal.RoutineCall => "routineCalls",
         SimilarCodeSignal.Terms => "terms",
+        SimilarCodeSignal.UnresolvedCall => "unresolvedCallsWeak",
         _ => "size",
     };
 

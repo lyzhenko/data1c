@@ -119,6 +119,92 @@ public sealed class SimilarToolTests
         }
     }
 
+    [Fact]
+    public async Task Ответ_показывает_текст_вызова_и_отдельно_слабый_сигнал()
+    {
+        var path = TempIndexPath();
+        try
+        {
+            using var session = IndexSession(path, CallDump());
+            var response = await CallAsync(session, $"{{\"text\":{JsonSerializer.Serialize(CallDraft)}}}");
+
+            var payload = JsonNode.Parse(response)!.AsObject();
+            var draft = payload["draft"]!.AsObject();
+
+            // Признак вызова процедуры — идентификатор цели, но в ответе виден текст вызова.
+            Assert.Contains("Общий.ОбработатьТовар", draft["routineCalls"]!.AsArray().Select(Text));
+
+            // Вызов с неразрешённой целью показан отдельно: по нему совпадение только по имени метода.
+            Assert.Contains("Справочники.Товары.НайтиПоНаименованию", draft["unresolvedCalls"]!.AsArray().Select(Text));
+
+            var weak = payload["candidates"]!.AsArray()
+                .SelectMany(static candidate => candidate!["matches"]!.AsArray())
+                .Where(static match => Text(match!["signal"]) == "unresolvedCallsWeak")
+                .ToList();
+            Assert.NotEmpty(weak);
+            Assert.Contains(weak, static match =>
+                string.Join(" ", match!["values"]!.AsArray().Select(Text))
+                    .Contains("НайтиПоНаименованию", StringComparison.Ordinal));
+            Assert.Contains("слабый сигнал", Text(payload["candidates"]![0]!["why"]), StringComparison.Ordinal);
+        }
+        finally
+        {
+            Remove(path);
+        }
+    }
+
+    /// <summary>Черновик: вызывает метод общего модуля с квалификатором и метод менеджера справочника.</summary>
+    private const string CallDraft = """
+        // Обрабатывает товары по заказу.
+        Процедура ОбработатьТоварыПоЗаказу()
+            Общий.ОбработатьТовар("Тест");
+            Товар = Справочники.Товары.НайтиПоНаименованию("Тест");
+        КонецПроцедуры
+        """;
+
+    /// <summary>Выгрузка: процедура вызывает тот же метод общего модуля и тот же метод менеджера.</summary>
+    private static InMemoryDumpSource CallDump()
+    {
+        var source = new InMemoryDumpSource("выгрузка с вызовом общего модуля");
+        source.AddText("Configuration.xml", """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+                <Configuration uuid="0f0f0f0f-0000-0000-0000-0000000000e5">
+                    <Properties>
+                        <Name>КонфигурацияСВызовомМодуля</Name>
+                    </Properties>
+                    <ChildObjects>
+                        <CommonModule>Общий</CommonModule>
+                    </ChildObjects>
+                </Configuration>
+            </MetaDataObject>
+            """);
+        source.AddText("CommonModules/Общий.xml", """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+                <CommonModule uuid="99999999-9999-9999-9999-999999999991">
+                    <Properties>
+                        <Name>Общий</Name>
+                        <Server>true</Server>
+                    </Properties>
+                </CommonModule>
+            </MetaDataObject>
+            """);
+        source.AddText("CommonModules/Общий/Ext/Module.bsl", """
+            // Обрабатывает товар.
+            Процедура ОбработатьТовар(Товар)
+                Сообщить(Товар);
+            КонецПроцедуры
+
+            // Обрабатывает товары по заказу.
+            Процедура ОбработатьТоварыПоЗаказу()
+                Общий.ОбработатьТовар("Тест");
+                Товар = Товары.НайтиПоНаименованию("Тест");
+            КонецПроцедуры
+            """);
+        return source;
+    }
+
     /// <summary>Сессия поверх готового индекса в файле: инструмент отвечает из индекса, без разбора в память.</summary>
     private static AnalysisSession IndexSession(string path, InMemoryDumpSource source)
     {
