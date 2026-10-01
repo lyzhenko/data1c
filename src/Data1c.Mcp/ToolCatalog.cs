@@ -1890,14 +1890,20 @@ public sealed class ToolCatalog
     private ToolSpec ConventionsTool() => new(
         "conventions",
         "«В конфигурации это уже делают так»: рейтинг общих модулей и процедур по числу вызовов и подбор "
-        + "типовых приёмов под намерение агента — получить реквизит объекта, записать объект, найти по "
-        + "наименованию, прочитать данные запросом, вывести сообщение пользователю, выполнить на сервере "
-        + "или в фоне. В ответе процедуры с числом использований, пример вызова (модуль и строка) и "
-        + "пояснение, почему они подходят. Вместо intent можно задать точный метод платформы — тогда "
-        + "инструмент покажет, кто его вызывает и на каких строках. Пример: intent=\"записать объект\" "
-        + "или platform=\"Записать\". Код найденных процедур открывается инструментом code по их id.",
+        + "типовых приёмов под намерение агента. В каталоге двадцать приёмов: записать объект, провести "
+        + "документ, получить и установить реквизит, найти по наименованию или по коду, прочитать данные "
+        + "запросом, записать набор записей регистра, вывести сообщение, выполнить на сервере или в фоне, "
+        + "добавить в коллекцию, сформировать печатную форму, сохранить или прочитать файл, сериализовать "
+        + "в XML или JSON, получить представление объекта, проверить заполнение, получить константу или "
+        + "настройку, замерить производительность, записать в журнал регистрации, выполнить в транзакции. "
+        + "В ответе процедуры с числом использований, пример вызова (модуль и строка), пояснение, почему они "
+        + "подходят, и recognition — по каким словам и методу платформы распознан приём (step = platformMethod, "
+        + "keywords или none). Если приём не распознан, инструмент честно говорит об этом и ищет процедуры по "
+        + "словам запроса. Вместо intent можно задать точный метод платформы — тогда инструмент покажет, кто "
+        + "его вызывает и на каких строках. Пример: intent=\"записать объект\" или platform=\"Записать\". "
+        + "Код найденных процедур открывается инструментом code по их id.",
         [
-            new ToolParameter("intent", "string", "Намерение словами: «получить реквизит объекта», «записать объект», «найти по наименованию»."),
+            new ToolParameter("intent", "string", "Намерение словами: «провести документ», «получить реквизит объекта», «записать набор записей регистра», «сформировать печатную форму»."),
             new ToolParameter("platform", "string", "Точный метод платформы: Записать, ЗначениеРеквизитаОбъекта, НайтиПоНаименованию, Сообщить."),
             new ToolParameter("limit", "integer", "Сколько процедур и модулей вернуть (1–50, по умолчанию 8)."),
         ],
@@ -1963,6 +1969,20 @@ public sealed class ToolCatalog
                 intent = answer.Intent,
                 question = answer.Question,
                 platformMethod = answer.PlatformMethod,
+                recognition = answer.Recognition is { } recognition
+                    ? new
+                    {
+                        intentId = recognition.IntentId,
+                        title = recognition.Title,
+                        step = MatchStepName(recognition.Step),
+                        method = recognition.PlatformMethod,
+                        words = recognition.Words,
+                        keywords = recognition.Keywords,
+                        nameTokens = recognition.NameTokens,
+                        score = recognition.Score,
+                        summary = recognition.Summary,
+                    }
+                    : null,
                 found = new
                 {
                     modules = answer.Modules.Count,
@@ -1976,6 +1996,16 @@ public sealed class ToolCatalog
                 hint = answer.Hint,
             });
         });
+
+    /// <summary>
+    /// Ступень распознавания приёма словами: агент видит, почему инструмент выбрал именно этот приём.
+    /// </summary>
+    private static string MatchStepName(ConventionMatchStep step) => step switch
+    {
+        ConventionMatchStep.PlatformMethod => "platformMethod",
+        ConventionMatchStep.Keywords => "keywords",
+        _ => "none",
+    };
 
     private ToolSpec ReloadTool() => new(
         "reload",
