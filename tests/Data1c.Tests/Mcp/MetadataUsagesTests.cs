@@ -1,6 +1,7 @@
 using System.Text.Json.Nodes;
 using Data1c.Core.Analysis;
 using Data1c.Core.Dump;
+using Data1c.Core.Graph;
 using Data1c.Mcp;
 using Xunit;
 
@@ -295,6 +296,22 @@ public sealed class MetadataUsagesTests
         var item = Assert.Single(usages["items"]!.AsArray())!;
         Assert.Equal("query", Text(item["context"]));
         Assert.Equal("ИЗ Справочник.Номенклатура КАК Т", Text(item["detail"]));
+    }
+
+    [Fact]
+    public void Инструменты_объявляют_допустимые_контексты_фильтра()
+    {
+        using var session = new AnalysisSession(new AnalysisRequest(), CreateDump());
+        var catalog = new ToolCatalog(session);
+
+        // Схема обоих инструментов перечисляет те же контексты, что понимает фильтр:
+        // агент видит допустимые значения до вызова, а не только из текста ошибки.
+        foreach (var name in new[] { "metadata", "node" })
+        {
+            var parameter = catalog.Find(name)!.Parameters.Single(item => item.Name == "usageContext");
+            Assert.Equal(MetadataRefContexts.All, parameter.Values);
+            Assert.Contains("query", parameter.Description, StringComparison.Ordinal);
+        }
     }
 
     [Fact]
