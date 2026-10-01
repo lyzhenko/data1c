@@ -16,6 +16,11 @@ namespace Data1c.Core.Analysis;
 /// близость имени с термами. Поэтому «похоже по смыслу» отличается от «похоже по буквам»:
 /// две процедуры, читающие один справочник и вызывающие один и тот же метод платформы, похожи,
 /// даже если написаны разными словами.</para>
+/// <para>Вызов процедуры конфигурации сравнивается по идентификатору разрешённой цели, а не по
+/// тексту вызова: «Справочники.Товары.НайтиПоНаименованию» и «Товары.НайтиПоНаименованию» ведут
+/// в один узел, и квалификация на совпадение не влияет. Вызовы, цель которых разрешить не удалось
+/// (узлы <c>call:…</c>), дают отдельный слабый сигнал: у них сравнивается только имя метода
+/// без квалификатора.</para>
 /// <para>Внутри категории признаки взвешиваются обратной частотой: вес признака считает источник
 /// данных (<see cref="ISimilarCodeSource"/>), а частые признаки («Структура.Вставить») веса не
 /// получают вовсе — иначе любой черновик находил бы тысячи «похожих» процедур.</para>
@@ -85,6 +90,14 @@ public sealed class SimilarCode
                 : $"Из {found.Profiles.Count} рассмотренных кандидатов ни один не набрал оценку {_options.MinScore:0.00}.");
         }
 
+        if (ordered.Any(static candidate =>
+            candidate.Matches.Any(static match => match.Signal == SimilarCodeSignal.UnresolvedCall)))
+        {
+            notes.Add("Часть совпадений — по вызовам с неразрешённой целью (call:…): сравнивалось только "
+                + "имя метода без квалификатора. Это слабый сигнал: одноимённые методы есть у разных "
+                + "модулей и объектов, самостоятельно он кандидатов не находит.");
+        }
+
         return new SimilarCodeResult(ordered, features, found.Profiles.Count, notes, found.Recognized);
     }
 
@@ -95,7 +108,16 @@ public sealed class SimilarCode
     /// </summary>
     /// <param name="text">Текст черновика или процедуры.</param>
     /// <param name="path">Путь модуля для сообщений разбора; по умолчанию — «черновик.bsl».</param>
-    public static SimilarCodeFeatures Describe(string text, string? path = null)
+    /// <param name="resolve">
+    /// Разрешение вызова в узел процедуры конфигурации. Обычно его даёт индекс
+    /// (<c>IndexReader.SimilarCodeSource</c>): признак вызова процедуры — это идентификатор цели,
+    /// поэтому квалификация («ОбщийМодуль.Метод» и «Метод» внутри того же модуля) на совпадение
+    /// не влияет. Без разрешителя вызовы процедур конфигурации остаются слабым сигналом.
+    /// </param>
+    public static SimilarCodeFeatures Describe(
+        string text,
+        string? path = null,
+        RoutineCallResolver? resolve = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(text);
         var module = new BslModuleParser().Parse(
@@ -107,19 +129,39 @@ public sealed class SimilarCode
 
         var platform = new List<SimilarCodeFeature>();
         var routines = new List<SimilarCodeFeature>();
+        var unresolved = new List<SimilarCodeFeature>();
+        var resolved = new Dictionary<(string? Qualifier, string Method), string?>();
         foreach (var call in calls)
         {
-            if (module.Types is not null && module.Types.TryGetPlatformCallee(call, out var resolved))
+            if (module.Types is not null && module.Types.TryGetPlatformCallee(call, out var platformCallee))
             {
                 // Тип переменной известен: это метод платформы, а не процедура конфигурации.
-                platform.Add(new SimilarCodeFeature(resolved));
+                platform.Add(new SimilarCodeFeature(platformCallee));
                 continue;
             }
 
             // Вызов без квалификатора может быть и глобальной функцией платформы, и процедурой
             // этого же модуля: в графе это решает узел-цель, поэтому признак идёт в обе категории.
             platform.Add(new SimilarCodeFeature(call.Qualifier is null ? call.Method : call.Callee));
-            routines.Add(new SimilarCodeFeature(call.Callee));
+
+            // Признак вызова процедуры конфигурации — идентификатор разрешённой цели, а не текст
+            // вызова: «ОбщийМодуль.Метод» и «Метод» внутри этого модуля ведут в один узел.
+            var key = (call.Qualifier, call.Method);
+            if (!resolved.TryGetValue(key, out var target))
+            {
+                target = resolve?.Invoke(call.Qualifier, call.Method);
+                resolved[key] = target;
+            }
+
+            if (target is { Length: > 0 })
+            {
+                routines.Add(new SimilarCodeFeature(target, call.Callee));
+            }
+            else
+            {
+                // Цель не разрешилась: остаётся слабый сигнал — имя метода без квалификатора.
+                unresolved.Add(new SimilarCodeFeature(CallName(call.Callee), call.Callee));
+            }
         }
 
         var metadata = new List<SimilarCodeFeature>();
@@ -154,9 +196,24 @@ public sealed class SimilarCode
             Distinct(platform),
             Distinct(metadata),
             Distinct(routines),
+            Distinct(unresolved),
             Terms(main, text),
             main?.LineCount ?? module.LineCount,
             calls.Count + metadata.Count);
+    }
+
+    /// <summary>
+    /// Имя метода вызова без квалификатора, строчными: значение признака для вызова, цель которого
+    /// не разрешилась. «Справочники.Товары.НайтиПоНаименованию» и «Товары.НайтиПоНаименованию» дают
+    /// одно и то же значение — «найтипонаименованию».
+    /// </summary>
+    /// <param name="callee">Текст вызова, как он записан в коде.</param>
+    public static string CallName(string callee)
+    {
+        ArgumentNullException.ThrowIfNull(callee);
+        var separator = callee.LastIndexOf('.');
+        var method = separator < 0 ? callee : callee[(separator + 1)..];
+        return method.Trim().ToLowerInvariant();
     }
 
     /// <summary>Оценка одной реализации: доля покрытых признаков, термы и штраф за объём.</summary>
@@ -171,6 +228,7 @@ public sealed class SimilarCode
             (SimilarCodeSignal.PlatformCall, Category(draft.PlatformCalls, profile.PlatformCalls, SimilarCodeSignal.PlatformCall, weights, matches), "вызовы платформы"),
             (SimilarCodeSignal.MetadataReference, Category(draft.MetadataReferences, profile.MetadataReferences, SimilarCodeSignal.MetadataReference, weights, matches), "обращения к метаданным"),
             (SimilarCodeSignal.RoutineCall, Category(draft.RoutineCalls, profile.RoutineCalls, SimilarCodeSignal.RoutineCall, weights, matches), "вызовы процедур"),
+            (SimilarCodeSignal.UnresolvedCall, Category(draft.UnresolvedCalls, profile.UnresolvedCalls, SimilarCodeSignal.UnresolvedCall, weights, matches), "неразрешённые вызовы, только имя метода (слабый сигнал)"),
         };
 
         var terms = TermsSimilarity(draft, profile, out var sharedTerms);
@@ -186,6 +244,7 @@ public sealed class SimilarCode
             _options.PlatformWeight * categories[0].Similarity
             + _options.MetadataWeight * categories[1].Similarity
             + _options.RoutineWeight * categories[2].Similarity
+            + _options.UnresolvedCallWeight * categories[3].Similarity
             + _options.TermsWeight * terms;
 
         if (matches.Count == 0 || baseScore <= 0)
@@ -194,7 +253,9 @@ public sealed class SimilarCode
         }
 
         var size = SizeFactor(draft, profile);
-        var score = baseScore * size.Factor;
+        // Сумма весов сигналов чуть больше единицы (слабый сигнал добавлен сверх прежних четырёх),
+        // поэтому оценка ограничивается единицей: «похожесть 1.00» — это совпадение всех сигналов.
+        var score = Math.Min(1, baseScore * size.Factor);
         if (score < _options.MinScore)
         {
             return null;
@@ -334,13 +395,21 @@ public sealed class SimilarCode
         return string.Join("; ", parts);
     }
 
-    /// <summary>Как показать совпавший признак: с уточнением, откуда он взят.</summary>
-    private static string Describe(SimilarCodeMatch match) => match.Detail switch
+    /// <summary>
+    /// Как показать совпавший признак: у вызова процедуры — текст вызова (идентификатор цели
+    /// сравнивается, но агенту полезнее текст), у обращения к метаданным — откуда оно взято.
+    /// </summary>
+    private static string Describe(SimilarCodeMatch match) => match.Signal switch
     {
-        null or "" => match.Value,
-        MetadataRefContexts.Query => $"{match.Value} (из запроса)",
-        MetadataRefContexts.Code => $"{match.Value} (из кода)",
-        _ => $"{match.Value} ({match.Detail})",
+        SimilarCodeSignal.RoutineCall or SimilarCodeSignal.UnresolvedCall =>
+            string.IsNullOrEmpty(match.Detail) ? match.Value : match.Detail,
+        _ => match.Detail switch
+        {
+            null or "" => match.Value,
+            MetadataRefContexts.Query => $"{match.Value} (из запроса)",
+            MetadataRefContexts.Code => $"{match.Value} (из кода)",
+            _ => $"{match.Value} ({match.Detail})",
+        },
     };
 
     /// <summary>Термы черновика: имя процедуры по частям, шапка комментария и имена параметров.</summary>

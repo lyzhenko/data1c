@@ -163,7 +163,8 @@ public sealed class IndexSimilarCodeTests
         internal SimilarCode Engine { get; }
 
         internal SimilarCodeResult Find(string draft, int limit = 10, string? excludeId = null) =>
-            Engine.Find(draft, limit, excludeId);
+            // Вызовы черновика разрешает индекс — так же, как это делает инструмент similar.
+            Engine.Find(SimilarCode.Describe(draft, null, Source.ResolveCall), limit, excludeId);
 
         public void Dispose() => _index.Dispose();
     }

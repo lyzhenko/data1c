@@ -17,10 +17,19 @@ namespace Data1c.Store;
 /// начинается с самых редких признаков черновика, а частые пропускаются с пояснением.</para>
 /// <para>Вес признака — обратная частота: <c>log(всего процедур / процедур с признаком)</c>.
 /// Он считается здесь, потому что только здесь известны частоты по индексу.</para>
-/// <para>Запросы идут по существующим индексам схемы: <c>idx_edges_target</c> — вызовы платформы,
-/// <c>idx_refs_target</c> — обращения к метаданным, <c>idx_edges_calls_detail</c> — вызовы процедур,
-/// <c>idx_symbols_node</c> и <c>idx_edges_source</c> — признаки выбранных кандидатов.
-/// Схема индекса при этом не меняется.</para>
+/// <para>Вызов процедуры конфигурации сравнивается по идентификатору разрешённой цели
+/// (<c>routine:module:…#Имя</c>), а не по тексту вызова: «ОбщийМодуль.Метод» и «Метод» внутри этого
+/// модуля ведут в один узел, поэтому квалификация на совпадение не влияет. Текст вызова остаётся
+/// в уточнении признака — он нужен только для объяснения в ответе.</para>
+/// <para>Вызовы с неразрешённой целью (<c>call:…</c>) кандидатов не выбирают: у них нет
+/// идентификатора цели, а по одному имени метода выборка была бы случайной. Они приходят слабым
+/// сигналом <see cref="SimilarCodeSignal.UnresolvedCall"/> с единичным весом и лишь добавляют
+/// немного к оценке уже найденных процедур.</para>
+/// <para>Запросы идут по существующим индексам схемы: <c>idx_edges_target</c> — вызовы платформы
+/// и вызовы процедур (по цели), <c>idx_refs_target</c> — обращения к метаданным,
+/// <c>idx_symbols_owner</c>, <c>idx_symbols_module</c> и <c>idx_symbols_name</c> — разрешение
+/// вызовов черновика, <c>idx_symbols_node</c> и <c>idx_edges_source</c> — признаки выбранных
+/// кандидатов. Схема индекса при этом не меняется.</para>
 /// </remarks>
 public sealed class IndexSimilarCodeSource : ISimilarCodeSource
 {
@@ -63,8 +72,32 @@ public sealed class IndexSimilarCodeSource : ISimilarCodeSource
     private static readonly string RoutineSql =
         """
         SELECT source_id FROM edges
-        WHERE kind = 'Calls' AND detail = @value AND source_id LIKE 'routine:%'
+        WHERE kind = 'Calls' AND target_id = @value AND source_id LIKE 'routine:%'
         LIMIT @cap
+        """;
+
+    /// <summary>Разрешение вызова с квалификатором: процедура общего модуля конфигурации.</summary>
+    private static readonly string OwnerRoutineSql =
+        """
+        SELECT node_id FROM symbols
+        WHERE owner_id = @owner AND name_lower = @method
+        LIMIT 1
+        """;
+
+    /// <summary>Разрешение вызова без квалификатора: процедура модуля черновика.</summary>
+    private static readonly string ModuleRoutineSql =
+        """
+        SELECT node_id FROM symbols
+        WHERE module_path = @module AND name_lower = @method
+        LIMIT 1
+        """;
+
+    /// <summary>Разрешение вызова без квалификатора, когда модуль черновика неизвестен.</summary>
+    private static readonly string UniqueRoutineSql =
+        """
+        SELECT node_id FROM symbols
+        WHERE name_lower = @method
+        LIMIT 2
         """;
 
     private static readonly string TermsSql =
@@ -79,12 +112,90 @@ public sealed class IndexSimilarCodeSource : ISimilarCodeSource
 
     private readonly SqliteIndex _index;
 
+    /// <summary>Модуль черновика: по нему разрешаются вызовы без квалификатора.</summary>
+    private readonly string? _draftModule;
+
     /// <summary>Создаёт источник поверх соединения с индексом.</summary>
     /// <param name="index">Открытый индекс выгрузки: чтение идёт под его замком.</param>
-    public IndexSimilarCodeSource(SqliteIndex index)
+    /// <param name="draftModule">
+    /// Путь модуля черновика внутри выгрузки, если он известен (поиск по существующей процедуре).
+    /// Вызов без квалификатора в BSL — это процедура своего модуля, поэтому без этого пути такой
+    /// вызов разрешается только тогда, когда такое имя в конфигурации одно.
+    /// </param>
+    public IndexSimilarCodeSource(SqliteIndex index, string? draftModule = null)
     {
         ArgumentNullException.ThrowIfNull(index);
         _index = index;
+        _draftModule = string.IsNullOrWhiteSpace(draftModule) ? null : draftModule;
+    }
+
+    /// <summary>
+    /// Разрешает вызов черновика в узел процедуры конфигурации — так же, как это делает сборка
+    /// индекса. Квалифицированный вызов ищется по общему модулю («ОбщийМодуль.Метод»), вызов без
+    /// квалификатора — в модуле черновика, а если модуль неизвестен, то по единственной процедуре
+    /// конфигурации с таким именем. Разрешение нужно признаку вызова процедуры: сравнивается
+    /// идентификатор цели, поэтому «ОбщийМодуль.Метод» и «Метод» внутри этого модуля совпадают.
+    /// </summary>
+    /// <param name="qualifier">Квалификатор вызова («ОбщийМодуль»); null — вызов без квалификатора.</param>
+    /// <param name="method">Имя вызываемого метода.</param>
+    /// <returns>Идентификатор узла процедуры или null, если цель не разрешилась.</returns>
+    public string? ResolveCall(string? qualifier, string method)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(method);
+        return _index.WithLock(() => Resolve(qualifier, method));
+    }
+
+    private string? Resolve(string? qualifier, string method)
+    {
+        var lowered = method.ToLowerInvariant();
+        if (qualifier is { Length: > 0 })
+        {
+            // Порядок тот же, что при сборке индекса: «CommonModule.Имя», затем само имя владельца.
+            return RoutineOfOwner("CommonModule." + qualifier, lowered)
+                ?? RoutineOfOwner(qualifier, lowered);
+        }
+
+        if (_draftModule is { } module)
+        {
+            return RoutineOfModule(module, lowered);
+        }
+
+        // Модуль черновика неизвестен: вызов без квалификатора — процедура своего модуля, поэтому
+        // разрешить его можно только тогда, когда такое имя в конфигурации одно.
+        return UniqueRoutine(lowered);
+    }
+
+    /// <summary>Процедура общего модуля по имени владельца: null, если такой нет.</summary>
+    private string? RoutineOfOwner(string owner, string method)
+    {
+        using var command = _index.CreateCommand(OwnerRoutineSql);
+        command.Parameters.AddWithValue("@owner", owner);
+        command.Parameters.AddWithValue("@method", method);
+        return command.ExecuteScalar() as string;
+    }
+
+    /// <summary>Процедура модуля по его пути: null, если такой нет.</summary>
+    private string? RoutineOfModule(string module, string method)
+    {
+        using var command = _index.CreateCommand(ModuleRoutineSql);
+        command.Parameters.AddWithValue("@module", module);
+        command.Parameters.AddWithValue("@method", method);
+        return command.ExecuteScalar() as string;
+    }
+
+    /// <summary>Единственная процедура конфигурации с таким именем: при повторе имени цель неизвестна.</summary>
+    private string? UniqueRoutine(string method)
+    {
+        using var command = _index.CreateCommand(UniqueRoutineSql);
+        command.Parameters.AddWithValue("@method", method);
+        using var reader = command.ExecuteReader();
+        if (!reader.Read())
+        {
+            return null;
+        }
+
+        var found = reader.GetString(0);
+        return reader.Read() ? null : found;
     }
 
     /// <inheritdoc/>
@@ -132,6 +243,14 @@ public sealed class IndexSimilarCodeSource : ISimilarCodeSource
             }
         }
 
+        // Слабый сигнал: вызовы с неразрешённой целью. Частоты для них не считаются — кандидатов
+        // они не выбирают, а сила сигнала ограничена их общим весом в настройках.
+        var weak = WeakWeights(features.UnresolvedCalls);
+        if (weak.Count > 0)
+        {
+            weights[SimilarCodeSignal.UnresolvedCall] = weak;
+        }
+
         var terms = ReadTerms(features, limit);
         var candidates = Collect(probes, terms, limit, excludeId);
         var profiles = ReadProfiles(candidates, terms.Scores);
@@ -148,6 +267,25 @@ public sealed class IndexSimilarCodeSource : ISimilarCodeSource
         }
 
         return new SimilarCodeCandidates(profiles, weights, notes, recognized);
+    }
+
+    /// <summary>
+    /// Веса вызовов с неразрешённой целью: у каждого признака единица. Обратная частота здесь
+    /// не считается: такие вызовы кандидатов не выбирают (нет идентификатора цели), поэтому
+    /// конфигурация по ним не опрашивается, а вклад сигнала ограничен его общим весом.
+    /// </summary>
+    private static Dictionary<string, double> WeakWeights(IReadOnlyList<SimilarCodeFeature> features)
+    {
+        var weights = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        foreach (var feature in features)
+        {
+            if (!string.IsNullOrWhiteSpace(feature.Value))
+            {
+                weights[feature.Value] = 1;
+            }
+        }
+
+        return weights;
     }
 
     /// <summary>
@@ -323,6 +461,7 @@ public sealed class IndexSimilarCodeSource : ISimilarCodeSource
         var symbols = new List<SymbolRow>();
         var platforms = new Dictionary<string, List<SimilarCodeFeature>>(StringComparer.Ordinal);
         var routines = new Dictionary<string, List<SimilarCodeFeature>>(StringComparer.Ordinal);
+        var unresolved = new Dictionary<string, List<SimilarCodeFeature>>(StringComparer.Ordinal);
         var references = new Dictionary<string, List<SimilarCodeFeature>>(StringComparer.Ordinal);
         var statements = new Dictionary<string, int>(StringComparer.Ordinal);
 
@@ -369,6 +508,7 @@ public sealed class IndexSimilarCodeSource : ISimilarCodeSource
                     var source = reader.GetString(0);
                     var target = reader.GetString(1);
                     statements[source] = statements.GetValueOrDefault(source) + 1;
+                    var detail = reader.IsDBNull(2) ? target : reader.GetString(2);
 
                     if (target.StartsWith("platform:", StringComparison.Ordinal))
                     {
@@ -376,9 +516,17 @@ public sealed class IndexSimilarCodeSource : ISimilarCodeSource
                     }
                     else if (target.StartsWith("routine:", StringComparison.Ordinal))
                     {
-                        // Значение признака — текст вызова: он же лежит в detail и по нему идёт выборка.
-                        var detail = reader.IsDBNull(2) ? target : reader.GetString(2);
-                        Add(routines, source, new SimilarCodeFeature(detail));
+                        // Значение признака — идентификатор разрешённой цели: по нему и идёт выборка,
+                        // поэтому «ОбщийМодуль.Метод» и «Метод» внутри этого модуля совпадают.
+                        // Текст вызова остаётся в уточнении — он нужен только для объяснения.
+                        Add(routines, source, new SimilarCodeFeature(target, detail));
+                    }
+                    else if (target.StartsWith("call:", StringComparison.Ordinal))
+                    {
+                        // Цель не разрешилась: слабый признак — имя метода без квалификатора.
+                        Add(unresolved, source, new SimilarCodeFeature(
+                            SimilarCode.CallName(target["call:".Length..]),
+                            detail));
                     }
                 }
             }
@@ -416,6 +564,7 @@ public sealed class IndexSimilarCodeSource : ISimilarCodeSource
                 Distinct(platforms, symbol.NodeId),
                 Distinct(references, symbol.NodeId),
                 Distinct(routines, symbol.NodeId),
+                Distinct(unresolved, symbol.NodeId),
                 terms.TryGetValue(symbol.NodeId, out var score) ? score : 0,
                 symbol.CommentHead,
                 symbol.Parameters));

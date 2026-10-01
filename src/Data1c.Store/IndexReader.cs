@@ -26,7 +26,12 @@ public sealed class IndexReader
     /// Источник кандидатов для поиска похожего кода (Э2-5). Сравнение идёт по тому же соединению
     /// и под тем же замком, что и остальные запросы: индекс открыт только на чтение.
     /// </summary>
-    public IndexSimilarCodeSource SimilarCodeSource() => new(_index);
+    /// <param name="draftModule">
+    /// Модуль черновика внутри выгрузки, если он известен: по нему источник разрешает вызовы без
+    /// квалификатора в узлы процедур (<see cref="IndexSimilarCodeSource.ResolveCall"/>). Для
+    /// черновика, которого в выгрузке нет, путь не передаётся.
+    /// </param>
+    public IndexSimilarCodeSource SimilarCodeSource(string? draftModule = null) => new(_index, draftModule);
 
     /// <summary>Сколько узлов каждого вида: нужно для статистики графа.</summary>
     public IReadOnlyDictionary<string, int> CountNodesByKind() => CountByKind("nodes");

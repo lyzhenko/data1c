@@ -175,7 +175,8 @@ public sealed class SimilarCodeTests
         string name,
         int lines,
         int statements,
-        IReadOnlyList<string>? platform = null)
+        IReadOnlyList<string>? platform = null,
+        IReadOnlyList<string>? unresolved = null)
     {
         var start = 2;
         return new SimilarCodeProfile(
@@ -189,6 +190,7 @@ public sealed class SimilarCodeTests
             [.. (platform ?? []).Select(static value => new SimilarCodeFeature(value))],
             [],
             [],
+            [.. (unresolved ?? []).Select(static value => new SimilarCodeFeature(value))],
             0);
     }
 
@@ -216,6 +218,7 @@ public sealed class SimilarCodeTests
                 [SimilarCodeSignal.PlatformCall] = Build(features.PlatformCalls),
                 [SimilarCodeSignal.MetadataReference] = Build(features.MetadataReferences),
                 [SimilarCodeSignal.RoutineCall] = Build(features.RoutineCalls),
+                [SimilarCodeSignal.UnresolvedCall] = Build(features.UnresolvedCalls),
             };
 
             var profiles = _profiles
