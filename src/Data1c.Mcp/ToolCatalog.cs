@@ -1,11 +1,14 @@
 using System.Globalization;
 using System.Text;
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Data1c.Core.Analysis;
 using Data1c.Core.Bsl;
 using Data1c.Core.Dump;
 using Data1c.Core.Graph;
 using Data1c.Core.Metadata;
 using Data1c.Core.Platform;
+using Data1c.FileSystem;
 
 namespace Data1c.Mcp;
 
@@ -15,6 +18,12 @@ namespace Data1c.Mcp;
 /// </summary>
 public sealed class ToolCatalog
 {
+    /// <summary>Расширения, по которым ищет grep, если агент не задал свои.</summary>
+    private static readonly IReadOnlyCollection<string> DefaultGrepExtensions = [".bsl", ".xml"];
+
+    /// <summary>Предел строк, читаемых из одного файла при поиске: защита от гигантских модулей.</summary>
+    private const int MaxLinesPerFile = 60_000;
+
     private readonly Lock _sessionGate = new();
     private readonly List<ToolSpec> _tools;
     private AnalysisSession _session;
@@ -28,6 +37,7 @@ public sealed class ToolCatalog
             StatusTool(),
             OpenTool(),
             SearchTool(),
+            GrepTool(),
             NodeTool(),
             NeighborsTool(),
             CodeTool(),
@@ -64,24 +74,30 @@ public sealed class ToolCatalog
 
     private ToolSpec OpenTool() => new(
         "open",
-        "Открыть выгрузку конфигурации 1С по пути к каталогу (или переключиться на другую): "
-        + "разбор запускается в фоне, следите через status. Нужен, если сервер запущен без --dump.",
+        "Открыть выгрузку конфигурации 1С по путям к каталогам (или переключиться на другую): первый каталог — "
+        + "база, следующие — расширения, они перекрывают базу по совпадающим путям. Разбор идёт в фоне (status).",
         [
-            new ToolParameter("path", "string", "Каталог выгрузки, созданный командой «Выгрузить конфигурацию в файлы».", Required: true),
+            new ToolParameter("path", "string", "Каталог выгрузки, созданный командой «Выгрузить конфигурацию в файлы»."),
+            new ToolParameter("paths", "array", "Несколько каталогов: база и расширения. Заменяет path."),
             new ToolParameter("platform", "boolean", "Подключить справку платформы 1С для этой выгрузки."),
             new ToolParameter("sections", "array", "Разбирать только эти секции выгрузки (например, [\"CommonModules\",\"Catalogs\"])."),
         ],
         (arguments, cancellationToken) =>
         {
             _ = cancellationToken;
-            var path = arguments.RequireString("path");
             var current = Session;
+            var paths = arguments.GetStringList("paths");
+            if (paths is null)
+            {
+                paths = [arguments.RequireString("path")];
+            }
+
             var platform = arguments.GetBool("platform", current.Request.PlatformHelp);
             var sections = arguments.GetStringList("sections") ?? current.Request.Sections;
 
             var opened = new AnalysisSession(current.Request with
             {
-                DumpPath = path,
+                DumpPaths = paths,
                 PlatformHelp = platform,
                 Sections = sections,
             });
@@ -106,23 +122,32 @@ public sealed class ToolCatalog
 
     private ToolSpec SearchTool() => new(
         "search",
-        "Поиск объектов конфигурации по идентификатору, имени, синониму, пути файла: даёт идентификаторы "
-        + "для node/neighbors/code. Пример: search query=\"Номенклатура\".",
+        "Поиск по имени, синониму, идентификатору или пути файла: объекты, модули и процедуры из графа, "
+        + "а при includeNested — ещё и реквизиты, табличные части, формы и команды внутри объектов. "
+        + "Даёт идентификаторы для node/neighbors/code/metadata. Пример: search query=\"Номенклатура\".",
         [
             new ToolParameter("query", "string", "Имя, синоним, часть идентификатора (Catalog.Товары) или путь файла.", Required: true),
             new ToolParameter("limit", "integer", "Сколько результатов вернуть (1–100, по умолчанию 20)."),
             new ToolParameter(
                 "kinds",
                 "array",
-                "Оставить только эти виды узлов.",
+                "Оставить только эти виды узлов графа.",
                 Values: ["Configuration", "MetadataObject", "Module", "Routine", "External", "Platform"]),
+            new ToolParameter("includeNested", "boolean", "Искать также реквизиты и табличные части внутри объектов (по умолчанию да)."),
+            new ToolParameter(
+                "metadataKinds",
+                "array",
+                "Оставить из вложенных только эти виды: Attribute, TabularSection, Form, Command, Template."),
         ],
         async (arguments, token) =>
         {
-            var query = await QueryAsync(token);
+            var result = await AnalysisAsync(token);
+            var query = new GraphQueryService(result.Graph);
             var text = arguments.RequireString("query");
             var limit = arguments.GetInt("limit", 20, 1, 100);
             var kinds = ParseKinds(arguments.GetStringList("kinds"));
+            var includeNested = arguments.GetBool("includeNested", true);
+            var metadataKinds = arguments.GetStringList("metadataKinds");
 
             var hits = query.Search(text, kinds is null ? limit : Math.Min(100, limit * 4));
             var filtered = hits
@@ -141,13 +166,139 @@ public sealed class ToolCatalog
                 })
                 .ToList();
 
-            if (filtered.Count == 0)
+            // Вложенные объекты (реквизиты, табличные части) в графе не представлены, но есть в модели
+            // метаданных — иначе по имени реквизита ничего не находится.
+            var nested = includeNested ? SearchNested(result.Metadata, text, metadataKinds, limit) : [];
+
+            if (filtered.Count == 0 && nested.Count == 0)
             {
                 return $"Ничего не найдено по запросу «{text}». Попробуйте часть имени, синоним или путь файла.";
             }
 
-            return Render.JsonOf(new { query = text, found = filtered.Count, total = hits.Count, results = filtered });
+            return Render.JsonOf(new
+            {
+                query = text,
+                found = filtered.Count,
+                total = hits.Count,
+                results = filtered,
+                nestedFound = nested.Count,
+                nested,
+            });
         });
+
+    /// <summary>Поиск по вложенным объектам модели метаданных: реквизиты, табличные части, формы, команды.</summary>
+    private static List<object> SearchNested(
+        MdObjectModel model,
+        string text,
+        IReadOnlyList<string>? kinds,
+        int limit)
+    {
+        var hits = new List<(int Score, MdObject Object)>();
+
+        foreach (var obj in model.Objects)
+        {
+            // Верхний уровень ищется в графе: здесь только вложенное.
+            if (obj.Parent is null || obj.Parent.Kind == MdKind.Configuration)
+            {
+                continue;
+            }
+
+            if (kinds is { Count: > 0 } && !kinds.Contains(obj.Kind.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var score = RankMetadata(obj, text);
+            if (score >= 0)
+            {
+                hits.Add((score, obj));
+            }
+        }
+
+        return hits
+            .OrderBy(static hit => hit.Score)
+            .ThenBy(static hit => hit.Object.Id, StringComparer.Ordinal)
+            .Take(limit)
+            .Select(static hit => (object)new
+            {
+                id = hit.Object.Id,
+                kind = hit.Object.Kind.Name,
+                name = hit.Object.Name,
+                synonym = hit.Object.Synonym,
+                objectId = TopLevelId(hit.Object),
+                parent = hit.Object.Parent?.Id,
+                types = hit.Object.References
+                    .Where(static reference => reference.Kind == MdReferenceKind.Type)
+                    .Select(static reference => reference.TargetId)
+                    .Distinct(StringComparer.Ordinal)
+                    .Take(5)
+                    .ToList(),
+            })
+            .ToList();
+    }
+
+    private static string TopLevelId(MdObject obj)
+    {
+        var current = obj;
+        while (current.Parent is not null && current.Parent.Kind != MdKind.Configuration)
+        {
+            current = current.Parent;
+        }
+
+        return current.Id;
+    }
+
+    private static int RankMetadata(MdObject obj, string text)
+    {
+        if (string.Equals(obj.Name, text, StringComparison.OrdinalIgnoreCase))
+        {
+            return 0;
+        }
+
+        if (string.Equals(obj.Synonym, text, StringComparison.OrdinalIgnoreCase))
+        {
+            return 1;
+        }
+
+        if (obj.Name.StartsWith(text, StringComparison.OrdinalIgnoreCase))
+        {
+            return 2;
+        }
+
+        if (obj.Name.Contains(text, StringComparison.OrdinalIgnoreCase))
+        {
+            return 3;
+        }
+
+        if (obj.Id.Contains(text, StringComparison.OrdinalIgnoreCase))
+        {
+            return 4;
+        }
+
+        if (obj.Synonym is not null && obj.Synonym.Contains(text, StringComparison.OrdinalIgnoreCase))
+        {
+            return 5;
+        }
+
+        return -1;
+    }
+
+    private ToolSpec GrepTool() => new(
+        "grep",
+        "Поиск по тексту файлов выгрузки (BSL, XML): подстрока или регулярное выражение. Ищет во всех "
+        + "подключённых источниках (база и расширения) и для каждого совпадения указывает источник и "
+        + "объект-владелец. Пример: найти реквизит в текстах запросов — grep pattern=\"Артикул\" paths=[\"Reports/\"].",
+        [
+            new ToolParameter("pattern", "string", "Что искать: подстрока или регулярное выражение.", Required: true),
+            new ToolParameter("regex", "boolean", "Считать pattern регулярным выражением (по умолчанию — подстрока)."),
+            new ToolParameter("ignoreCase", "boolean", "Не учитывать регистр (по умолчанию да)."),
+            new ToolParameter("extensions", "array", "Расширения файлов (по умолчанию .bsl и .xml)."),
+            new ToolParameter("paths", "array", "Ограничить префиксами путей: [\"Reports/\", \"Documents/Заказ/\" ]."),
+            new ToolParameter("limit", "integer", "Предел числа совпадений (1–500, по умолчанию 50)."),
+            new ToolParameter("context", "integer", "Сколько строк до и после совпадения показать (0–3, по умолчанию 1)."),
+            new ToolParameter("waitMs", "integer", "Сколько миллисекунд ждать разбор ради имён владельцев (0–600000, по умолчанию 60000; 0 — не ждать)."),
+        ],
+        (arguments, cancellationToken) => GrepAsync(arguments, cancellationToken));
 
     private ToolSpec NodeTool() => new(
         "node",
@@ -330,15 +481,19 @@ public sealed class ToolCatalog
 
     private ToolSpec MetadataTool() => new(
         "metadata",
-        "Состав объекта метаданных 1С: реквизиты, табличные части, типы, формы, модули. "
-        + "Нужен, чтобы писать код по реальной структуре объекта. Пример: id=\"Catalog.Товары\".",
+        "Состав объекта метаданных 1С деревом: реквизиты, табличные части и их реквизиты, формы, команды, "
+        + "типы, модули. Нужен, чтобы писать код по реальной структуре объекта. Пример: id=\"Catalog.Товары\".",
         [
-            new ToolParameter("id", "string", "Идентификатор объекта: Catalog.Товары, Document.Заказ, CommonModule.ОбщегоНазначения.", Required: true),
+            new ToolParameter("id", "string", "Идентификатор: Catalog.Товары, Document.Заказ, Document.Заказ/TabularSection.Строки.", Required: true),
+            new ToolParameter("depth", "integer", "Глубина дерева состава (1–4, по умолчанию 3)."),
+            new ToolParameter("maxChildren", "integer", "Сколько детей показывать у одного узла (1–500, по умолчанию 200)."),
         ],
         async (arguments, token) =>
         {
             var result = await AnalysisAsync(token);
             var id = arguments.RequireString("id");
+            var depth = arguments.GetInt("depth", 3, 1, 4);
+            var maxChildren = arguments.GetInt("maxChildren", 200, 1, 500);
             var obj = result.Metadata.Find(id);
 
             if (obj is null)
@@ -349,54 +504,126 @@ public sealed class ToolCatalog
                 throw new ToolException($"Объект метаданных «{id}» не найден.{hint}");
             }
 
-            return Render.JsonOf(new
+            var card = MetadataNode(obj, depth, maxChildren);
+            card["uuid"] = obj.Uuid?.ToString();
+            card["file"] = obj.SourcePath;
+            card["isTopLevel"] = obj.IsTopLevel;
+            card["parent"] = obj.Parent?.Id;
+
+            var properties = new JsonObject();
+            foreach (var property in obj.Properties.Where(static property => !string.IsNullOrWhiteSpace(property.Value)).Take(40))
             {
-                id = obj.CanonicalName,
-                kind = obj.Kind.ToString(),
-                name = obj.Name,
-                synonym = obj.Synonym,
-                uuid = obj.Uuid,
-                parent = obj.Parent?.CanonicalName,
-                file = obj.SourcePath,
-                comment = obj.Comment,
-                isTopLevel = obj.IsTopLevel,
-                properties = obj.Properties
-                    .Where(static property => !string.IsNullOrWhiteSpace(property.Value))
-                    .Take(30)
-                    .ToDictionary(static property => property.Key, static property => property.Value),
-                children = obj.Children
-                    .GroupBy(static child => child.Kind.ToString())
-                    .ToDictionary(
-                        static group => group.Key,
-                        group => group.Take(60).Select(child => new
-                        {
-                            id = child.CanonicalName,
-                            name = child.Name,
-                            synonym = child.Synonym,
-                            types = child.References
-                                .Where(static reference => reference.Kind == MdReferenceKind.Type)
-                                .Select(static reference => reference.TargetId)
-                                .Distinct(StringComparer.Ordinal)
-                                .Take(10)
-                                .ToList(),
-                        }).ToList()),
-                references = obj.References
-                    .Where(static reference => reference.Kind != MdReferenceKind.Type)
-                    .Take(60)
-                    .Select(static reference => new
-                    {
-                        kind = reference.Kind.ToString(),
-                        target = reference.TargetId,
-                        detail = reference.Detail,
-                    })
-                    .ToList(),
-                modules = obj.Modules.Select(static module => new
+                properties[property.Key] = property.Value;
+            }
+
+            card["properties"] = properties.Count > 0 ? properties : null;
+
+            var references = new JsonArray();
+            foreach (var reference in obj.References.Where(static reference => reference.Kind != MdReferenceKind.Type).Take(60))
+            {
+                references.Add(new JsonObject
                 {
-                    path = module.RelativePath,
-                    kind = module.Kind.ToString(),
-                }).ToList(),
-            });
+                    ["kind"] = reference.Kind.ToString(),
+                    ["target"] = reference.TargetId,
+                    ["detail"] = reference.Detail,
+                });
+            }
+
+            card["references"] = references.Count > 0 ? references : null;
+
+            var modules = new JsonArray();
+            foreach (var module in obj.Modules)
+            {
+                modules.Add(new JsonObject
+                {
+                    ["path"] = module.RelativePath,
+                    ["kind"] = module.Kind.ToString(),
+                });
+            }
+
+            card["modules"] = modules.Count > 0 ? modules : null;
+            return Render.JsonOf(card);
         });
+
+    /// <summary>
+    /// Узел дерева состава объекта: сам объект, его типы и дети. Вложенность важна для табличных частей —
+    /// плоский список реквизитов не показывает, какие из них относятся к табличной части, а какие к объекту.
+    /// </summary>
+    private static JsonObject MetadataNode(MdObject obj, int depth, int maxChildren)
+    {
+        var node = new JsonObject
+        {
+            ["id"] = obj.Id,
+            ["kind"] = obj.Kind.Name,
+            ["name"] = obj.Name,
+        };
+
+        if (!string.IsNullOrWhiteSpace(obj.Synonym))
+        {
+            node["synonym"] = obj.Synonym;
+        }
+
+        if (!string.IsNullOrWhiteSpace(obj.Comment))
+        {
+            node["comment"] = obj.Comment;
+        }
+
+        if (obj.IsNameOnlyReference)
+        {
+            node["nameOnly"] = true;
+        }
+
+        var types = obj.References
+            .Where(static reference => reference.Kind == MdReferenceKind.Type)
+            .Select(static reference => reference.TargetId)
+            .Distinct(StringComparer.Ordinal)
+            .Take(10)
+            .ToList();
+
+        if (types.Count > 0)
+        {
+            var values = new JsonArray();
+            foreach (var type in types)
+            {
+                values.Add(type);
+            }
+
+            node["types"] = values;
+        }
+
+        if (obj.Children.Count == 0)
+        {
+            return node;
+        }
+
+        if (depth <= 1)
+        {
+            // Глубина исчерпана: показываем хотя бы состав по видам, чтобы не терять структуру.
+            var kinds = new JsonObject();
+            foreach (var group in obj.Children.GroupBy(static child => child.Kind.Name).OrderBy(static group => group.Key, StringComparer.Ordinal))
+            {
+                kinds[group.Key] = group.Count();
+            }
+
+            node["childrenCount"] = obj.Children.Count;
+            node["childrenOfKinds"] = kinds;
+            return node;
+        }
+
+        var children = new JsonArray();
+        foreach (var child in obj.Children.Take(maxChildren))
+        {
+            children.Add(MetadataNode(child, depth - 1, maxChildren));
+        }
+
+        node["children"] = children;
+        if (obj.Children.Count > maxChildren)
+        {
+            node["childrenTruncated"] = obj.Children.Count - maxChildren;
+        }
+
+        return node;
+    }
 
     private ToolSpec PlatformTool() => new(
         "platform",
@@ -546,6 +773,381 @@ public sealed class ToolCatalog
             Session.Reload();
             return Task.FromResult($"Разбор запущен заново. Состояние: {Session.State}");
         });
+
+    /// <summary>Совпадение без сведений об объекте: их добавляет вызывающий, когда знает владельца.</summary>
+    private sealed record RawHit(int Line, string Text, List<string> Context);
+
+    /// <summary>Готовое совпадение: где найдено, из какого источника и какому объекту принадлежит файл.</summary>
+    private sealed record GrepHit(
+        string? Owner,
+        string Source,
+        bool Overridden,
+        string File,
+        int Line,
+        string Text,
+        List<string> Context);
+
+    /// <summary>Поиск по тексту файлов выгрузки.</summary>
+    private async Task<string> GrepAsync(ToolArguments arguments, CancellationToken cancellationToken)
+    {
+        var session = Session;
+        var source = session.Source;
+        var pattern = arguments.RequireString("pattern");
+        var isRegex = arguments.GetBool("regex", false);
+        var ignoreCase = arguments.GetBool("ignoreCase", true);
+        var extensions = NormalizeExtensions(arguments.GetStringList("extensions"));
+        var prefixes = arguments.GetStringList("paths");
+        var limit = arguments.GetInt("limit", 50, 1, 500);
+        var contextLines = arguments.GetInt("context", 1, 0, 3);
+        var waitMs = arguments.GetInt("waitMs", 60_000, 0, 600_000);
+
+        var matcher = BuildMatcher(pattern, isRegex, ignoreCase);
+        var composite = source as CompositeDumpSource;
+
+        // Разбор нужен только ради имён владельцев, поэтому ждём его ограниченное время:
+        // на большой выгрузке первый вызов иначе упирается в таймаут клиента.
+        var (owners, ownersResolved) = await OwnerIndexAsync(waitMs, cancellationToken);
+
+        var files = new List<SourcedDumpFile>();
+        if (composite is not null)
+        {
+            files.AddRange(composite
+                .EnumerateAll(cancellationToken)
+                .Where(entry => Accept(entry.File, extensions, prefixes)));
+        }
+        else
+        {
+            files.AddRange(source
+                .EnumerateFiles(cancellationToken)
+                .Where(file => Accept(file, extensions, prefixes))
+                .Select(file => new SourcedDumpFile(0, source, file)));
+        }
+
+        var hits = new List<GrepHit>();
+        var gate = new Lock();
+        var scanned = 0;
+        var matchedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var stop = new int[1];
+        var overriddenFound = false;
+
+        Parallel.ForEach(
+            files,
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Environment.ProcessorCount,
+                CancellationToken = cancellationToken,
+            },
+            (entry, state) =>
+            {
+                if (Volatile.Read(ref stop[0]) == 1)
+                {
+                    state.Stop();
+                    return;
+                }
+
+                Interlocked.Increment(ref scanned);
+                List<RawHit> found;
+                try
+                {
+                    found = ScanFile(source, entry.File, matcher, contextLines, limit, cancellationToken);
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or NotSupportedException)
+                {
+                    // Файл занят выгрузкой 1С или исчез между запросами — поиск продолжается.
+                    return;
+                }
+
+                if (found.Count == 0)
+                {
+                    return;
+                }
+
+                var owner = owners.Find(entry.File.RelativePath);
+                var overridden = composite?.IsOverridden(entry.File.RelativePath) ?? false;
+
+                lock (gate)
+                {
+                    foreach (var hit in found)
+                    {
+                        if (hits.Count >= limit)
+                        {
+                            Volatile.Write(ref stop[0], 1);
+                            break;
+                        }
+
+                        matchedFiles.Add(entry.File.RelativePath);
+                        overriddenFound |= overridden;
+                        hits.Add(new GrepHit(owner, entry.Source.DisplayName, overridden, entry.File.RelativePath, hit.Line, hit.Text, hit.Context));
+                    }
+                }
+            });
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var ownerSummary = hits
+            .Where(static hit => !string.IsNullOrEmpty(hit.Owner))
+            .GroupBy(static hit => hit.Owner!, StringComparer.Ordinal)
+            .OrderByDescending(static group => group.Count())
+            .Select(static group => new { owner = group.Key, count = group.Count() })
+            .ToList();
+
+        return Render.JsonOf(new
+        {
+            pattern,
+            regex = isRegex,
+            ignoreCase,
+            sources = SourceNames(source),
+            filesScanned = Volatile.Read(ref scanned),
+            filesMatched = matchedFiles.Count,
+            matches = hits.Count,
+            truncated = Volatile.Read(ref stop[0]) == 1,
+            ownersResolved,
+            byOwner = ownerSummary,
+            note = BuildGrepNote(overriddenFound, ownersResolved),
+            hits = hits.Select(static hit => new
+            {
+                owner = hit.Owner,
+                source = hit.Source,
+                overridden = hit.Overridden ? true : (bool?)null,
+                file = hit.File,
+                line = hit.Line,
+                text = hit.Text,
+                context = hit.Context.Count > 0 ? hit.Context : null,
+            }).ToList(),
+        });
+    }
+
+    private static string? BuildGrepNote(bool overridden, bool ownersResolved)
+    {
+        var parts = new List<string>(2);
+        if (!ownersResolved)
+        {
+            parts.Add("Разбор выгрузки ещё идёт, поэтому владельцы не определены: повторите поиск позже "
+                + "(разбор продолжается в фоне, status покажет готовность) или увеличьте waitMs.");
+        }
+
+        if (overridden)
+        {
+            parts.Add("Часть файлов перекрыта другим источником (расширением): показаны обе версии, у совпадения указан source.");
+        }
+
+        return parts.Count == 0 ? null : string.Join(' ', parts);
+    }
+
+    /// <summary>Читает файл и возвращает совпадения с окружением.</summary>
+    private static List<RawHit> ScanFile(
+        IDumpSource source,
+        DumpFile file,
+        Func<string, bool> matcher,
+        int contextLines,
+        int limit,
+        CancellationToken cancellationToken)
+    {
+        var lines = new List<string>(1024);
+        using (var stream = source.OpenRead(file))
+        using (var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
+        {
+            while (reader.ReadLine() is { } line)
+            {
+                lines.Add(line);
+                if (lines.Count >= MaxLinesPerFile)
+                {
+                    break;
+                }
+            }
+        }
+
+        var found = new List<RawHit>();
+        for (var index = 0; index < lines.Count && found.Count < limit; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!matcher(lines[index]))
+            {
+                continue;
+            }
+
+            var from = Math.Max(0, index - contextLines);
+            var to = Math.Min(lines.Count - 1, index + contextLines);
+            var context = new List<string>(Math.Max(0, to - from));
+            for (var neighbour = from; neighbour <= to; neighbour++)
+            {
+                if (neighbour != index)
+                {
+                    context.Add(lines[neighbour].Trim());
+                }
+            }
+
+            found.Add(new RawHit(index + 1, lines[index].Trim(), context));
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// Карта «файл выгрузки → объект метаданных». Модули сопоставляются точно (по пути модуля),
+    /// остальные файлы — по каталогу объекта: у схемы компоновки данных или макета отчёта нет
+    /// собственного объекта в модели, но владелец у них всё равно есть — сам отчёт.
+    /// </summary>
+    private sealed class OwnerIndex
+    {
+        private readonly IReadOnlyDictionary<string, string> _byFile;
+        private readonly IReadOnlyList<(string Prefix, string Owner)> _byDirectory;
+
+        public OwnerIndex(
+            IReadOnlyDictionary<string, string> byFile,
+            IReadOnlyList<(string Prefix, string Owner)> byDirectory)
+        {
+            _byFile = byFile;
+            _byDirectory = byDirectory;
+        }
+
+        public string? Find(string relativePath)
+        {
+            if (_byFile.TryGetValue(relativePath, out var owner))
+            {
+                return owner;
+            }
+
+            string? best = null;
+            var bestLength = 0;
+            foreach (var (prefix, candidate) in _byDirectory)
+            {
+                if (prefix.Length > bestLength && relativePath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    best = candidate;
+                    bestLength = prefix.Length;
+                }
+            }
+
+            return best;
+        }
+    }
+
+    /// <summary>
+    /// Строит карту владельцев, ожидая разбор не дольше <paramref name="waitMs"/>. Если разбор не успел
+    /// или не удался, поиск всё равно отдаёт совпадения — просто без имён объектов.
+    /// </summary>
+    private async Task<(OwnerIndex Index, bool Resolved)> OwnerIndexAsync(int waitMs, CancellationToken cancellationToken)
+    {
+        var session = Session;
+        var result = session.Result;
+
+        if (result is null && waitMs > 0)
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(waitMs);
+            try
+            {
+                result = await session.GetAsync(timeout.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Разбор не успел за отведённое время: отдаём совпадения без владельцев.
+                result = null;
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                result = null;
+            }
+        }
+
+        if (result is null)
+        {
+            return (new OwnerIndex(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), []), false);
+        }
+
+        var byFile = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var module in result.Modules)
+        {
+            if (!string.IsNullOrEmpty(module.OwnerId))
+            {
+                byFile[module.Path] = module.OwnerId!;
+            }
+        }
+
+        var byDirectory = new List<(string Prefix, string Owner)>();
+        foreach (var obj in result.Metadata.Objects)
+        {
+            if (obj.IsTopLevel && !string.IsNullOrEmpty(obj.Directory))
+            {
+                byDirectory.Add((obj.Directory + "/", obj.Id));
+            }
+        }
+
+        return (new OwnerIndex(byFile, byDirectory), true);
+    }
+
+    private static Func<string, bool> BuildMatcher(string pattern, bool isRegex, bool ignoreCase)
+    {
+        if (!isRegex)
+        {
+            var comparison = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            return line => line.Contains(pattern, comparison);
+        }
+
+        var options = RegexOptions.CultureInvariant;
+        if (ignoreCase)
+        {
+            options |= RegexOptions.IgnoreCase;
+        }
+
+        Regex regex;
+        try
+        {
+            regex = new Regex(pattern, options);
+        }
+        catch (ArgumentException exception)
+        {
+            throw new ToolException($"Регулярное выражение не разобрано: {exception.Message}");
+        }
+
+        return line => regex.IsMatch(line);
+    }
+
+    private static IReadOnlyCollection<string> NormalizeExtensions(IReadOnlyList<string>? values)
+    {
+        if (values is null || values.Count == 0)
+        {
+            return DefaultGrepExtensions;
+        }
+
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var value in values)
+        {
+            result.Add(value.StartsWith('.') ? value : "." + value);
+        }
+
+        return result;
+    }
+
+    private static bool Accept(DumpFile file, IReadOnlyCollection<string> extensions, IReadOnlyList<string>? prefixes)
+    {
+        if (!extensions.Contains(file.Extension))
+        {
+            return false;
+        }
+
+        if (prefixes is null || prefixes.Count == 0)
+        {
+            return true;
+        }
+
+        foreach (var prefix in prefixes)
+        {
+            var normalized = DumpPath.Normalize(prefix);
+            if (file.RelativePath.StartsWith(normalized, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static IReadOnlyList<string> SourceNames(IDumpSource source) =>
+        source is CompositeDumpSource composite
+            ? [.. composite.Sources.Select(static item => item.DisplayName)]
+            : [source.DisplayName];
 
     private string Status()
     {

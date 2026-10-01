@@ -22,6 +22,8 @@
         args:
           - 'C:\Users\alexa\RiderProjects\Data1C\src\Data1c.Mcp\bin\Release\net10.0\Data1c.Mcp.dll'
           - '--platform'
-        # Разбор большой выгрузки на первом запросе занимает десятки секунд.
-        toolCallTimeoutMs: 300000
+        # Первый вызов, которому нужен разбор (search, metadata, node), на большой
+        # выгрузке идёт минуты, поэтому таймаут увеличен. Поиск по тексту (grep)
+        # разбор не ждёт: у него свой предел waitMs.
+        toolCallTimeoutMs: 1800000
         failOnStartupError: false

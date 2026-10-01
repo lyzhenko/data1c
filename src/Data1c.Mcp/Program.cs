@@ -39,7 +39,7 @@ internal static class Program
 
         var session = new AnalysisSession(new AnalysisRequest
         {
-            DumpPath = options.DumpPath ?? string.Empty,
+            DumpPaths = options.DumpPaths,
             IncludeBsl = options.IncludeBsl,
             IncludeCalls = options.IncludeCalls,
             Sections = options.Sections,
