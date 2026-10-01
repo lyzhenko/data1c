@@ -88,7 +88,21 @@ public sealed record BslRegion(string Name, int StartLine, int EndLine, int Dept
 /// <param name="Qualifier">Часть до последней точки: «ОбщегоНазначения». Для локального вызова — null.</param>
 /// <param name="Method">Последняя часть: «ЗначениеРеквизитаОбъекта».</param>
 /// <param name="Line">Номер строки (1-based).</param>
-public sealed record BslCall(string Callee, string? Qualifier, string Method, int Line)
+/// <param name="ArgumentCount">
+/// Число аргументов вызова; −1 — неизвестно (вызов собран не разборщиком, а, например, тестом).
+/// </param>
+/// <param name="ResultUsed">
+/// Результат вызова используется в выражении (true), вызов — отдельный оператор (false),
+/// определить не удалось (null). Нужно проверке черновика, чтобы отличить вызов процедуры
+/// как функции от обычного оператора.
+/// </param>
+public sealed record BslCall(
+    string Callee,
+    string? Qualifier,
+    string Method,
+    int Line,
+    int ArgumentCount = -1,
+    bool? ResultUsed = null)
 {
     /// <summary>Вызов процедуры/функции текущего модуля без квалификатора.</summary>
     public bool IsLocal => Qualifier is null;

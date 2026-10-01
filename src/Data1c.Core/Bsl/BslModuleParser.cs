@@ -35,6 +35,22 @@ public sealed class BslModuleParser : IBslModuleParser
     private readonly Dictionary<string, int> _routineLines = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<RouteResult> _finished = [];
 
+    /// <summary>Операторы, после которых вызов продолжает выражение.</summary>
+    private static readonly string[] BinaryOperators =
+        ["=", "+", "-", "*", "/", "%", "(", "[", ",", "<", ">", "<=", ">=", "<>", "?"];
+
+    /// <summary>Ключевые слова, после которых вызов — часть выражения.</summary>
+    private static readonly string[] ExpressionKeywords =
+        ["Возврат", "Если", "ИначеЕсли", "Или", "И", "Не", "Пока", "Для", "Из", "По", "Ждать", "Асинх"];
+
+    /// <summary>Ключевые слова, после которых идёт новый оператор, а не выражение.</summary>
+    private static readonly string[] StatementKeywords =
+        ["Тогда", "Иначе", "Цикл", "Попытка", "Исключение", "КонецЕсли", "КонецЦикла", "КонецПопытки",
+         "Прервать", "Продолжить", "КонецПроцедуры", "КонецФункции"];
+
+    /// <summary>Ключевые слова, после которых стоит условие: вызов перед ними использован как значение.</summary>
+    private static readonly string[] ConditionKeywords = ["Тогда", "Цикл", "И", "Или", "Ждать"];
+
     private IReadOnlyList<BslToken> _tokens = [];
     private int _index;
     private int _lineCount;
@@ -621,10 +637,215 @@ public sealed class BslModuleParser : IBslModuleParser
             var method = _tokens[endedOnElement].GetText();
             var dot = callee.LastIndexOf('.');
             var qualifier = dot > 0 ? callee[..dot] : null;
-            records.Add(new BslCall(callee, qualifier, method, chainLine));
+            var close = FindClosingParenthesis(i);
+            records.Add(new BslCall(
+                callee,
+                qualifier,
+                method,
+                chainLine,
+                CountArguments(i, close),
+                IsResultUsed(segments[0], close)));
         }
 
         return i;
+    }
+
+    /// <summary>Индекс парной закрывающей скобки для «(» на позиции <paramref name="open"/>; −1 — не найдена.</summary>
+    private int FindClosingParenthesis(int open)
+    {
+        var depth = 0;
+        for (var i = open; i < _tokens.Count; i++)
+        {
+            var token = _tokens[i];
+            if (token.Kind != BslTokenKind.Operator)
+            {
+                continue;
+            }
+
+            if (IsOpening(token))
+            {
+                depth++;
+            }
+            else if (IsClosing(token))
+            {
+                depth--;
+                if (depth <= 0)
+                {
+                    return i;
+                }
+            }
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// Число аргументов вызова: запятые верхнего уровня плюс один. Пустые скобки (в том числе
+    /// с переводами строк и комментариями внутри) дают ноль; −1 — закрывающая скобка не найдена.
+    /// </summary>
+    private int CountArguments(int open, int close)
+    {
+        if (close < 0)
+        {
+            return -1;
+        }
+
+        var commas = 0;
+        var hasValue = false;
+        var depth = 0;
+        for (var i = open + 1; i < close; i++)
+        {
+            var token = _tokens[i];
+            if (token.Kind is BslTokenKind.NewLine or BslTokenKind.Comment or BslTokenKind.Directive)
+            {
+                continue;
+            }
+
+            if (token.Kind == BslTokenKind.Operator)
+            {
+                if (IsOpening(token))
+                {
+                    depth++;
+                }
+                else if (IsClosing(token))
+                {
+                    depth--;
+                }
+                else if (depth == 0 && IsOperator(token, ","))
+                {
+                    commas++;
+                    continue;
+                }
+            }
+
+            hasValue = true;
+        }
+
+        return commas + (hasValue ? 1 : 0);
+    }
+
+    /// <summary>
+    /// Используется ли результат вызова. Смотрим на токен перед началом цепочки вызова
+    /// («= Ф()» — выражение, «; Ф()» — оператор), а если это отдельный оператор — на токен сразу
+    /// за скобкой («Ф() + 1», «Ф().Свойство»). Неоднозначные случаи («А.Б Ф()») остаются неопределёнными.
+    /// </summary>
+    private bool? IsResultUsed(int chainStart, int close)
+    {
+        var before = PreviousToken(chainStart - 1);
+        var used = before < 0 ? false : IsExpressionBefore(_tokens[before]);
+        if (used == true)
+        {
+            return true;
+        }
+
+        var after = close >= 0 ? NextToken(close + 1) : -1;
+        if (after >= 0 && IsExpressionAfter(_tokens[after]))
+        {
+            return true;
+        }
+
+        return used;
+    }
+
+    /// <summary>Ближайший значимый токен перед позицией: комментарии и директивы пропускаются.</summary>
+    private int PreviousToken(int index)
+    {
+        for (var i = index; i >= 0; i--)
+        {
+            if (_tokens[i].Kind is not (BslTokenKind.Comment or BslTokenKind.Directive))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    /// <summary>Ближайший значимый токен начиная с позиции: переводы строк, комментарии и директивы пропускаются.</summary>
+    private int NextToken(int index)
+    {
+        for (var i = index; i < _tokens.Count; i++)
+        {
+            if (_tokens[i].Kind is not (BslTokenKind.NewLine or BslTokenKind.Comment or BslTokenKind.Directive))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    /// <summary>Подсказывает ли предыдущий токен, что вызов стоит в выражении и его результат нужен.</summary>
+    private static bool? IsExpressionBefore(BslToken token)
+    {
+        switch (token.Kind)
+        {
+            case BslTokenKind.NewLine:
+                return false;
+            case BslTokenKind.Operator:
+                foreach (var text in BinaryOperators)
+                {
+                    if (IsOperator(token, text))
+                    {
+                        return true;
+                    }
+                }
+
+                return IsOperator(token, ";") ? false : null;
+            case BslTokenKind.Keyword:
+            case BslTokenKind.Identifier:
+                foreach (var keyword in ExpressionKeywords)
+                {
+                    if (token.Span.Equals(keyword, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+
+                foreach (var keyword in StatementKeywords)
+                {
+                    if (token.Span.Equals(keyword, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return false;
+                    }
+                }
+
+                return null;
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>Продолжается ли выражение сразу за закрывающей скобкой вызова: «Ф() + 1», «Ф().Свойство».</summary>
+    private static bool IsExpressionAfter(BslToken token)
+    {
+        if (token.Kind == BslTokenKind.Operator)
+        {
+            foreach (var text in BinaryOperators)
+            {
+                if (IsOperator(token, text))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        if (token.Kind != BslTokenKind.Keyword)
+        {
+            return false;
+        }
+
+        foreach (var keyword in ConditionKeywords)
+        {
+            if (token.Span.Equals(keyword, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>

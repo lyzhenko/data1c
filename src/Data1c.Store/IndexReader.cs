@@ -685,6 +685,49 @@ public sealed class IndexReader
         return result;
     });
 
+    /// <summary>Процедуры и функции одного объекта-владельца: «CommonModule.ОбщегоНазначения».</summary>
+    /// <param name="ownerId">Идентификатор объекта-владельца.</param>
+    /// <param name="limit">Предел числа символов в ответе.</param>
+    public IReadOnlyList<SymbolRow> FindSymbolsByOwner(string ownerId, int limit = 50)
+    {
+        if (string.IsNullOrWhiteSpace(ownerId))
+        {
+            return [];
+        }
+
+        return _index.WithLock(() =>
+        {
+            using var command = _index.CreateCommand(
+                """
+                SELECT id, node_id, module_path, owner_id, name, kind, is_export, start_line, end_line, region, parameters, comment_head
+                FROM symbols WHERE owner_id = @owner ORDER BY start_line LIMIT @limit
+                """);
+            command.Parameters.AddWithValue("@owner", ownerId.Trim());
+            command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 1000));
+            return (IReadOnlyList<SymbolRow>)ReadSymbols(command);
+        });
+    }
+
+    /// <summary>
+    /// Есть ли в индексе хотя бы один объект метаданных такого вида («Catalog», «Document»).
+    /// Нужно проверке черновика: если секция выгрузки не индексировалась, «объекта нет» ничего не значит.
+    /// </summary>
+    /// <param name="kind">Вид объекта метаданных.</param>
+    public bool HasMetadataKind(string kind)
+    {
+        if (string.IsNullOrWhiteSpace(kind))
+        {
+            return false;
+        }
+
+        return _index.WithLock(() =>
+        {
+            using var command = _index.CreateCommand("SELECT 1 FROM metadata_objects WHERE kind = @kind LIMIT 1");
+            command.Parameters.AddWithValue("@kind", kind.Trim());
+            return command.ExecuteScalar() is not null;
+        });
+    }
+
     /// <summary>Состав объекта метаданных: реквизиты, табличные части, формы, макеты, команды.</summary>
     public IReadOnlyList<MetadataItemRow> GetMetadataItems(string objectId, int limit = 500) => _index.WithLock(() =>
     {

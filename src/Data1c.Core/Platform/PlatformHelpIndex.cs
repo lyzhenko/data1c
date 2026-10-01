@@ -35,6 +35,7 @@ public sealed class PlatformHelpIndex
     private readonly Dictionary<string, PlatformTopic> _byLastSegment = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PlatformTopic> _byTitle = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PlatformTopic> _byTitleSegment = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PlatformTopic> _globalFunctions = new(StringComparer.OrdinalIgnoreCase);
     private IReadOnlyList<PlatformInstallation>? _installations;
     private IReadOnlyList<PlatformTopic>? _topics;
     private PlatformInstallation? _installation;
@@ -159,6 +160,25 @@ public sealed class PlatformHelpIndex
         return _byName.ContainsKey(key) || _byTitle.ContainsKey(key);
     }
 
+    /// <summary>
+    /// Глобальная функция платформы по короткому имени: «Сообщить», «СтрШаблон», «СтрНайти».
+    /// В справке такие функции названы с уточнением («Глобальный контекст.Сообщить»), поэтому
+    /// <see cref="ContainsMember"/> по короткому имени их не находит: строка «Сообщить()» в модуле —
+    /// это вызов глобальной функции, а не пользовательской процедуры.
+    /// </summary>
+    /// <param name="name">Короткое имя без точки.</param>
+    public PlatformTopic? FindGlobalFunction(string? name)
+    {
+        var key = NormalizeQuery(name);
+        if (key.Length == 0 || key.Contains('.'))
+        {
+            return null;
+        }
+
+        EnsureLoaded();
+        return _globalFunctions.TryGetValue(key, out var topic) ? topic : null;
+    }
+
     /// <summary>Известен ли такой идентификатор платформы: тип, метод, свойство или глобальная функция.</summary>
     public bool KnownIdentifier(string? name)
     {
@@ -265,6 +285,10 @@ public sealed class PlatformHelpIndex
                     {
                         _byTitle.TryAdd(alias, item);
                         _byTitleSegment.TryAdd(LastSegment(alias), item);
+                        if (TryGlobalFunctionName(alias, out var globalName))
+                        {
+                            _globalFunctions.TryAdd(globalName, item);
+                        }
                     }
                 }
             }
@@ -387,4 +411,26 @@ public sealed class PlatformHelpIndex
 
         yield return text;
     }
+
+    /// <summary>
+    /// Выделяет короткое имя глобальной функции из псевдонима заголовка: «Глобальный контекст.Сообщить»
+    /// даёт «Сообщить». Для остальных страниц возвращает <see langword="false"/>.
+    /// </summary>
+    private static bool TryGlobalFunctionName(string alias, out string name)
+    {
+        foreach (var prefix in GlobalContextPrefixes)
+        {
+            if (alias.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                name = alias[prefix.Length..].Trim();
+                return name.Length > 0;
+            }
+        }
+
+        name = string.Empty;
+        return false;
+    }
+
+    /// <summary>Как в справке платформы назван раздел глобальных функций: русская и английская локаль.</summary>
+    private static readonly string[] GlobalContextPrefixes = ["Глобальный контекст.", "Global context."];
 }

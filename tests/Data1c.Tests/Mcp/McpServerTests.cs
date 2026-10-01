@@ -141,6 +141,104 @@ public sealed class McpServerTests
     }
 
     [Fact]
+    public async Task Проверка_черновика_без_файла_находит_замечания_с_позициями()
+    {
+        // Главный сценарий Э2-2: модуль пишется агентом и проверяется текстом, до вставки
+        // в Конфигуратор — файла в выгрузке ещё нет.
+        var session = Session();
+        await session.GetAsync(CancellationToken.None);
+
+        var responses = await ExchangeAsync(
+            session,
+            InitializeKnown,
+            ToolCall(2, "check", """{"text":"Процедура Черновик()\n    Справочники.Товар.НайтиПоНаименованию(\"Тест\");\nКонецПроцедуры"}"""));
+
+        var payload = Json(ContentText(responses, 2));
+
+        Assert.Equal("text", Text(payload["source"]));
+        Assert.Equal("черновик.bsl", Text(payload["path"]));
+        Assert.Equal("разбор в памяти", Text(payload["context"]));
+        Assert.Equal(1, payload["problemsCount"]!.GetValue<int>());
+
+        var problem = payload["problems"]!.AsArray()[0]!;
+        Assert.Equal(2, problem["line"]!.GetValue<int>());
+        Assert.Equal("UnknownMetadataObject", Text(problem["code"]));
+        Assert.Equal("Error", Text(problem["severity"]));
+        Assert.Contains("Catalog.Товары", Text(problem["hint"]), StringComparison.Ordinal);
+
+        Assert.Equal(1, payload["problemsBySeverity"]!["errors"]!.GetValue<int>());
+        Assert.Equal(0, payload["problemsBySeverity"]!["warnings"]!.GetValue<int>());
+        Assert.Single(payload["routines"]!.AsArray());
+    }
+
+    [Fact]
+    public async Task Проверка_черновика_работает_без_разбора_выгрузки()
+    {
+        // Разбор ещё не запускался: проверка обязана ответить, не дожидаясь его, — только
+        // правилами внутри модуля, и честно сказать об этом в оговорках.
+        var responses = await ExchangeAsync(
+            InitializeKnown,
+            ToolCall(2, "check", """{"text":"Процедура Черновик()\n    НеизвестнаяПроцедура();\nКонецПроцедуры"}"""));
+
+        var payload = Json(ContentText(responses, 2));
+
+        Assert.Equal("text", Text(payload["source"]));
+        Assert.Null(payload["context"]);
+        Assert.Equal(1, payload["problemsCount"]!.GetValue<int>());
+        Assert.Equal("UnknownProcedure", Text(payload["problems"]!.AsArray()[0]!["code"]));
+
+        var notes = payload["notes"]!.AsArray().Select(Text).ToList();
+        Assert.Contains(notes, static note => note.Contains("Индекс конфигурации", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Проверка_черновика_без_текста_требует_путь_или_ид()
+    {
+        var responses = await ExchangeAsync(InitializeKnown, ToolCall(2, "check", "{}"));
+
+        var response = responses.Single(item => Text(item["id"]) == "2");
+        Assert.True(response["result"]!["isError"]!.GetValue<bool>());
+        Assert.Contains("id", ContentText(responses, 2), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Проверка_черновика_работает_по_индексу_выгрузки()
+    {
+        // Рабочий режим сервера: выгрузка лежит на диске, индекс собран, факты о конфигурации
+        // приходят из SQLite (IndexDraftContext), а не из разбора в памяти.
+        var root = TestDump.Materialize();
+        try
+        {
+            using var session = new AnalysisSession(new AnalysisRequest { DumpPaths = [root] });
+            await session.QueryAsync(CancellationToken.None);
+
+            var responses = await ExchangeAsync(
+                session,
+                InitializeKnown,
+                ToolCall(2, "check", """{"text":"Процедура Черновик(НеиспользуемыйПараметр)\n    Справочники.Товар.НайтиПоНаименованию(\"Тест\");\n    НеизвестнаяПроцедура();\n    РаботаСДанными.ЗагрузитьДанные(1);\nКонецПроцедуры"}"""));
+
+            var payload = Json(ContentText(responses, 2));
+
+            Assert.Equal("индекс", Text(payload["context"]));
+            Assert.Equal(4, payload["problemsCount"]!.GetValue<int>());
+            Assert.Equal(2, payload["problemsBySeverity"]!["errors"]!.GetValue<int>());
+            Assert.Equal(2, payload["problemsBySeverity"]!["warnings"]!.GetValue<int>());
+
+            var lines = payload["problems"]!.AsArray()
+                .Select(problem => (Line: problem!["line"]!.GetValue<int>(), Code: Text(problem["code"])))
+                .ToList();
+
+            Assert.Equal(
+                [(1, "UnusedParameter"), (2, "UnknownMetadataObject"), (3, "UnknownProcedure"), (4, "WrongArgumentCount")],
+                lines);
+        }
+        finally
+        {
+            TestDump.Remove(root);
+        }
+    }
+
+    [Fact]
     public async Task Состояние_сообщает_о_готовом_разборе()
     {
         var session = Session();
