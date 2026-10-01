@@ -157,6 +157,8 @@ public sealed class IndexReader
             ? parsed
             : null;
 
+        var refsByContext = CountMetadataRefsByContext();
+
         return new IndexStatistics(
             Counter("cnt_nodes", "nodes"),
             Counter("cnt_edges", "edges"),
@@ -170,7 +172,28 @@ public sealed class IndexReader
             Scalar("SELECT COUNT(*) FROM nodes WHERE is_external = 1"),
             dumpPath,
             indexedAt,
-            Counter("cnt_forms", "form_models"));
+            Counter("cnt_forms", "form_models"),
+            refsByContext.GetValueOrDefault(MetadataRefContexts.Code),
+            refsByContext.GetValueOrDefault(MetadataRefContexts.Query),
+            refsByContext);
+    });
+
+    /// <summary>
+    /// Сколько обращений к метаданным собрано в каждом контексте: код, тексты запросов, типы,
+    /// состав объекта, формы и прочее. Нужно статистике: агент по ней видит, что индекс разобрал
+    /// и тексты запросов, а не только код.
+    /// </summary>
+    public IReadOnlyDictionary<string, int> CountMetadataRefsByContext() => _index.WithLock(() =>
+    {
+        using var command = _index.CreateCommand("SELECT context, COUNT(*) FROM metadata_refs GROUP BY context");
+        using var reader = command.ExecuteReader();
+        var result = new Dictionary<string, int>(StringComparer.Ordinal);
+        while (reader.Read())
+        {
+            result[reader.GetString(0)] = reader.GetInt32(1);
+        }
+
+        return (IReadOnlyDictionary<string, int>)result;
     });
 
     /// <summary>Счётчик из meta: считается при сборке индекса. Для старых индексов — подсчёт строк.</summary>
@@ -442,6 +465,46 @@ public sealed class IndexReader
 
         return result;
     });
+
+    /// <summary>
+    /// Обращения к объекту метаданных: кто, в каком контексте и где именно. Обращения берутся
+    /// из <c>metadata_refs</c> — там и код, и тексты запросов, и перекрёстные ссылки метаданных.
+    /// Счётчики считаются по всем обращениям, а читатели и примеры обрезаются лимитом.
+    /// </summary>
+    /// <param name="targetId">Идентификатор объекта метаданных.</param>
+    /// <param name="limit">Предел числа примеров обращений в ответе.</param>
+    public MetadataUsageSummary GetMetadataUsages(string targetId, int limit = 20)
+    {
+        if (string.IsNullOrWhiteSpace(targetId))
+        {
+            return MetadataUsageSummary.Empty;
+        }
+
+        return _index.WithLock(() =>
+        {
+            using var command = _index.CreateCommand(
+                """
+                SELECT r.source_id, n.name, n.source_path, r.context, r.line, r.detail
+                FROM metadata_refs r LEFT JOIN nodes n ON n.id = r.source_id
+                WHERE r.target_id = @id
+                """);
+            command.Parameters.AddWithValue("@id", targetId.Trim());
+            using var reader = command.ExecuteReader();
+            var usages = new List<MetadataUsage>();
+            while (reader.Read())
+            {
+                usages.Add(new MetadataUsage(
+                    reader.GetString(0),
+                    reader.IsDBNull(1) ? null : reader.GetString(1),
+                    reader.IsDBNull(2) ? null : reader.GetString(2),
+                    reader.GetString(3),
+                    reader.IsDBNull(4) ? null : reader.GetInt32(4),
+                    reader.IsDBNull(5) ? null : reader.GetString(5)));
+            }
+
+            return MetadataUsageSummary.From(usages, limit);
+        });
+    }
 
     /// <summary>Обращения, которые делает узел: какие объекты метаданных он затрагивает.</summary>
     public IReadOnlyList<MetadataRefRow> ReferencesOf(string sourceId, int limit = 200) => _index.WithLock(() =>

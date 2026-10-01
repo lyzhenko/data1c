@@ -9,12 +9,16 @@ namespace Data1c.Tests;
 internal static class TestDump
 {
     /// <summary>Создаёт временный каталог с файлами выгрузки и возвращает его путь.</summary>
-    internal static string Materialize()
+    internal static string Materialize() => Materialize(SampleDump.Create());
+
+    /// <summary>Создаёт временный каталог с файлами указанной выгрузки и возвращает его путь.</summary>
+    /// <param name="source">Выгрузка в памяти, которую нужно разложить по диску.</param>
+    internal static string Materialize(IDumpSource source)
     {
+        ArgumentNullException.ThrowIfNull(source);
         var root = Path.Combine(Path.GetTempPath(), "data1c-dump-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
 
-        var source = SampleDump.Create();
         foreach (var file in source.EnumerateFiles())
         {
             var path = Path.Combine(root, file.RelativePath.Replace('/', Path.DirectorySeparatorChar));

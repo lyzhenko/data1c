@@ -146,6 +146,63 @@ public sealed class GraphQueryService : IGraphQuery
         return obj is null ? null : Card(obj, Math.Clamp(depth, 1, 4), Math.Clamp(maxChildren, 1, 500));
     }
 
+    /// <summary>
+    /// Обращения к объекту метаданных по разбору в памяти. Источников два, как и в индексе:
+    /// связи <see cref="GraphEdgeKind.UsesMetadata"/> дают обращения из кода и текстов запросов,
+    /// а перекрёстные ссылки модели метаданных — типы, состав, формы и права.
+    /// </summary>
+    public MetadataUsageSummary GetMetadataUsages(string? id, int limit = 20)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+        {
+            return MetadataUsageSummary.Empty;
+        }
+
+        var target = id.Trim();
+        var usages = new List<MetadataUsage>();
+
+        foreach (var edge in _graph.Incoming(target))
+        {
+            if (edge.Kind != GraphEdgeKind.UsesMetadata)
+            {
+                continue;
+            }
+
+            var reader = _graph.FindNode(edge.SourceId);
+            usages.Add(new MetadataUsage(
+                edge.SourceId,
+                reader?.Name,
+                reader?.SourcePath,
+                string.IsNullOrEmpty(edge.Context) ? MetadataRefContexts.Code : edge.Context,
+                edge.Line,
+                edge.Detail));
+        }
+
+        if (_metadata is not null)
+        {
+            foreach (var obj in _metadata.Objects)
+            {
+                foreach (var reference in obj.References)
+                {
+                    if (!string.Equals(reference.TargetId, target, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    usages.Add(new MetadataUsage(
+                        obj.Id,
+                        obj.Name,
+                        obj.SourcePath,
+                        MetadataRefContexts.FromReference(reference.Kind),
+                        Line: null,
+                        reference.Detail));
+                }
+            }
+        }
+
+        return MetadataUsageSummary.From(usages, limit);
+    }
+
     private static MetadataCard Card(MdObject obj, int depth, int maxChildren)
     {
         var properties = new Dictionary<string, string>(StringComparer.Ordinal);

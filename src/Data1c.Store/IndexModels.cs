@@ -83,6 +83,9 @@ public sealed record MetadataRefRow(
 public sealed record ReachRow(string Id, int Depth);
 
 /// <summary>Сводка по индексу.</summary>
+/// <param name="MetadataRefsCode">Сколько обращений к метаданным собрано из кода BSL.</param>
+/// <param name="MetadataRefsQuery">Сколько обращений собрано из текстов запросов.</param>
+/// <param name="MetadataRefsByContext">Все обращения по контекстам: код, запросы, типы, состав, формы и прочее.</param>
 public sealed record IndexStatistics(
     long Nodes,
     long Edges,
@@ -96,11 +99,15 @@ public sealed record IndexStatistics(
     long ExternalNodes,
     string? DumpPath,
     DateTimeOffset? IndexedAt,
-    long Forms = 0)
+    long Forms = 0,
+    long MetadataRefsCode = 0,
+    long MetadataRefsQuery = 0,
+    IReadOnlyDictionary<string, int>? MetadataRefsByContext = null)
 {
     public override string ToString() =>
         $"узлов {Nodes:N0}, связей {Edges:N0}, символов {Symbols:N0}, вызовов {Calls:N0}, " +
-        $"объектов метаданных {MetadataObjects:N0}, реквизитов {MetadataItems:N0}, обращений {MetadataRefs:N0}, " +
+        $"объектов метаданных {MetadataObjects:N0}, реквизитов {MetadataItems:N0}, " +
+        $"обращений {MetadataRefs:N0} (код {MetadataRefsCode:N0}, запросы {MetadataRefsQuery:N0}), " +
         $"форм {Forms:N0}";
 }
 

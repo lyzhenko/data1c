@@ -1,3 +1,5 @@
+using Data1c.Core.Metadata;
+
 namespace Data1c.Core.Graph;
 
 /// <summary>Тип узла графа зависимостей.</summary>
@@ -81,6 +83,51 @@ public static class MetadataRefContexts
 
     /// <summary>Обращение из текста запроса: «ИЗ Справочник.Товары».</summary>
     public const string Query = "query";
+
+    /// <summary>
+    /// Контекст перекрёстной ссылки объекта метаданных по смыслу ссылки в XML.
+    /// Тот же набор значений, что пишет индекс в <c>metadata_refs.context</c> для ссылок.
+    /// </summary>
+    /// <param name="kind">Смысл ссылки, найденной в XML.</param>
+    public static string FromReference(MdReferenceKind kind) => kind switch
+    {
+        MdReferenceKind.Type => "type",
+        MdReferenceKind.Content => "content",
+        MdReferenceKind.Field => "field",
+        MdReferenceKind.Form => "form",
+        MdReferenceKind.Template => "template",
+        MdReferenceKind.Command => "command",
+        MdReferenceKind.RoleRight => "rights",
+        MdReferenceKind.EventSource => "event",
+        _ => "other",
+    };
+
+    /// <summary>
+    /// Вид связи графа, к которому относится контекст обращения: код и тексты запросов — это
+    /// <see cref="GraphEdgeKind.UsesMetadata"/>, остальные контексты — ссылки метаданных
+    /// (<see cref="GraphEdgeKind.References"/>).
+    /// </summary>
+    /// <param name="context">Контекст обращения из <c>metadata_refs</c>.</param>
+    public static string KindOf(string context) =>
+        context is Code or Query ? nameof(GraphEdgeKind.UsesMetadata) : nameof(GraphEdgeKind.References);
+
+    /// <summary>Подпись контекста для ответа агенту: «в коде», «в запросах», «в типах» и так далее.</summary>
+    /// <param name="context">Контекст обращения из <c>metadata_refs</c>.</param>
+    public static string Label(string context) => context switch
+    {
+        Code => "в коде",
+        Query => "в запросах",
+        "type" => "в типах",
+        "content" => "в составе объекта",
+        "field" => "в полях",
+        "form" => "в формах",
+        "template" => "в макетах",
+        "command" => "в командах",
+        "rights" => "в правах ролей",
+        "event" => "в подписках на события",
+        "other" => "прочее",
+        _ => context,
+    };
 }
 
 /// <summary>Сводная статистика графа.</summary>
