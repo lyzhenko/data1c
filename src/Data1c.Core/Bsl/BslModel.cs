@@ -130,6 +130,11 @@ public sealed record BslRoutine(
     IReadOnlyList<BslCall> Calls,
     IReadOnlyList<BslMetadataAccess> MetadataAccesses)
 {
+    /// <summary>
+    /// Таблицы метаданных из текстов запросов процедуры: номер строки и фрагмент запроса.
+    /// </summary>
+    public IReadOnlyList<BslQueryReference> QueryReferences { get; init; } = [];
+
     /// <summary>Число строк тела процедуры.</summary>
     public int LineCount => EndLine - StartLine + 1;
 
@@ -160,6 +165,9 @@ public sealed class BslModuleInfo
     /// <summary>Обращения к метаданным вне процедур и функций.</summary>
     public IReadOnlyList<BslMetadataAccess> MetadataAccesses { get; init; } = [];
 
+    /// <summary>Таблицы метаданных из текстов запросов вне процедур и функций.</summary>
+    public IReadOnlyList<BslQueryReference> QueryReferences { get; init; } = [];
+
     public IReadOnlyList<BslDiagnostic> Diagnostics { get; init; } = [];
 
     public int LineCount { get; init; }
@@ -168,7 +176,7 @@ public sealed class BslModuleInfo
     public string Id => "module:" + Path;
 
     public bool IsEmpty =>
-        Routines.Count == 0 && Calls.Count == 0 && MetadataAccesses.Count == 0;
+        Routines.Count == 0 && Calls.Count == 0 && MetadataAccesses.Count == 0 && QueryReferences.Count == 0;
 }
 
 /// <summary>Входные данные для разбора модуля.</summary>

@@ -307,6 +307,9 @@ public static class MdNaming
     /// <summary>Известные каталоги выгрузки.</summary>
     public static IEnumerable<string> KnownSections => Sections.Keys;
 
+    /// <summary>Известные имена коллекций в коде и в текстах запросов BSL («Справочники»).</summary>
+    public static IEnumerable<string> KnownCollections => Collections.Keys;
+
     /// <summary>Канонический идентификатор объекта: «Catalog.Товары».</summary>
     public static string CreateId(MdKind kind, string name) => $"{kind.Name}.{name}";
 

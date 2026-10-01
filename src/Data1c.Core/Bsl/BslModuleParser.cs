@@ -10,7 +10,8 @@ namespace Data1c.Core.Bsl;
 /// <para>Разборщик сознательно не строит AST и работает за один проход по потоку токенов. Он никогда
 /// не бросает исключений на некорректном тексте: все неожиданности попадают в
 /// <see cref="BslModuleInfo.Diagnostics"/>.</para>
-/// <para>Осознанные упрощения: строки внутри выражений не разбираются; аргументы вызовов
+/// <para>Осознанные упрощения: код внутри строковых литералов не разбирается (строки просматриваются
+/// только как тексты запросов — см. <see cref="QueryParser"/>); аргументы вызовов
 /// пропускаются целиком, поэтому вызовы и обращения к метаданным внутри аргументов не учитываются;
 /// вложенные процедуры (запрещённые в 1С) закрывают предыдущую процедуру и дают диагностику.</para>
 /// </remarks>
@@ -30,6 +31,8 @@ public sealed class BslModuleParser : IBslModuleParser
     private readonly List<BslDiagnostic> _diagnostics = [];
     private readonly List<BslCall> _moduleCalls = [];
     private readonly List<BslMetadataAccess> _moduleMetadata = [];
+    private readonly List<BslQueryReference> _queries = [];
+    private readonly List<BslQueryReference> _moduleQueries = [];
     private readonly List<string> _pendingDirectives = [];
     private readonly Stack<RegionFrame> _regionStack = new();
     private readonly Dictionary<string, int> _routineLines = new(StringComparer.OrdinalIgnoreCase);
@@ -65,6 +68,11 @@ public sealed class BslModuleParser : IBslModuleParser
         var text = source.Text ?? string.Empty;
         Reset(text);
         _tokens = BslLexer.Tokenize(text);
+
+        // Строки запросов ищутся по готовым токенам: своей лексической разметки не нужно, а строковые
+        // литералы вместе с номером строки открывающей кавычки уже собраны. Ссылки распределяются по
+        // процедурам в конце разбора, когда границы процедур известны.
+        QueryParser.CollectFromTokens(_tokens, _queries);
 
         while (_index < _tokens.Count)
         {
@@ -136,6 +144,21 @@ public sealed class BslModuleParser : IBslModuleParser
                 open.StartLine));
         }
 
+        // Ссылки из запросов приписываются процедуре, которая содержит эту строку; запросы кода модуля
+        // (вне процедур) остаются на самом модуле — так же, как обращения к метаданным из кода.
+        foreach (var reference in _queries)
+        {
+            var frame = FindRoutineAt(reference.Line);
+            if (frame is null)
+            {
+                _moduleQueries.Add(reference);
+            }
+            else
+            {
+                frame.Queries.Add(reference);
+            }
+        }
+
         foreach (var finished in _finished)
         {
             _routines.Add(finished.Frame.ToRoutine(finished.EndLine));
@@ -151,6 +174,7 @@ public sealed class BslModuleParser : IBslModuleParser
             Regions = [.. _regions],
             Calls = [.. _moduleCalls],
             MetadataAccesses = [.. _moduleMetadata],
+            QueryReferences = [.. _moduleQueries],
             Diagnostics = [.. _diagnostics],
             LineCount = _lineCount,
         };
@@ -163,6 +187,8 @@ public sealed class BslModuleParser : IBslModuleParser
         _diagnostics.Clear();
         _moduleCalls.Clear();
         _moduleMetadata.Clear();
+        _queries.Clear();
+        _moduleQueries.Clear();
         _pendingDirectives.Clear();
         _regionStack.Clear();
         _routineLines.Clear();
@@ -201,6 +227,32 @@ public sealed class BslModuleParser : IBslModuleParser
     private static bool IsRoutineKeyword(BslToken token) =>
         token.Span.Equals("Процедура", StringComparison.OrdinalIgnoreCase) ||
         token.Span.Equals("Функция", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Процедура, в тело которой попадает строка. Если границы процедур пересекаются (вложенные
+    /// процедуры в 1С запрещены, но в некорректном тексте встречаются), выбирается самая узкая.
+    /// </summary>
+    private RoutineFrame? FindRoutineAt(int line)
+    {
+        RoutineFrame? found = null;
+        var narrowest = int.MaxValue;
+        foreach (var finished in _finished)
+        {
+            if (line < finished.Frame.StartLine || line > finished.EndLine)
+            {
+                continue;
+            }
+
+            var span = finished.EndLine - finished.Frame.StartLine;
+            if (span < narrowest)
+            {
+                narrowest = span;
+                found = finished.Frame;
+            }
+        }
+
+        return found;
+    }
 
     /// <summary>Обрабатывает директиву препроцессора «#…»: области и условия компиляции.</summary>
     private void HandleDirective(BslToken token)
@@ -864,6 +916,9 @@ public sealed class BslModuleParser : IBslModuleParser
 
         public List<BslMetadataAccess> Metadata { get; } = [];
 
+        /// <summary>Таблицы метаданных из текстов запросов процедуры.</summary>
+        public List<BslQueryReference> Queries { get; } = [];
+
         public BslRoutine ToRoutine(int endLine) => new(
             Name,
             Kind,
@@ -875,7 +930,10 @@ public sealed class BslModuleParser : IBslModuleParser
             Region,
             Directives,
             Calls,
-            Metadata);
+            Metadata)
+        {
+            QueryReferences = Queries,
+        };
     }
 
     /// <summary>Готовая процедура вместе со строкой её завершения.</summary>

@@ -6,13 +6,14 @@ namespace Data1c.Core.Graph;
 
 /// <summary>
 /// Собирает граф зависимостей из модели метаданных и разобранных модулей BSL:
-/// вложенность объектов, ссылки метаданных, объявления процедур, вызовы и обращения к метаданным.
+/// вложенность объектов, ссылки метаданных, объявления процедур, вызовы и обращения к метаданным —
+/// из кода и из текстов запросов.
 /// </summary>
 public sealed class DependencyGraphBuilder
 {
     private readonly Dictionary<string, GraphNode> _nodes = new(StringComparer.Ordinal);
     private readonly List<GraphEdge> _edges = [];
-    private readonly HashSet<(string Source, string Target, GraphEdgeKind Kind, int Line, string? Detail)> _edgeKeys = [];
+    private readonly HashSet<(string Source, string Target, GraphEdgeKind Kind, int Line, string? Detail, string? Context)> _edgeKeys = [];
     private readonly Dictionary<(string ModuleId, string Routine), string> _routineIndex = [];
     private readonly Dictionary<string, string> _moduleByOwner = new(StringComparer.Ordinal);
 
@@ -228,6 +229,11 @@ public sealed class DependencyGraphBuilder
                 AddMetadataAccessEdges(module.Id, module.MetadataAccesses);
             }
 
+            if (_options.IncludeQueryReferences)
+            {
+                AddQueryReferenceEdges(module.Id, module.QueryReferences);
+            }
+
             if (_options.IncludeCalls)
             {
                 AddCallEdges(module, module.Id, module.Calls);
@@ -235,6 +241,16 @@ public sealed class DependencyGraphBuilder
 
             if (!_options.IncludeRoutines)
             {
+                // Узлов процедур в графе нет: чтобы таблицы из их запросов не потерялись,
+                // связи приписываются модулю.
+                if (_options.IncludeQueryReferences)
+                {
+                    foreach (var routine in module.Routines)
+                    {
+                        AddQueryReferenceEdges(module.Id, routine.QueryReferences);
+                    }
+                }
+
                 continue;
             }
 
@@ -248,6 +264,11 @@ public sealed class DependencyGraphBuilder
                 if (_options.IncludeMetadataAccess)
                 {
                     AddMetadataAccessEdges(routineId, routine.MetadataAccesses);
+                }
+
+                if (_options.IncludeQueryReferences)
+                {
+                    AddQueryReferenceEdges(routineId, routine.QueryReferences);
                 }
 
                 if (_options.IncludeCalls)
@@ -363,7 +384,29 @@ public sealed class DependencyGraphBuilder
                 continue;
             }
 
-            AddEdge(sourceId, targetId, GraphEdgeKind.UsesMetadata, access.Line, access.Text);
+            AddEdge(sourceId, targetId, GraphEdgeKind.UsesMetadata, access.Line, access.Text, MetadataRefContexts.Code);
+        }
+    }
+
+    /// <summary>
+    /// Связи «обращается к таблице» для таблиц, найденных в текстах запросов: в detail попадает
+    /// фрагмент запроса, а контекст обращения отличается от обращений из кода.
+    /// </summary>
+    private void AddQueryReferenceEdges(string sourceId, IReadOnlyList<BslQueryReference> references)
+    {
+        foreach (var reference in references)
+        {
+            var targetId = ResolveReferenceTarget(
+                MdNaming.CreateId(reference.Kind, reference.ObjectName),
+                reference.Kind,
+                reference.ObjectName);
+
+            if (targetId is null)
+            {
+                continue;
+            }
+
+            AddEdge(sourceId, targetId, GraphEdgeKind.UsesMetadata, reference.Line, reference.Text, MetadataRefContexts.Query);
         }
     }
 
@@ -396,20 +439,26 @@ public sealed class DependencyGraphBuilder
         }
     }
 
-    private void AddEdge(string sourceId, string targetId, GraphEdgeKind kind, int? line = null, string? detail = null)
+    private void AddEdge(
+        string sourceId,
+        string targetId,
+        GraphEdgeKind kind,
+        int? line = null,
+        string? detail = null,
+        string? context = null)
     {
         if (string.Equals(sourceId, targetId, StringComparison.Ordinal))
         {
             return;
         }
 
-        var key = (sourceId, targetId, kind, line ?? -1, detail);
+        var key = (sourceId, targetId, kind, line ?? -1, detail, context);
         if (!_edgeKeys.Add(key))
         {
             return;
         }
 
-        _edges.Add(new GraphEdge(sourceId, targetId, kind, line, detail));
+        _edges.Add(new GraphEdge(sourceId, targetId, kind, line, detail, context));
     }
 
     private static bool IsNestedBookkeepingKind(MdKind kind) =>

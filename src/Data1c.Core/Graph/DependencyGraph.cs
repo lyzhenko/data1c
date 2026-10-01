@@ -57,12 +57,28 @@ public sealed record GraphNode(
 /// <param name="Kind">Тип связи.</param>
 /// <param name="Line">Строка в файле модуля для связей из кода.</param>
 /// <param name="Detail">Уточнение (например, имя реквизита или признак неразрешённого вызова).</param>
+/// <param name="Context">
+/// Контекст обращения для таблицы <c>metadata_refs</c>: <see cref="MetadataRefContexts.Code"/> —
+/// обращение из кода, <see cref="MetadataRefContexts.Query"/> — из текста запроса.
+/// <see langword="null"/> означает <see cref="MetadataRefContexts.Code"/>.
+/// </param>
 public sealed record GraphEdge(
     string SourceId,
     string TargetId,
     GraphEdgeKind Kind,
     int? Line = null,
-    string? Detail = null);
+    string? Detail = null,
+    string? Context = null);
+
+/// <summary>Контексты обращений к метаданным в таблице <c>metadata_refs</c>.</summary>
+public static class MetadataRefContexts
+{
+    /// <summary>Обращение из кода BSL: «Справочники.Товары».</summary>
+    public const string Code = "code";
+
+    /// <summary>Обращение из текста запроса: «ИЗ Справочник.Товары».</summary>
+    public const string Query = "query";
+}
 
 /// <summary>Сводная статистика графа.</summary>
 public sealed record GraphStatistics(
@@ -96,6 +112,9 @@ public sealed record DependencyGraphOptions
 
     /// <summary>Включать обращения к метаданным из кода.</summary>
     public bool IncludeMetadataAccess { get; init; } = true;
+
+    /// <summary>Включать обращения к метаданным из текстов запросов.</summary>
+    public bool IncludeQueryReferences { get; init; } = true;
 
     /// <summary>Создавать узлы-заглушки для целей, которых нет в выгрузке.</summary>
     public bool IncludeExternalNodes { get; init; } = true;
