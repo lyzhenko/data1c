@@ -6,24 +6,32 @@ public enum PlatformCheckSeverity
     /// <summary>Сообщение без признака ошибки или предупреждения.</summary>
     Info,
 
-    /// <summary>Предупреждение: платформа считает код рабочим, но на что-то указывает.</summary>
+    /// <summary>Предупреждение: конфигурация рабочая, но платформа на что-то указывает.</summary>
     Warning,
 
     /// <summary>Ошибка: конфигурация в таком виде не собирается.</summary>
     Error,
 }
 
-/// <summary>Одно замечание из журнала проверки: файл выгрузки, строка и текст.</summary>
-/// <param name="FilePath">Путь файла, как его напечатала платформа (может быть не указан).</param>
+/// <summary>Одно замечание из журнала проверки.</summary>
+/// <param name="FilePath">Путь файла выгрузки, если его удалось определить.</param>
 /// <param name="Message">Текст сообщения.</param>
 /// <param name="Line">Номер строки, если платформа его указала.</param>
 /// <param name="Severity">Важность.</param>
-public sealed record PlatformCheckProblem(string? FilePath, string Message, int? Line, PlatformCheckSeverity Severity);
+/// <param name="Place">Место в терминах платформы («ОбщийМодуль.X.Модуль(3,9)») или путь из журнала.</param>
+/// <param name="Snippet">Строка кода, на которую указала платформа (со вставкой <c>&lt;&lt;?&gt;&gt;</c>).</param>
+public sealed record PlatformCheckProblem(
+    string? FilePath,
+    string Message,
+    int? Line,
+    PlatformCheckSeverity Severity,
+    string? Place = null,
+    string? Snippet = null);
 
 /// <summary>Итог разбора журнала.</summary>
 /// <param name="Problems">Разобранные замечания.</param>
 /// <param name="Other">Строки журнала, которые не удалось отнести к замечаниям (не выбрасываются).</param>
-/// <param name="Clean">Платформа сообщила, что синтаксических ошибок нет.</param>
+/// <param name="Clean">Платформа сообщила, что ошибок нет.</param>
 public sealed record PlatformCheckLogResult(
     IReadOnlyList<PlatformCheckProblem> Problems,
     IReadOnlyList<string> Other,
@@ -40,19 +48,29 @@ public sealed record PlatformCheckLogResult(
 }
 
 /// <summary>
-/// Разбор журнала, который платформа пишет по ключу <c>/Out</c>.
-/// Формат строк: «Файл - &lt;путь&gt;: &lt;сообщение&gt;», сообщение может начинаться со «Строка N:».
-/// Итоговая строка «Синтаксических ошибок не обнаружено!» означает, что замечаний нет.
+/// Разбор журнала, который платформа пишет по ключу <c>/Out</c>. Форматы сняты с реальных запусков
+/// на выгрузке 2,9 ГБ:
+/// <list type="bullet">
+/// <item>ошибки компиляции модулей: <c>{ОбщийМодуль.Имя.Модуль(3,9)}: Ожидается выражение</c>,
+/// следующая строка с отступом — фрагмент кода со вставкой <c>&lt;&lt;?&gt;&gt;</c>;</item>
+/// <item>замечания проверки: <c>Подсистема.Имя.Справка Неразрешимые ссылки на объекты метаданных (1)</c>;</item>
+/// <item>предупреждения загрузки конфигурации: <c>Файл - &lt;путь&gt;: Возможно неверная ссылка …</c>;</item>
+/// <item>итог: «Синтаксических ошибок не обнаружено!» или «Ошибок не обнаружено».</item>
+/// </list>
 /// Незнакомые строки не теряются, а возвращаются отдельным списком.
 /// </summary>
 public static class PlatformCheckLog
 {
-    private const string CleanMarker = "Синтаксических ошибок не обнаружено";
+    private static readonly string[] CleanMarkers =
+    [
+        "Синтаксических ошибок не обнаружено",
+        "Ошибок не обнаружено",
+    ];
 
     /// <summary>
-    /// Разбирает текст журнала. <paramref name="fallback"/> — важность для строк, у которых есть
-    /// путь файла, но нет слов «Ошибка» или «Предупреждение»: у журнала проверки модулей такие
-    /// строки ошибки, у журнала загрузки конфигурации — предупреждения.
+    /// Разбирает текст журнала. <paramref name="fallback"/> — важность для строк, у которых нет
+    /// ни пути, ни явных слов платформы: у журнала проверки модулей это ошибки, у журнала загрузки —
+    /// предупреждения.
     /// </summary>
     public static PlatformCheckLogResult Parse(string? text, PlatformCheckSeverity fallback = PlatformCheckSeverity.Error)
     {
@@ -67,34 +85,132 @@ public static class PlatformCheckLog
 
         foreach (var raw in text.Split('\n'))
         {
-            var line = raw.Trim().TrimEnd('\r');
-            if (line.Length == 0)
+            var line = raw.TrimEnd('\r');
+            var trimmed = line.Trim();
+            if (trimmed.Length == 0)
             {
                 continue;
             }
 
-            if (line.Contains(CleanMarker, StringComparison.OrdinalIgnoreCase))
+            if (CleanMarkers.Any(marker => trimmed.Contains(marker, StringComparison.OrdinalIgnoreCase)))
             {
                 clean = true;
                 continue;
             }
 
-            var (path, body) = SplitPath(line);
-            var severity = ExplicitSeverity(line);
-
-            // Строка без пути и без слов об ошибке — это не диагностика, а служебный текст.
-            if (path is null && severity is null)
+            // Продолжение предыдущего сообщения: платформа печатает строку кода с отступом.
+            if (line.Length > 0 && char.IsWhiteSpace(line[0]) && problems.Count > 0 && LooksLikeSnippet(trimmed))
             {
-                other.Add(line);
+                var previous = problems[^1];
+                problems[^1] = previous with { Snippet = previous.Snippet is null ? trimmed : previous.Snippet + " " + trimmed };
                 continue;
             }
 
-            var (number, message) = SplitLineNumber(body);
-            problems.Add(new PlatformCheckProblem(path, message, number, severity ?? fallback));
+            if (TryParseBraced(trimmed, out var place, out var message, out var lineNumber))
+            {
+                problems.Add(new PlatformCheckProblem(
+                    PlatformLocation.ResolveFilePath(place),
+                    message,
+                    lineNumber,
+                    PlatformCheckSeverity.Error,
+                    place,
+                    null));
+                continue;
+            }
+
+            if (TryParseReportItem(trimmed, out var reported, out var reportMessage))
+            {
+                problems.Add(new PlatformCheckProblem(
+                    PlatformLocation.ResolveFilePath(reported),
+                    reportMessage,
+                    null,
+                    PlatformCheckSeverity.Warning,
+                    reported,
+                    null));
+                continue;
+            }
+
+            var (path, body) = SplitPath(trimmed);
+            var severity = ExplicitSeverity(trimmed);
+            if (path is null && severity is null)
+            {
+                other.Add(trimmed);
+                continue;
+            }
+
+            var (number, body_text) = SplitLineNumber(body);
+            problems.Add(new PlatformCheckProblem(path, body_text, number, severity ?? fallback, path));
         }
 
         return new PlatformCheckLogResult(problems, other, clean);
     }
+
+    /// <summary>Строка кода из сообщения платформы — она содержит вставку <c>&lt;&lt;?&gt;&gt;</c> или пометку контекста.</summary>
+    private static bool LooksLikeSnippet(string line) =>
+        line.Contains("<<?>>", StringComparison.Ordinal) || line.Contains("(Проверка:", StringComparison.Ordinal);
+
+    /// <summary>Разбирает «{ОбщийМодуль.Имя.Модуль(3,9)}: Ожидается выражение».</summary>
+    private static bool TryParseBraced(string line, out string place, out string message, out int? lineNumber)
+    {
+        place = string.Empty;
+        message = string.Empty;
+        lineNumber = null;
+
+        if (!line.StartsWith('{'))
+        {
+            return false;
+        }
+
+        var close = line.IndexOf('}');
+        if (close < 2)
+        {
+            return false;
+        }
+
+        place = line[1..close].Trim();
+        var rest = line[(close + 1)..].TrimStart();
+        if (rest.StartsWith(':'))
+        {
+            rest = rest[1..].Trim();
+        }
+
+        message = rest;
+        lineNumber = PlatformLocation.LineOf(place);
+        return message.Length > 0;
+    }
+
+    /// <summary>Разбирает «Подсистема.Имя.Справка Неразрешимые ссылки на объекты метаданных (1)».</summary>
+    private static bool TryParseReportItem(string line, out string place, out string message)
+    {
+        place = string.Empty;
+        message = string.Empty;
+
+        var marker = line.LastIndexOf(" (", StringComparison.Ordinal);
+        if (marker <= 0 || !line.EndsWith(')'))
+        {
+            return false;
+        }
+
+        var count = line[(marker + 2)..^1];
+        if (!int.TryParse(count, out _))
+        {
+            return false;
+        }
+
+        var head = line[..marker];
+        var space = head.IndexOf(' ');
+        if (space <= 0)
+        {
+            return false;
+        }
+
+        place = head[..space];
+        message = head[(space + 1)..] + " (" + count + ")";
+        return looksLikeMetadataPath(place);
+    }
+
+    private static bool looksLikeMetadataPath(string value) =>
+        value.Contains('.') && !value.Contains('/') && !value.Contains('\\') && !value.Contains(':');
 
     /// <summary>Отделяет путь файла от сообщения: платформа пишет «Файл - &lt;путь&gt;: сообщение».</summary>
     private static (string? FilePath, string Body) SplitPath(string line)

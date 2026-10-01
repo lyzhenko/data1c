@@ -7,17 +7,20 @@ using Data1c.Core.Platform;
 //
 // Ключи:
 //   --dump <путь>       выгрузка конфигурации в файлы (обязательно)
-//   --infobase <путь>   каталог пустой информационной базы (по умолчанию <выгрузка>/.data1c/platform-base)
+//   --infobase <путь>   каталог информационной базы (по умолчанию <выгрузка>/.data1c/platform-base)
 //   --one-c <путь>      путь к 1cv8.exe, если платформа не находится автоматически
-//   --config            проверять конфигурацию целиком (/CheckConfig) — дольше и строже
+//   --modules           быстрая проверка модулей (/CheckModules): секунды, но ошибок в коде НЕ находит
+//   --config            проверка конфигурации (/CheckConfig) — по умолчанию; 5–10 минут, ловит ошибки
+//   --reuse             не перечитывать конфигурацию в базу, даже если выгрузка новее (итог помечается)
 //   --json              напечатать итог в JSON
 //   --clean             удалить каталог базы после проверки
-//   --timeout <мин>     предел ожидания платформы (по умолчанию 10, для --config 45)
+//   --timeout <мин>     предел ожидания проверки (по умолчанию 45)
+//   --load-timeout <мин> предел ожидания загрузки конфигурации (по умолчанию 60)
 //
 // Коды возврата: 0 — ошибок нет, 1 — есть ошибки, 2 — проверку не удалось выполнить.
 //
-// Конфигурацию в базу загружать не нужно: платформа читает файлы прямо из каталога (-ConfigDir).
-// Замеры на выгрузке 2,9 ГБ: создание пустой базы 4 с, проверка модулей 4–10 с.
+// Замеры на выгрузке 2,9 ГБ: создание базы 4 с, загрузка конфигурации 844 с, проверка 430 с.
+// Проверка модулей синтаксических ошибок не находит — это проверено внесением заведомой ошибки.
 
 var dump = Value("--dump");
 if (dump is null)
@@ -27,26 +30,34 @@ if (dump is null)
 }
 
 var infobase = Value("--infobase") ?? Path.Combine(dump, ".data1c", "platform-base");
-var mode = Has("--config") ? PlatformCheckMode.Config : PlatformCheckMode.Modules;
+var mode = Has("--modules") ? PlatformCheckMode.Modules : PlatformCheckMode.Config;
 var json = Has("--json");
 var clean = Has("--clean");
-var timeout = TimeSpan.FromMinutes(int.TryParse(Value("--timeout"), out var minutes)
-    ? minutes
-    : mode == PlatformCheckMode.Config ? 45 : 10);
+var reuse = Has("--reuse");
+var timeout = TimeSpan.FromMinutes(Number("--timeout", 45));
+var loadTimeout = TimeSpan.FromMinutes(Number("--load-timeout", 60));
 
 Console.WriteLine($"выгрузка: {Path.GetFullPath(dump)}");
 Console.WriteLine($"база:     {Path.GetFullPath(infobase)}");
-Console.WriteLine($"проверка: {(mode == PlatformCheckMode.Config ? "вся конфигурация" : "синтаксис модулей")}");
+Console.WriteLine($"проверка: {(mode == PlatformCheckMode.Modules ? "модули (быстрая, ошибок в коде не находит)" : "конфигурация")}");
 Console.WriteLine();
 
 try
 {
     var runner = new PlatformCheckRunner(Value("--one-c"), message => Console.WriteLine("  " + message));
-    var outcome = runner.Run(dump, infobase, mode, timeout);
+    var outcome = runner.Run(dump, infobase, mode, reuse, timeout, loadTimeout);
 
     Console.WriteLine();
-    Console.WriteLine($"создание базы:  {outcome.CreateTime.TotalSeconds,8:F1} с");
-    Console.WriteLine($"проверка:       {outcome.CheckTime.TotalSeconds,8:F1} с");
+    Console.WriteLine($"создание базы:          {outcome.CreateTime.TotalSeconds,8:F1} с");
+    Console.WriteLine(outcome.LoadTime is { } load
+        ? $"загрузка конфигурации:  {load.TotalSeconds,8:F1} с"
+        : "загрузка конфигурации:  пропущена");
+    Console.WriteLine($"проверка:               {outcome.CheckTime.TotalSeconds,8:F1} с");
+    if (outcome.StaleBase && outcome.LoadSkipped)
+    {
+        Console.WriteLine("ВНИМАНИЕ: база старше выгрузки — проверялась прежняя конфигурация");
+    }
+
     Console.WriteLine();
 
     if (json)
@@ -57,14 +68,17 @@ try
             clean = outcome.Clean,
             errors = outcome.ErrorCount,
             warnings = outcome.WarningCount,
-            createSeconds = Math.Round(outcome.CreateTime.TotalSeconds, 1),
+            staleBase = outcome.StaleBase,
+            loadSeconds = outcome.LoadTime is { } value ? Math.Round(value.TotalSeconds, 1) : (double?)null,
             checkSeconds = Math.Round(outcome.CheckTime.TotalSeconds, 1),
             problems = outcome.Problems.Select(problem => new
             {
                 file = problem.FilePath,
+                place = problem.Place,
                 line = problem.Line,
                 severity = problem.Severity.ToString(),
                 message = problem.Message,
+                snippet = problem.Snippet,
             }),
             other = outcome.Other,
         }, new JsonSerializerOptions { WriteIndented = true }));
@@ -72,7 +86,7 @@ try
     else if (outcome.ErrorCount == 0)
     {
         Console.WriteLine(outcome.Clean
-            ? "Синтаксических ошибок не обнаружено."
+            ? "Ошибок не обнаружено."
             : $"Ошибок нет, предупреждений: {outcome.WarningCount}");
     }
     else
@@ -80,10 +94,14 @@ try
         Console.WriteLine($"Ошибок: {outcome.ErrorCount}, предупреждений: {outcome.WarningCount}");
         foreach (var problem in outcome.Problems)
         {
-            var where = problem.FilePath ?? "(без файла)";
+            var where = problem.FilePath ?? problem.Place ?? "(без места)";
             var line = problem.Line is { } number ? $":{number}" : string.Empty;
             Console.WriteLine($"  {problem.Severity,-8} {where}{line}");
             Console.WriteLine($"           {problem.Message}");
+            if (problem.Snippet is { Length: > 0 } snippet)
+            {
+                Console.WriteLine($"           {snippet}");
+            }
         }
     }
 
@@ -124,3 +142,6 @@ string? Value(string name)
 }
 
 bool Has(string name) => Array.IndexOf(args, name) >= 0;
+
+int Number(string name, int fallback) =>
+    int.TryParse(Value(name), out var value) ? value : fallback;

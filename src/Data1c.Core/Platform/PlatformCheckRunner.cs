@@ -7,29 +7,42 @@ namespace Data1c.Core.Platform;
 /// <summary>Что именно проверяет платформа.</summary>
 public enum PlatformCheckMode
 {
-    /// <summary>Синтаксис модулей (<c>/CheckModules</c>) — быстрая проверка, секунды.</summary>
-    Modules,
-
-    /// <summary>Вся конфигурация (<c>/CheckConfig</c>) — дольше и строже, сообщает о неразрешимых ссылках.</summary>
+    /// <summary>
+    /// Проверка конфигурации (<c>/CheckConfig</c>) — единственная, которая ловит ошибки в модулях.
+    /// По умолчанию используется она.
+    /// </summary>
     Config,
+
+    /// <summary>
+    /// Быстрая проверка модулей (<c>/CheckModules</c>). Замерено: **не находит** синтаксическую ошибку,
+    /// специально внесённую в модуль (журнал — «Синтаксических ошибок не обнаружено»), поэтому
+    /// полагаться на неё нельзя. Оставлена для случаев, когда нужен быстрый прогон без разбора кода.
+    /// </summary>
+    Modules,
 }
 
 /// <summary>Итог штатной проверки выгрузки платформой 1С.</summary>
 /// <param name="Mode">Что проверялось.</param>
-/// <param name="Clean">Платформа сообщила, что синтаксических ошибок нет.</param>
+/// <param name="Clean">Платформа сообщила, что ошибок нет.</param>
 /// <param name="Problems">Замечания проверки.</param>
 /// <param name="Other">Строки журнала, не отнесённые к замечаниям.</param>
 /// <param name="CreateTime">Сколько заняло создание информационной базы.</param>
+/// <param name="LoadTime">Сколько заняла загрузка конфигурации; <see langword="null"/>, если пропущена.</param>
 /// <param name="CheckTime">Сколько заняла проверка.</param>
 /// <param name="InfobasePath">Каталог информационной базы.</param>
+/// <param name="LoadSkipped">Загрузка конфигурации пропущена.</param>
+/// <param name="StaleBase">База старше выгрузки: проверялась прежняя конфигурация.</param>
 public sealed record PlatformCheckOutcome(
     PlatformCheckMode Mode,
     bool Clean,
     IReadOnlyList<PlatformCheckProblem> Problems,
     IReadOnlyList<string> Other,
     TimeSpan CreateTime,
+    TimeSpan? LoadTime,
     TimeSpan CheckTime,
-    string InfobasePath)
+    string InfobasePath,
+    bool LoadSkipped,
+    bool StaleBase)
 {
     /// <summary>Число ошибок.</summary>
     public int ErrorCount => Problems.Count(static problem => problem.Severity == PlatformCheckSeverity.Error);
@@ -39,14 +52,13 @@ public sealed record PlatformCheckOutcome(
 }
 
 /// <summary>
-/// Штатная проверка выгрузки платформой 1С. Нужна только пустая файловая информационная база:
-/// конфигурацию в неё загружать не требуется, платформа читает файлы прямо из каталога
-/// (<c>-ConfigDir</c>), а ключ <c>/Out</c> пишет журнал, который разбирает
-/// <see cref="PlatformCheckLog"/>.
+/// Штатная проверка выгрузки платформой 1С. Нужна файловая информационная база с загруженной
+/// конфигурацией: платформа проверяет то, что находится в базе, а не файлы в каталоге.
 ///
-/// Замеры на выгрузке 2,9 ГБ: создание пустой базы 4 с, <c>/CheckModules</c> 4–10 с.
-/// Полная загрузка конфигурации в базу (<c>/LoadConfigFromFiles</c>, 844 с) для проверки модулей
-/// не нужна — она понадобилась бы только для работы с конфигурацией как с базой.
+/// Замеры на выгрузке 2,9 ГБ: создание базы 4 с, загрузка конфигурации 844 с, проверка
+/// конфигурации 430 с. Проверка модулей (<c>/CheckModules</c>, 10 с) синтаксических ошибок
+/// **не находит** — проверено внесением заведомой ошибки в модуль; ловит их только
+/// <c>/CheckConfig</c>, поэтому по умолчанию используется он.
 ///
 /// Пути к базе и выгрузке не должны содержать пробелов: строка соединения 1С передаётся одним
 /// аргументом, и надёжно закавычить её в этом случае нельзя.
@@ -101,12 +113,18 @@ public sealed class PlatformCheckRunner
             : candidates.OrderByDescending(static candidate => candidate.Version).First().Path;
     }
 
-    /// <summary>Проверяет выгрузку; информационная база создаётся пустой, если её ещё нет.</summary>
+    /// <summary>
+    /// Проверяет выгрузку. База создаётся при необходимости, конфигурация загружается в неё, если
+    /// база старше самого свежего файла выгрузки; при <paramref name="reuse"/> загрузка не делается
+    /// и в итоге отмечается, что проверялась прежняя конфигурация.
+    /// </summary>
     public PlatformCheckOutcome Run(
         string dumpPath,
         string infobasePath,
-        PlatformCheckMode mode = PlatformCheckMode.Modules,
-        TimeSpan? timeout = null)
+        PlatformCheckMode mode = PlatformCheckMode.Config,
+        bool reuse = false,
+        TimeSpan? timeout = null,
+        TimeSpan? loadTimeout = null)
     {
         var dump = Path.GetFullPath(dumpPath);
         var infobase = Path.GetFullPath(infobasePath);
@@ -125,7 +143,7 @@ public sealed class PlatformCheckRunner
         var createTime = TimeSpan.Zero;
         if (!File.Exists(dataFile))
         {
-            _log?.Invoke("создаю пустую файловую информационную базу");
+            _log?.Invoke("создаю файловую информационную базу");
             createTime = RunOneC(
                 ["CREATEINFOBASE", $"File={infobase};", "/Out", LogPath(infobase, "create"), "/DisableStartupDialogs", "/DisableStartupMessages"],
                 TimeSpan.FromMinutes(5));
@@ -135,20 +153,43 @@ public sealed class PlatformCheckRunner
             _log?.Invoke("информационная база уже есть");
         }
 
+        // Конфигурацию в базе нужно обновлять, когда изменился любой файл выгрузки: правка модуля
+        // не трогает Configuration.xml, поэтому сравнения только с ним недостаточно.
+        var newest = NewestWriteTime(dump);
+        var stale = !File.Exists(dataFile) || File.GetLastWriteTimeUtc(dataFile) < newest;
+        var skipLoad = reuse && stale;
+
+        TimeSpan? loadTime = null;
+        if (skipLoad)
+        {
+            _log?.Invoke("ВНИМАНИЕ: база старше выгрузки, проверяется прежняя конфигурация (--reuse)");
+        }
+        else if (stale)
+        {
+            _log?.Invoke("загружаю конфигурацию из файлов (на большой выгрузке это 10–15 минут)");
+            loadTime = RunOneC(
+                ["DESIGNER", "/F", infobase, "/LoadConfigFromFiles", dump, "/Out", LogPath(infobase, "load"), "/DisableStartupDialogs", "/DisableStartupMessages"],
+                loadTimeout ?? TimeSpan.FromMinutes(60));
+        }
+        else
+        {
+            _log?.Invoke("база новее выгрузки — загрузку конфигурации пропускаю");
+        }
+
         var check = LogPath(infobase, "check");
-        var key = mode == PlatformCheckMode.Config ? "/CheckConfig" : "/CheckModules";
-        _log?.Invoke(mode == PlatformCheckMode.Config
-            ? "проверяю конфигурацию целиком (это долго)"
-            : "проверяю синтаксис модулей");
+        var key = mode == PlatformCheckMode.Modules ? "/CheckModules" : "/CheckConfig";
+        _log?.Invoke(mode == PlatformCheckMode.Modules
+            ? "проверяю модули (быстрая проверка, ошибок в коде не находит)"
+            : "проверяю конфигурацию (это несколько минут)");
 
         var checkTime = RunOneC(
-            ["DESIGNER", "/F", infobase, key, "-ConfigDir", dump, "/Out", check, "/DisableStartupDialogs", "/DisableStartupMessages"],
-            timeout ?? (mode == PlatformCheckMode.Config ? TimeSpan.FromMinutes(45) : TimeSpan.FromMinutes(10)));
+            ["DESIGNER", "/F", infobase, key, "/Out", check, "/DisableStartupDialogs", "/DisableStartupMessages"],
+            timeout ?? (mode == PlatformCheckMode.Modules ? TimeSpan.FromMinutes(10) : TimeSpan.FromMinutes(45)));
 
         var parsed = PlatformCheckLog.Parse(ReadLog(check));
 
         _log?.Invoke(parsed.Clean
-            ? "платформа: синтаксических ошибок не обнаружено"
+            ? "платформа: ошибок не обнаружено"
             : $"платформа: ошибок {parsed.ErrorCount}, предупреждений {parsed.WarningCount}");
 
         return new PlatformCheckOutcome(
@@ -157,8 +198,33 @@ public sealed class PlatformCheckRunner
             parsed.Problems,
             parsed.Other,
             createTime,
+            loadTime,
             checkTime,
-            infobase);
+            infobase,
+            skipLoad || loadTime is null,
+            stale);
+    }
+
+    /// <summary>Самый свежий файл выгрузки: по нему решается, нужно ли перечитывать конфигурацию в базу.</summary>
+    private static DateTime NewestWriteTime(string dump)
+    {
+        var newest = File.GetLastWriteTimeUtc(Path.Combine(dump, "Configuration.xml"));
+        foreach (var file in Directory.EnumerateFiles(dump, "*", SearchOption.AllDirectories))
+        {
+            // Служебный каталог .data1c (индекс, базы проверки) к выгрузке не относится.
+            if (file.Contains(Path.DirectorySeparatorChar + ".data1c" + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var written = File.GetLastWriteTimeUtc(file);
+            if (written > newest)
+            {
+                newest = written;
+            }
+        }
+
+        return newest;
     }
 
     /// <summary>Читает журнал 1С: кодировка определяется так же, как для текстов выгрузки.</summary>
