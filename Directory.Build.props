@@ -13,4 +13,53 @@
     <NuGetAudit>false</NuGetAudit>
   </PropertyGroup>
 
+  <!--
+    Долго живущий просмотрщик (data1c view), запущенный из bin, держит свои же dll и не даёт
+    сборке перезаписать файлы: MSBuild десять раз повторяет копирование и падает с MSB3027/MSB3021.
+    Ниже — проверка перед копированием файлов: вместо невнятного сообщения объясняем, что случилось
+    и как это исправить. Запуск через tools\view.ps1 (публикация в artifacts\viewer) не мешает сборке.
+  -->
+  <UsingTask TaskName="Data1cCheckViewer" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <OutputDirectory ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System.Collections.Generic" />
+      <Using Namespace="System.Diagnostics" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        var offenders = new List<string>();
+        foreach (var process in Process.GetProcessesByName("data1c"))
+        {
+            try
+            {
+                var module = process.MainModule;
+                var path = module != null ? module.FileName : null;
+                if (path != null && path.StartsWith(OutputDirectory, System.StringComparison.OrdinalIgnoreCase))
+                {
+                    offenders.Add("PID " + process.Id);
+                }
+            }
+            catch
+            {
+                // Нет прав на чтение сведений о процессе — не мешаем сборке.
+            }
+        }
+
+        if (offenders.Count > 0)
+        {
+            Log.LogError(
+                "Просмотрщик data1c (" + string.Join(", ", offenders) + ") запущен из этой папки сборки и держит её файлы. " +
+                "Остановите его: Get-Process data1c | Stop-Process — либо запускайте просмотрщик через tools\\view.ps1, " +
+                "он публикует сборку в artifacts\\viewer и сборке не мешает.");
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="Data1cCheckViewerRunning" BeforeTargets="CopyFilesToOutputDirectory"
+          Condition="'$(DesignTimeBuild)' != 'true' and '$(TargetDir)' != ''">
+    <Data1cCheckViewer OutputDirectory="$(TargetDir)" />
+  </Target>
+
 </Project>
