@@ -12,13 +12,14 @@ namespace Data1c.Store;
 /// <item><c>calls</c> — вызовы с текстом цели: работает даже когда цель не разрешена;</item>
 /// <item><c>metadata_objects</c>, <c>metadata_items</c> — объекты конфигурации, реквизиты, формы, макеты;</item>
 /// <item><c>metadata_refs</c> — обращения к метаданным из кода, из текстов запросов, типы и права;</item>
+/// <item><c>form_models</c>, <c>form_items</c> — описания форм: реквизиты, элементы, команды и обработчики;</item>
 /// <item><c>*_fts</c> — полнотекстовый поиск: триграммы для имён (поиск по подстроке), unicode61 для термов и BM25.</item>
 /// </list>
 /// </remarks>
 internal static class IndexSchema
 {
     /// <summary>Версия схемы. Меняется вместе с DDL.</summary>
-    internal const int Version = 5;
+    internal const int Version = 6;
 
     internal static readonly string[] Statements =
     [
@@ -140,6 +141,47 @@ internal static class IndexSchema
         """,
         "CREATE INDEX IF NOT EXISTS idx_refs_target ON metadata_refs(target_id)",
         "CREATE INDEX IF NOT EXISTS idx_refs_source ON metadata_refs(source_id)",
+
+        // Описания форм (Ext/Form.xml): отдельная таблица на форму и построчный состав.
+        // Реквизиты, элементы, команды и обработчики лежат в одной таблице: у них общий набор
+        // полей (имя, привязка, обработчик, строка), а вид строки различается значением kind.
+        """
+        CREATE TABLE IF NOT EXISTS form_models (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            name_lower TEXT NOT NULL,
+            form_kind TEXT,
+            source_path TEXT,
+            object_id TEXT,
+            attribute_count INTEGER NOT NULL DEFAULT 0,
+            element_count INTEGER NOT NULL DEFAULT 0,
+            command_count INTEGER NOT NULL DEFAULT 0,
+            handler_count INTEGER NOT NULL DEFAULT 0,
+            resolved_handler_count INTEGER NOT NULL DEFAULT 0
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_forms_object ON form_models(object_id)",
+        "CREATE INDEX IF NOT EXISTS idx_forms_name ON form_models(name_lower)",
+
+        """
+        CREATE TABLE IF NOT EXISTS form_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            form_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            view_kind TEXT,
+            data_path TEXT,
+            type_info TEXT,
+            handler TEXT,
+            element_name TEXT,
+            command_name TEXT,
+            line INTEGER,
+            is_main INTEGER NOT NULL DEFAULT 0,
+            is_resolved INTEGER NOT NULL DEFAULT 0
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_form_items_form ON form_items(form_id, kind)",
+        "CREATE INDEX IF NOT EXISTS idx_form_items_name ON form_items(name)",
 
         // Префиксный поиск по именам узлов: unicode61 с prefix занимает несопоставимо меньше места,
         // чем триграммы, и закрывает обычный случай — имя набирают с начала.

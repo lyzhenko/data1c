@@ -55,6 +55,22 @@ public sealed record MetadataItemRow(
 /// <summary>Страница состава объекта: показанные дети и их общее число.</summary>
 public sealed record MetadataChildrenPage(IReadOnlyList<MetadataItemRow> Items, int Total);
 
+/// <summary>Виды строк состава формы в индексе (<c>form_items.kind</c>).</summary>
+internal static class FormItemKinds
+{
+    /// <summary>Реквизит формы: имя, типы значения и признак основного реквизита.</summary>
+    internal const string Attribute = "Attribute";
+
+    /// <summary>Элемент формы: имя, вид (InputField, Table, …), путь данных и команда.</summary>
+    internal const string Element = "Element";
+
+    /// <summary>Команда формы: имя, процедура действия и ссылка на команду объекта.</summary>
+    internal const string Command = "Command";
+
+    /// <summary>Обработчик события: событие, элемент, процедура модуля формы и её строка.</summary>
+    internal const string Handler = "Handler";
+}
+
 /// <summary>Обращение к объекту метаданных: из кода, из текста запроса, тип реквизита, право роли.</summary>
 public sealed record MetadataRefRow(
     string SourceId,
@@ -79,11 +95,13 @@ public sealed record IndexStatistics(
     long PlatformNodes,
     long ExternalNodes,
     string? DumpPath,
-    DateTimeOffset? IndexedAt)
+    DateTimeOffset? IndexedAt,
+    long Forms = 0)
 {
     public override string ToString() =>
         $"узлов {Nodes:N0}, связей {Edges:N0}, символов {Symbols:N0}, вызовов {Calls:N0}, " +
-        $"объектов метаданных {MetadataObjects:N0}, реквизитов {MetadataItems:N0}, обращений {MetadataRefs:N0}";
+        $"объектов метаданных {MetadataObjects:N0}, реквизитов {MetadataItems:N0}, обращений {MetadataRefs:N0}, " +
+        $"форм {Forms:N0}";
 }
 
 /// <summary>Итог записи индекса.</summary>
@@ -96,4 +114,5 @@ public sealed record IndexWriteResult(
     int MetadataItems,
     int MetadataRefs,
     int Files,
+    int Forms,
     TimeSpan Duration);

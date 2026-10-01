@@ -1,3 +1,5 @@
+using Data1c.Core.Metadata;
+
 namespace Data1c.Core.Graph;
 
 /// <summary>Найденный вложенный объект: реквизит, табличная часть, форма, команда, макет.</summary>
@@ -29,6 +31,7 @@ public sealed record MetadataReferenceInfo(string Kind, string Target, string? D
 /// </summary>
 /// <param name="Children">Дети в пределах запрошенной глубины.</param>
 /// <param name="ChildrenNotShown">Сколько детей не попало в ответ: глубина или предел.</param>
+/// <param name="Form">Описание формы для объектов-форм: реквизиты, элементы, команды и обработчики.</param>
 public sealed record MetadataCard(
     string Id,
     string Kind,
@@ -44,7 +47,8 @@ public sealed record MetadataCard(
     IReadOnlyList<MetadataReferenceInfo> References,
     IReadOnlyList<string> ModulePaths,
     IReadOnlyList<MetadataCard> Children,
-    int ChildrenNotShown);
+    int ChildrenNotShown,
+    FormModel? Form = null);
 
 /// <summary>
 /// Запросы к графу зависимостей независимо от того, где он лежит: собран в памяти

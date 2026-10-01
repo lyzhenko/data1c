@@ -416,7 +416,10 @@ public sealed class ToolCatalog
     private ToolSpec MetadataTool() => new(
         "metadata",
         "Состав объекта метаданных 1С деревом: реквизиты, табличные части и их реквизиты, формы, команды, "
-        + "типы, модули. Нужен, чтобы писать код по реальной структуре объекта. Пример: id=\"Catalog.Товары\".",
+        + "типы, модули. У формы дополнительно показаны её реквизиты, элементы с привязкой DataPath, "
+        + "команды и обработчики событий с именами процедур модуля формы — запросите саму форму, "
+        + "например id=\"Catalog.Товары/Form.ФормаЭлемента\"; списки формы ограничивает maxChildren. "
+        + "Нужен, чтобы писать код по реальной структуре объекта. Пример: id=\"Catalog.Товары\".",
         [
             new ToolParameter("id", "string", "Идентификатор: Catalog.Товары, Document.Заказ, Document.Заказ/TabularSection.Строки.", Required: true),
             new ToolParameter("depth", "integer", "Глубина дерева состава (1–4, по умолчанию 3)."),
@@ -471,8 +474,132 @@ public sealed class ToolCatalog
             }
 
             root["modules"] = modules.Count > 0 ? modules : null;
+
+            // Описание формы (Ext/Form.xml) добавляется только форме: у остальных объектов его нет,
+            // а существующие поля ответа не меняются.
+            if (card.Form is { } form)
+            {
+                root["form"] = FormView(form, maxChildren);
+            }
+
             return Render.JsonOf(root);
         });
+
+    /// <summary>
+    /// Раздел ответа «form»: состав формы так, как его видит агент. Списки ограничены тем же пределом,
+    /// что и дерево состава, а полные размеры остаются в полях-счётчиках.
+    /// </summary>
+    private static JsonObject FormView(FormModel form, int maxChildren)
+    {
+        var view = new JsonObject
+        {
+            ["name"] = form.Name,
+            ["kind"] = form.Kind switch
+            {
+                FormKind.Managed => "Managed",
+                FormKind.Ordinary => "Ordinary",
+                _ => null,
+            },
+            ["file"] = form.SourcePath,
+            ["attributesCount"] = form.Attributes.Count,
+            ["elementsCount"] = form.Elements.Count,
+            ["commandsCount"] = form.Commands.Count,
+            ["handlersCount"] = form.Handlers.Count,
+            ["handlersResolved"] = form.Handlers.Count(static handler => handler.Resolved),
+        };
+
+        if (form.Attributes.Count > 0)
+        {
+            var attributes = new JsonArray();
+            foreach (var attribute in form.Attributes.Take(maxChildren))
+            {
+                var types = new JsonArray();
+                foreach (var type in attribute.Types)
+                {
+                    types.Add(type);
+                }
+
+                attributes.Add(new JsonObject
+                {
+                    ["name"] = attribute.Name,
+                    ["types"] = types.Count > 0 ? types : null,
+                    ["main"] = attribute.IsMain ? true : null,
+                });
+            }
+
+            view["attributes"] = attributes;
+            if (form.Attributes.Count > maxChildren)
+            {
+                view["attributesTruncated"] = form.Attributes.Count;
+            }
+        }
+
+        if (form.Elements.Count > 0)
+        {
+            var elements = new JsonArray();
+            foreach (var element in form.Elements.Take(maxChildren))
+            {
+                elements.Add(new JsonObject
+                {
+                    ["name"] = element.Name,
+                    ["kind"] = element.Kind,
+                    ["dataPath"] = element.DataPath,
+                    ["attribute"] = element.Attribute,
+                    ["command"] = element.CommandName,
+                });
+            }
+
+            view["elements"] = elements;
+            if (form.Elements.Count > maxChildren)
+            {
+                view["elementsTruncated"] = form.Elements.Count;
+            }
+        }
+
+        if (form.Commands.Count > 0)
+        {
+            var commands = new JsonArray();
+            foreach (var command in form.Commands.Take(maxChildren))
+            {
+                commands.Add(new JsonObject
+                {
+                    ["name"] = command.Name,
+                    ["handler"] = command.Handler,
+                    ["commandName"] = command.CommandName,
+                });
+            }
+
+            view["commands"] = commands;
+            if (form.Commands.Count > maxChildren)
+            {
+                view["commandsTruncated"] = form.Commands.Count;
+            }
+        }
+
+        if (form.Handlers.Count > 0)
+        {
+            var handlers = new JsonArray();
+            foreach (var handler in form.Handlers.Take(maxChildren))
+            {
+                handlers.Add(new JsonObject
+                {
+                    ["event"] = handler.Event,
+                    ["element"] = handler.Element,
+                    ["procedure"] = handler.Procedure,
+                    ["line"] = handler.Line,
+                    ["resolved"] = handler.Resolved,
+                });
+            }
+
+            view["handlers"] = handlers;
+            if (form.Handlers.Count > maxChildren)
+            {
+                view["handlersTruncated"] = form.Handlers.Count;
+            }
+        }
+
+        return view;
+    }
 
     /// <summary>
     /// Узел дерева состава объекта: сам объект, его типы и дети. Вложенность важна для табличных частей —
@@ -1162,6 +1289,7 @@ public sealed class ToolCatalog
                     metadataObjects = index.MetadataObjects,
                     metadataItems = index.MetadataItems,
                     metadataRefs = index.MetadataRefs,
+                    forms = index.Forms,
                     platformNodes = index.PlatformNodes,
                     externalNodes = index.ExternalNodes,
                     indexedAt = index.IndexedAt,

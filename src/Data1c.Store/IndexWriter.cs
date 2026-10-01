@@ -52,6 +52,7 @@ public sealed class IndexWriter
                 WriteEdges(result.Graph.Edges, connection, counters, cancellationToken);
                 WriteSymbols(source, result.Modules, connection, counters, cancellationToken);
                 WriteMetadata(result, connection, counters, cancellationToken);
+                WriteForms(result, connection, counters, cancellationToken);
 
                 _index.SetMeta("dump_path", result.SourceName);
                 _index.SetMeta("indexed_at", DateTimeOffset.UtcNow.ToString("O"));
@@ -72,6 +73,7 @@ public sealed class IndexWriter
                     counters.MetadataItems,
                     counters.MetadataRefs,
                     counters.Files,
+                    counters.Forms,
                     stopwatch.Elapsed);
             }
             finally
@@ -140,7 +142,7 @@ public sealed class IndexWriter
                 if (modules.Count == 0)
                 {
                     transaction.Rollback();
-                    return new IndexWriteResult(0, 0, 0, 0, 0, 0, 0, 0, stopwatch.Elapsed);
+                    return new IndexWriteResult(0, 0, 0, 0, 0, 0, 0, 0, 0, stopwatch.Elapsed);
                 }
 
                 var routineNames = modules
@@ -191,6 +193,7 @@ public sealed class IndexWriter
                     0,
                     counters.MetadataRefs,
                     counters.Files,
+                    0,
                     stopwatch.Elapsed);
             }
             finally
@@ -818,6 +821,7 @@ public sealed class IndexWriter
                 ('cnt_metadata_objects', (SELECT COUNT(*) FROM metadata_objects)),
                 ('cnt_metadata_items', (SELECT COUNT(*) FROM metadata_items)),
                 ('cnt_metadata_refs', (SELECT COUNT(*) FROM metadata_refs)),
+                ('cnt_forms', (SELECT COUNT(*) FROM form_models)),
                 ('cnt_files', (SELECT COUNT(*) FROM files)),
                 ('nodes', (SELECT COUNT(*) FROM nodes)),
                 ('edges', (SELECT COUNT(*) FROM edges));
@@ -893,6 +897,7 @@ public sealed class IndexWriter
             ("cnt_metadata_objects", counters.MetadataObjects),
             ("cnt_metadata_items", counters.MetadataItems),
             ("cnt_metadata_refs", counters.MetadataRefs),
+            ("cnt_forms", counters.Forms),
             ("cnt_files", counters.Files),
         })
         {
@@ -915,6 +920,8 @@ public sealed class IndexWriter
             DELETE FROM metadata_refs;
             DELETE FROM metadata_items;
             DELETE FROM metadata_objects;
+            DELETE FROM form_items;
+            DELETE FROM form_models;
             DELETE FROM nodes;
             DELETE FROM files;
             DELETE FROM sqlite_sequence;
@@ -1243,6 +1250,146 @@ public sealed class IndexWriter
         }
     }
 
+    /// <summary>
+    /// Записывает описания форм: саму форму со счётчиками состава и её строки — реквизиты, элементы,
+    /// команды и обработчики событий. Реквизиты пишутся раньше элементов, чтобы при чтении обратно
+    /// привязка «элемент → реквизит» восстанавливалась по DataPath однозначно.
+    /// </summary>
+    private void WriteForms(AnalysisResult result, SqliteConnection connection, Counters counters, CancellationToken cancellationToken)
+    {
+        using var forms = connection.CreateCommand();
+        forms.CommandText =
+            """
+            INSERT OR REPLACE INTO form_models
+                (id, name, name_lower, form_kind, source_path, object_id,
+                 attribute_count, element_count, command_count, handler_count, resolved_handler_count)
+            VALUES (@id, @name, @nameLower, @kind, @path, @object,
+                    @attributes, @elements, @commands, @handlers, @resolved)
+            """;
+        var formId = forms.Parameters.Add("@id", SqliteType.Text);
+        var formName = forms.Parameters.Add("@name", SqliteType.Text);
+        var formNameLower = forms.Parameters.Add("@nameLower", SqliteType.Text);
+        var formKind = forms.Parameters.Add("@kind", SqliteType.Text);
+        var formPath = forms.Parameters.Add("@path", SqliteType.Text);
+        var formObject = forms.Parameters.Add("@object", SqliteType.Text);
+        var formAttributes = forms.Parameters.Add("@attributes", SqliteType.Integer);
+        var formElements = forms.Parameters.Add("@elements", SqliteType.Integer);
+        var formCommands = forms.Parameters.Add("@commands", SqliteType.Integer);
+        var formHandlers = forms.Parameters.Add("@handlers", SqliteType.Integer);
+        var formResolved = forms.Parameters.Add("@resolved", SqliteType.Integer);
+
+        using var items = connection.CreateCommand();
+        items.CommandText =
+            """
+            INSERT INTO form_items
+                (form_id, kind, name, view_kind, data_path, type_info, handler, element_name, command_name, line, is_main, is_resolved)
+            VALUES (@form, @kind, @name, @viewKind, @dataPath, @type, @handler, @elementName, @commandName, @line, @isMain, @isResolved)
+            """;
+        var itemForm = items.Parameters.Add("@form", SqliteType.Text);
+        var itemKind = items.Parameters.Add("@kind", SqliteType.Text);
+        var itemName = items.Parameters.Add("@name", SqliteType.Text);
+        var itemViewKind = items.Parameters.Add("@viewKind", SqliteType.Text);
+        var itemDataPath = items.Parameters.Add("@dataPath", SqliteType.Text);
+        var itemType = items.Parameters.Add("@type", SqliteType.Text);
+        var itemHandler = items.Parameters.Add("@handler", SqliteType.Text);
+        var itemElementName = items.Parameters.Add("@elementName", SqliteType.Text);
+        var itemCommandName = items.Parameters.Add("@commandName", SqliteType.Text);
+        var itemLine = items.Parameters.Add("@line", SqliteType.Integer);
+        var itemIsMain = items.Parameters.Add("@isMain", SqliteType.Integer);
+        var itemIsResolved = items.Parameters.Add("@isResolved", SqliteType.Integer);
+
+        foreach (var obj in result.Metadata.Objects)
+        {
+            if (obj.Form is not { } form)
+            {
+                continue;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            formId.Value = obj.Id;
+            formName.Value = form.Name;
+            formNameLower.Value = form.Name.ToLowerInvariant();
+            formKind.Value = form.Kind.ToString();
+            formPath.Value = (object?)form.SourcePath ?? DBNull.Value;
+            formObject.Value = obj.Parent is null || obj.Parent.Kind == MdKind.Configuration
+                ? DBNull.Value
+                : obj.Parent.Id;
+            formAttributes.Value = form.Attributes.Count;
+            formElements.Value = form.Elements.Count;
+            formCommands.Value = form.Commands.Count;
+            formHandlers.Value = form.Handlers.Count;
+            formResolved.Value = form.ResolvedHandlers.Count();
+            forms.ExecuteNonQuery();
+            counters.Forms++;
+
+            itemForm.Value = obj.Id;
+            foreach (var attribute in form.Attributes)
+            {
+                itemKind.Value = FormItemKinds.Attribute;
+                itemName.Value = attribute.Name;
+                itemViewKind.Value = DBNull.Value;
+                itemDataPath.Value = DBNull.Value;
+                itemType.Value = (object?)attribute.TypeText ?? DBNull.Value;
+                itemHandler.Value = DBNull.Value;
+                itemElementName.Value = DBNull.Value;
+                itemCommandName.Value = DBNull.Value;
+                itemLine.Value = DBNull.Value;
+                itemIsMain.Value = attribute.IsMain ? 1 : 0;
+                itemIsResolved.Value = 0;
+                items.ExecuteNonQuery();
+            }
+
+            foreach (var element in form.Elements)
+            {
+                itemKind.Value = FormItemKinds.Element;
+                itemName.Value = element.Name;
+                itemViewKind.Value = element.Kind;
+                itemDataPath.Value = (object?)element.DataPath ?? DBNull.Value;
+                itemType.Value = DBNull.Value;
+                itemHandler.Value = DBNull.Value;
+                itemElementName.Value = DBNull.Value;
+                itemCommandName.Value = (object?)element.CommandName ?? DBNull.Value;
+                itemLine.Value = DBNull.Value;
+                itemIsMain.Value = 0;
+                itemIsResolved.Value = 0;
+                items.ExecuteNonQuery();
+            }
+
+            foreach (var command in form.Commands)
+            {
+                itemKind.Value = FormItemKinds.Command;
+                itemName.Value = command.Name;
+                itemViewKind.Value = DBNull.Value;
+                itemDataPath.Value = DBNull.Value;
+                itemType.Value = DBNull.Value;
+                itemHandler.Value = (object?)command.Handler ?? DBNull.Value;
+                itemElementName.Value = DBNull.Value;
+                itemCommandName.Value = (object?)command.CommandName ?? DBNull.Value;
+                itemLine.Value = DBNull.Value;
+                itemIsMain.Value = 0;
+                itemIsResolved.Value = 0;
+                items.ExecuteNonQuery();
+            }
+
+            foreach (var handler in form.Handlers)
+            {
+                itemKind.Value = FormItemKinds.Handler;
+                itemName.Value = handler.Event;
+                itemViewKind.Value = DBNull.Value;
+                itemDataPath.Value = DBNull.Value;
+                itemType.Value = DBNull.Value;
+                itemHandler.Value = handler.Procedure;
+                itemElementName.Value = (object?)handler.Element ?? DBNull.Value;
+                itemCommandName.Value = DBNull.Value;
+                itemLine.Value = (object?)handler.Line ?? DBNull.Value;
+                itemIsMain.Value = 0;
+                itemIsResolved.Value = handler.Resolved ? 1 : 0;
+                items.ExecuteNonQuery();
+            }
+        }
+    }
+
     private static string? Tag(GraphNode node, string key) =>
         node.Tags is not null && node.Tags.TryGetValue(key, out var value) ? value : null;
 
@@ -1401,6 +1548,7 @@ public sealed class IndexWriter
         internal int MetadataObjects;
         internal int MetadataItems;
         internal int MetadataRefs;
+        internal int Forms;
         internal int Files;
     }
 }
