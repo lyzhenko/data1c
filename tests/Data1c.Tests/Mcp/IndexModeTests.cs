@@ -1,4 +1,7 @@
 using Data1c.Core.Analysis;
+using Data1c.Core.Dump;
+using Data1c.Core.Metadata;
+using Data1c.FileSystem;
 using Data1c.Mcp;
 using Data1c.Store;
 using Xunit;
@@ -66,5 +69,62 @@ public sealed class IndexModeTests
         Assert.NotNull(session.Result);
         Assert.Contains(query.Search("Товары", 5), static hit => hit.Id == "Catalog.Товары");
         Assert.Contains(query.SearchNested("Артикул", 5), static hit => hit.Id == "Catalog.Товары/Attribute.Артикул");
+    }
+
+    [Fact]
+    public async Task Описание_формы_читается_из_индекса()
+    {
+        // Формы живут в отдельных таблицах индекса: без них карточка формы в режиме индекса
+        // (а это основной режим работы сервера) осталась бы без реквизитов и обработчиков.
+        var path = Path.Combine(Path.GetTempPath(), "data1c-form-index-" + Guid.NewGuid().ToString("N") + ".db");
+        var root = FormSampleDump.Materialize();
+        try
+        {
+            var source = new FileSystemDumpSource(root);
+            var analyzed = new DumpAnalyzer().Analyze(source);
+            using (var index = SqliteIndex.Open(path))
+            {
+                var written = new IndexWriter(index) { IncludeComments = false }.Write(source, analyzed);
+                Assert.Equal(1, written.Forms);
+            }
+
+            using var session = new AnalysisSession(
+                new AnalysisRequest { IndexPath = path, UseIndex = true },
+                source);
+
+            var query = await session.QueryAsync(CancellationToken.None);
+            Assert.True(session.IsIndexReady);
+            Assert.Null(session.Result);
+
+            var card = query.GetMetadata(FormSampleDump.FormId);
+            Assert.NotNull(card);
+            Assert.Equal(1, session.GetIndexStatistics()!.Forms);
+
+            var form = card.Form;
+            Assert.NotNull(form);
+            Assert.Equal("ФормаЭлемента", form.Name);
+            Assert.Equal(FormKind.Managed, form.Kind);
+            Assert.Equal(2, form.Attributes.Count);
+
+            var article = form.Elements.Single(static element => element.Name == "Артикул");
+            Assert.Equal("Объект.Артикул", article.DataPath);
+            Assert.Equal("Объект", article.Attribute);
+            Assert.Equal("InputField", article.Kind);
+
+            Assert.Equal("Печать", Assert.Single(form.Commands).Handler);
+
+            var open = form.Handlers.Single(static handler => handler.Procedure == "ПриОткрытии");
+            Assert.True(open.Resolved);
+            Assert.Equal(2, open.Line);
+            Assert.False(form.Handlers.Single(static handler => handler.Procedure == "НетТакойПроцедуры").Resolved);
+        }
+        finally
+        {
+            FormSampleDump.Remove(root);
+            foreach (var file in Directory.EnumerateFiles(Path.GetDirectoryName(path)!, Path.GetFileName(path) + "*"))
+            {
+                File.Delete(file);
+            }
+        }
     }
 }

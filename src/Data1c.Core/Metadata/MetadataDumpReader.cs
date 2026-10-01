@@ -16,6 +16,9 @@ public sealed record MetadataReadOptions
     /// <summary>Разбирать права ролей (Ext/Rights.xml). Даёт сотни тысяч рёбер, по умолчанию выключено.</summary>
     public bool IncludeRoleRights { get; init; }
 
+    /// <summary>Разбирать описания форм (Ext/Form.xml): реквизиты, элементы, команды, обработчики событий.</summary>
+    public bool ParseForms { get; init; } = true;
+
     /// <summary>Ограничить разбор указанными каталогами выгрузки («Catalogs», «CommonModules», ...).</summary>
     public IReadOnlyCollection<string>? Sections { get; init; }
 
@@ -90,6 +93,7 @@ public sealed class MetadataDumpReader
         var xmlFiles = new List<DumpFile>();
         var bslFiles = new List<DumpFile>();
         var rightsFiles = new List<DumpFile>();
+        var formFiles = new List<DumpFile>();
         var hasConfigurationFile = false;
 
         foreach (var file in source.EnumerateFiles(cancellationToken))
@@ -123,6 +127,14 @@ public sealed class MetadataDumpReader
                             rightsFiles.Add(file);
                         }
 
+                        break;
+                    }
+                    else if (options.ParseForms && string.Equals(fileName, "Form.xml", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Описание формы разбирается отдельно и привязывается к объекту-форме:
+                        // объекта метаданных в этом файле нет, а реквизиты, элементы, команды
+                        // и обработчики нужны карточке формы.
+                        formFiles.Add(file);
                         break;
                     }
 
@@ -210,6 +222,11 @@ public sealed class MetadataDumpReader
 
         var dirIndex = BuildDirectoryIndex(allObjects);
         var moduleRefs = AttachModules(bslFiles, dirIndex, configuration);
+
+        if (formFiles.Count > 0)
+        {
+            AttachForms(source, formFiles, dirIndex, warnings, cancellationToken);
+        }
 
         if (rightsFiles.Count > 0)
         {
@@ -387,6 +404,77 @@ public sealed class MetadataDumpReader
 
         return null;
     }
+
+    /// <summary>
+    /// Разбирает описания форм и привязывает их к объектам-формам. Владелец определяется по каталогу
+    /// файла: «Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form.xml» принадлежит форме
+    /// «Catalogs/Товары/Forms/ФормаЭлемента». Битый файл не роняет разбор: замечание попадает
+    /// в предупреждения, а остальные формы читаются дальше.
+    /// </summary>
+    private static void AttachForms(
+        IDumpSource source,
+        List<DumpFile> formFiles,
+        Dictionary<string, MdObject> dirIndex,
+        ConcurrentBag<string> warnings,
+        CancellationToken cancellationToken)
+    {
+        Parallel.ForEach(
+            formFiles,
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Environment.ProcessorCount,
+                CancellationToken = cancellationToken,
+            },
+            file =>
+            {
+                // Каталог формы — это каталог «Ext» и его родитель.
+                var formDirectory = DumpPath.GetDirectory(DumpPath.GetDirectory(file.RelativePath));
+                var owner = FindOwnerByDirectory(file.RelativePath, dirIndex);
+                if (owner is null || !string.Equals(owner.Directory, formDirectory, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Описания формы без объекта метаданных в выгрузке не бывает: пропускаем молча,
+                    // иначе неполная выгрузка засыпала бы предупреждениями.
+                    return;
+                }
+
+                try
+                {
+                    using var stream = source.OpenRead(file);
+                    var read = new FormDumpReader().Read(stream, file.RelativePath, owner.Name);
+                    foreach (var warning in read.Warnings)
+                    {
+                        warnings.Add(warning);
+                    }
+
+                    var form = read.Form;
+                    if (owner.Name.Length > 0)
+                    {
+                        form = form with { Name = owner.Name };
+                    }
+
+                    // Вид формы надёжнее берётся из свойств объекта метаданных (FormType): в самом
+                    // файле формы он различим только по пространству имён.
+                    if (FormKindFromProperties(owner) is { } kind)
+                    {
+                        form = form with { Kind = kind };
+                    }
+
+                    owner.Form = form;
+                }
+                catch (Exception ex)
+                {
+                    warnings.Add($"Форма «{file.RelativePath}» не разобрана: {ex.Message}");
+                }
+            });
+    }
+
+    /// <summary>Вид формы из свойств объекта метаданных: «Managed» или «Ordinary».</summary>
+    private static FormKind? FormKindFromProperties(MdObject owner) => owner.GetProperty("FormType")?.Trim() switch
+    {
+        "Managed" or "Управляемая" => FormKind.Managed,
+        "Ordinary" or "Обычная" => FormKind.Ordinary,
+        _ => null,
+    };
 
     private static void AttachRoleRights(
         IDumpSource source,

@@ -125,6 +125,55 @@ public sealed class McpServerTests
     }
 
     [Fact]
+    public async Task Карточка_формы_показывает_реквизиты_элементы_команды_и_обработчики()
+    {
+        var session = new AnalysisSession(new AnalysisRequest(), FormSampleDump.Create());
+
+        var responses = await ExchangeAsync(
+            session,
+            InitializeKnown,
+            ToolCall(2, "metadata", $$"""{"id":"{{FormSampleDump.FormId}}"}"""));
+
+        var payload = Json(ContentText(responses, 2));
+
+        // Существующие поля карточки не изменились, а детали формы добавлены отдельным разделом.
+        Assert.Equal("Form", Text(payload["kind"]));
+        Assert.Equal("ФормаЭлемента", Text(payload["name"]));
+        Assert.Equal("Catalog.Товары", Text(payload["parent"]));
+
+        var form = payload["form"]!;
+        Assert.Equal("Managed", Text(form["kind"]));
+        Assert.Equal(FormSampleDump.FormPath, Text(form["file"]));
+
+        var attributes = form["attributes"]!.AsArray();
+        var main = attributes.Single(attribute => Text(attribute!["name"]) == "Объект")!;
+        Assert.True(main["main"]!.GetValue<bool>());
+        Assert.Contains("Catalog.Товары", main["types"]!.AsArray().Select(Text));
+        Assert.Contains(attributes, attribute => Text(attribute!["name"]) == "Комментарий" && attribute!["main"] is null);
+
+        var element = form["elements"]!.AsArray().Single(item => Text(item!["name"]) == "Артикул")!;
+        Assert.Equal("InputField", Text(element["kind"]));
+        Assert.Equal("Объект.Артикул", Text(element["dataPath"]));
+        Assert.Equal("Объект", Text(element["attribute"]));
+
+        Assert.Equal("Печать", Text(form["commands"]!.AsArray()[0]!["handler"]));
+
+        var handlers = form["handlers"]!.AsArray();
+        var open = handlers.Single(handler => Text(handler!["procedure"]) == "ПриОткрытии")!;
+        Assert.Equal("OnOpen", Text(open["event"]));
+        Assert.Null(open["element"]);
+        Assert.Equal(2, open["line"]!.GetValue<int>());
+        Assert.True(open["resolved"]!.GetValue<bool>());
+
+        var changed = handlers.Single(handler => Text(handler!["procedure"]) == "АртикулПриИзменении")!;
+        Assert.Equal("Артикул", Text(changed["element"]));
+
+        var missing = handlers.Single(handler => Text(handler!["procedure"]) == "НетТакойПроцедуры")!;
+        Assert.False(missing["resolved"]!.GetValue<bool>());
+        Assert.Null(missing["line"]);
+    }
+
+    [Fact]
     public async Task Проверка_модуля_перечисляет_процедуры()
     {
         var responses = await ExchangeAsync(

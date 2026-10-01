@@ -116,6 +116,12 @@ public sealed class MdObject
     /// </summary>
     public string? Directory { get; internal set; }
 
+    /// <summary>
+    /// Разобранное описание формы (<c>Ext/Form.xml</c>): реквизиты, элементы, команды и обработчики.
+    /// Заполнено только для объектов-форм, у которых файл описания прочитан.
+    /// </summary>
+    public FormModel? Form { get; internal set; }
+
     public IReadOnlyList<MdObject> Children => _children;
 
     public IReadOnlyList<MdReference> References => _references;

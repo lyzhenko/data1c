@@ -191,7 +191,8 @@ public sealed class GraphQueryService : IGraphQuery
                     reference.Detail))],
             [.. obj.Modules.Select(static module => module.RelativePath)],
             children,
-            Math.Max(0, obj.Children.Count - children.Count));
+            Math.Max(0, obj.Children.Count - children.Count),
+            obj.Form);
     }
 
     private static string TopLevelId(MdObject obj)    {

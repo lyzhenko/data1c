@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Data1c.Core.Graph;
+using Data1c.Core.Metadata;
 
 namespace Data1c.Store;
 
@@ -167,6 +168,10 @@ public sealed class IndexGraphQuery : IGraphQuery
             children.AddRange(page.Items.Select(item => Item(row.Id, item, depth - 1, maxChildren)));
         }
 
+        // Описание формы читается только для самой формы: у остальных объектов его нет,
+        // а лишний запрос на каждый узел дерева карточке ни к чему.
+        var form = IsFormKind(row.Kind) ? _reader.FormDetails(row.Id) : null;
+
         return new MetadataCard(
             row.Id,
             row.Kind,
@@ -189,7 +194,8 @@ public sealed class IndexGraphQuery : IGraphQuery
                 .Select(static reference => new MetadataReferenceInfo(reference.Context, reference.TargetId, reference.Detail))],
             _reader.ModulePaths(row.Id),
             children,
-            Math.Max(0, page.Total - children.Count));
+            Math.Max(0, page.Total - children.Count),
+            form);
     }
 
     /// <summary>
@@ -230,6 +236,11 @@ public sealed class IndexGraphQuery : IGraphQuery
         typeInfo is null
             ? []
             : [.. typeInfo.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)];
+
+    /// <summary>Объект метаданных — форма: только у неё есть описание реквизитов, элементов и обработчиков.</summary>
+    private static bool IsFormKind(string kind) =>
+        string.Equals(kind, MdKind.Form.Name, StringComparison.Ordinal)
+        || string.Equals(kind, MdKind.CommonForm.Name, StringComparison.Ordinal);
 
     private static IReadOnlyDictionary<string, string> ParseProperties(string? json)
     {

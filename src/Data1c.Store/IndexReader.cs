@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using Data1c.Core.Graph;
+using Data1c.Core.Metadata;
 using Microsoft.Data.Sqlite;
 
 namespace Data1c.Store;
@@ -168,7 +169,8 @@ public sealed class IndexReader
             Scalar("SELECT COUNT(*) FROM nodes WHERE kind = 'Platform'"),
             Scalar("SELECT COUNT(*) FROM nodes WHERE is_external = 1"),
             dumpPath,
-            indexedAt);
+            indexedAt,
+            Counter("cnt_forms", "form_models"));
     });
 
     /// <summary>Счётчик из meta: считается при сборке индекса. Для старых индексов — подсчёт строк.</summary>
@@ -774,6 +776,116 @@ public sealed class IndexReader
         var total = Convert.ToInt32(count.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
         return new MetadataChildrenPage(items, total);
     });
+
+    /// <summary>
+    /// Описание формы из индекса: реквизиты, элементы, команды и обработчики событий.
+    /// Возвращает null, если формы в индексе нет (например, Ext/Form.xml отсутствовал в выгрузке).
+    /// </summary>
+    public FormModel? FormDetails(string formId)
+    {
+        if (string.IsNullOrWhiteSpace(formId))
+        {
+            return null;
+        }
+
+        return _index.WithLock(() =>
+        {
+            using (var command = _index.CreateCommand(
+                "SELECT name, form_kind, source_path FROM form_models WHERE id = @id"))
+            {
+                command.Parameters.AddWithValue("@id", formId.Trim());
+                using var reader = command.ExecuteReader();
+                if (!reader.Read())
+                {
+                    return (FormModel?)null;
+                }
+
+                var name = reader.GetString(0);
+                var kind = reader.IsDBNull(1)
+                    ? FormKind.Unknown
+                    : Enum.TryParse<FormKind>(reader.GetString(1), ignoreCase: false, out var parsed) ? parsed : FormKind.Unknown;
+                var sourcePath = reader.IsDBNull(2) ? null : reader.GetString(2);
+
+                return ReadFormItems(formId.Trim(), name, kind, sourcePath);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Строки состава формы читаются одним запросом с сохранением порядка записи: реквизиты идут
+    /// раньше элементов, поэтому привязка «элемент → реквизит» восстанавливается по DataPath.
+    /// </summary>
+    private FormModel ReadFormItems(string formId, string name, FormKind kind, string? sourcePath)
+    {
+        var attributes = new List<FormAttribute>();
+        var elements = new List<FormElement>();
+        var commands = new List<FormCommand>();
+        var handlers = new List<FormEventHandler>();
+
+        using var command = _index.CreateCommand(
+            """
+            SELECT kind, name, view_kind, data_path, type_info, handler, element_name, command_name, line, is_main, is_resolved
+            FROM form_items WHERE form_id = @id ORDER BY id
+            """);
+        command.Parameters.AddWithValue("@id", formId);
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var itemKind = reader.GetString(0);
+            var itemName = reader.GetString(1);
+            switch (itemKind)
+            {
+                case FormItemKinds.Attribute:
+                    attributes.Add(new FormAttribute(
+                        itemName,
+                        ParseTypes(reader.IsDBNull(4) ? null : reader.GetString(4)),
+                        reader.GetInt32(9) != 0));
+                    break;
+
+                case FormItemKinds.Element:
+                    elements.Add(new FormElement(
+                        itemName,
+                        reader.IsDBNull(2) ? string.Empty : reader.GetString(2),
+                        reader.IsDBNull(3) ? null : reader.GetString(3),
+                        Attribute: null,
+                        reader.IsDBNull(7) ? null : reader.GetString(7)));
+                    break;
+
+                case FormItemKinds.Command:
+                    commands.Add(new FormCommand(
+                        itemName,
+                        reader.IsDBNull(5) ? null : reader.GetString(5),
+                        reader.IsDBNull(7) ? null : reader.GetString(7)));
+                    break;
+
+                case FormItemKinds.Handler:
+                    handlers.Add(new FormEventHandler(
+                        itemName,
+                        reader.IsDBNull(6) ? null : reader.GetString(6),
+                        reader.IsDBNull(5) ? string.Empty : reader.GetString(5),
+                        reader.IsDBNull(8) ? null : reader.GetInt32(8),
+                        reader.GetInt32(10) != 0));
+                    break;
+
+                default:
+                    break;
+            }
+        }
+
+        // Связь элемента с реквизитом восстанавливается тем же правилом, что и при разборе XML.
+        var bound = new List<FormElement>(elements.Count);
+        foreach (var element in elements)
+        {
+            bound.Add(element with { Attribute = FormModel.ResolveAttribute(attributes, element.DataPath) });
+        }
+
+        return new FormModel(name, kind, sourcePath, attributes, bound, commands, handlers);
+    }
+
+    private static IReadOnlyList<string> ParseTypes(string? typeInfo) =>
+        typeInfo is null
+            ? []
+            : [.. typeInfo.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)];
 
     /// <summary>Пути модулей объекта: связи Contains ведут от объекта к его модулям.</summary>
     public IReadOnlyList<string> ModulePaths(string ownerId, int limit = 50) => _index.WithLock(() =>

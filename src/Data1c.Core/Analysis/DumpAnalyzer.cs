@@ -112,6 +112,10 @@ public sealed class DumpAnalyzer
             ? ParseModules(source, read.ModuleFiles, options, warnings, cancellationToken)
             : [];
 
+        // Обработчики формы назначаются процедурами её модуля: имена берутся из Ext/Form.xml,
+        // а строки процедур — из разобранного модуля формы, который читается позже метаданных.
+        FormModelLinker.Link(read.Model, modules);
+
         var platform = CreatePlatformIndex(options, warnings);
         var graph = new DependencyGraphBuilder().Build(read.Model, modules, options.Graph, platform);
         stopwatch.Stop();
