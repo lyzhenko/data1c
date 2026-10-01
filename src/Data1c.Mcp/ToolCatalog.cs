@@ -237,7 +237,9 @@ public sealed class ToolCatalog
     private ToolSpec NodeTool() => new(
         "node",
         "Карточка узла конфигурации: вид, имя, файл, теги и связи со строками кода. "
-        + "Кто вызывает процедуру и что вызывает она сама — в neighbors с edgeKinds=[\"Calls\"].",
+        + "Кто вызывает процедуру и что вызывает она сама — в neighbors с edgeKinds=[\"Calls\"]. "
+        + "У объекта метаданных показана короткая сводка обращений (usages): сколько раз и в каком "
+        + "контексте его читают, а читатели и примеры строк — в metadata.",
         [
             new ToolParameter("id", "string", "Идентификатор узла: Catalog.Товары, module:CommonModules/.../Module.bsl, routine:module:...#Имя.", Required: true),
             new ToolParameter("edges", "integer", "Сколько связей показать в каждую сторону (1–200, по умолчанию 40)."),
@@ -254,11 +256,19 @@ public sealed class ToolCatalog
             var incoming = details.Incoming.Take(edges).Select(edge => EdgeView(edge, edge.SourceId, query)).ToList();
             var outgoing = details.Outgoing.Take(edges).Select(edge => EdgeView(edge, edge.TargetId, query)).ToList();
 
+            // Сводка обращений нужна только объектам метаданных: обращения адресуются именно им,
+            // а полный список читателей и примеров отдаёт metadata. Списки здесь не нужны — только
+            // счётчики, поэтому лимит примеров минимальный.
+            var usages = details.Node.Kind == GraphNodeKind.MetadataObject
+                ? UsageBrief(query.GetMetadataUsages(id, limit: 1), id)
+                : null;
+
             return Render.JsonOf(new
             {
                 node = NodeView(details.Node),
                 incomingCount = details.Incoming.Count,
                 outgoingCount = details.Outgoing.Count,
+                usages,
                 incoming,
                 outgoing,
             });
@@ -419,11 +429,15 @@ public sealed class ToolCatalog
         + "типы, модули. У формы дополнительно показаны её реквизиты, элементы с привязкой DataPath, "
         + "команды и обработчики событий с именами процедур модуля формы — запросите саму форму, "
         + "например id=\"Catalog.Товары/Form.ФормаЭлемента\"; списки формы ограничивает maxChildren. "
+        + "Раздел usages показывает, кто и где читает объект: счётчики по контекстам (в коде, в запросах, "
+        + "в типах, в составе) и видам связи, топ модулей-читателей и примеры обращений со строками — "
+        + "по ним агент находит образцы работы с объектом. "
         + "Нужен, чтобы писать код по реальной структуре объекта. Пример: id=\"Catalog.Товары\".",
         [
             new ToolParameter("id", "string", "Идентификатор: Catalog.Товары, Document.Заказ, Document.Заказ/TabularSection.Строки.", Required: true),
             new ToolParameter("depth", "integer", "Глубина дерева состава (1–4, по умолчанию 3)."),
             new ToolParameter("maxChildren", "integer", "Сколько детей показывать у одного узла (1–500, по умолчанию 200)."),
+            new ToolParameter("usages", "integer", "Сколько обращений показать в разделе usages (1–500, по умолчанию 20); счётчики всегда полные."),
         ],
         async (arguments, token) =>
         {
@@ -431,6 +445,7 @@ public sealed class ToolCatalog
             var id = arguments.RequireString("id");
             var depth = arguments.GetInt("depth", 3, 1, 4);
             var maxChildren = arguments.GetInt("maxChildren", 200, 1, 500);
+            var usages = arguments.GetInt("usages", 20, 1, 500);
 
             var card = query.GetMetadata(id, depth, maxChildren);
             if (card is null)
@@ -440,7 +455,11 @@ public sealed class ToolCatalog
                 throw new ToolException($"Объект метаданных «{id}» не найден.{hint}");
             }
 
-            var root = MetadataNode(card);
+            // Обращения к объекту идут в начало карточки, до дерева состава: у крупных объектов
+            // ответ обрезается пределом длины, и раздел usages должен пережить обрезку.
+            var usageView = UsageView(query.GetMetadataUsages(card.Id, usages));
+
+            var root = MetadataNode(card, usageView);
             root["uuid"] = card.Uuid;
             root["file"] = card.SourcePath;
             root["isTopLevel"] = card.IsTopLevel;
@@ -484,6 +503,153 @@ public sealed class ToolCatalog
 
             return Render.JsonOf(root);
         });
+
+    /// <summary>
+    /// Раздел ответа «usages»: сколько раз и в каком контексте читают объект, кто читает и где
+    /// это видно. Счётчики берутся из полного набора обращений, а списки уже обрезаны лимитом.
+    /// </summary>
+    private static JsonObject UsageView(MetadataUsageSummary usage)
+    {
+        var view = new JsonObject
+        {
+            ["total"] = usage.Total,
+        };
+
+        if (usage.ByContext.Count > 0)
+        {
+            view["byContext"] = ContextsView(usage.ByContext);
+        }
+
+        if (usage.ByKind.Count > 0)
+        {
+            var kinds = new JsonArray();
+            foreach (var group in usage.ByKind)
+            {
+                kinds.Add(new JsonObject
+                {
+                    ["kind"] = group.Name,
+                    ["count"] = group.Count,
+                });
+            }
+
+            view["byKind"] = kinds;
+        }
+
+        if (usage.Readers.Count > 0)
+        {
+            var readers = new JsonArray();
+            foreach (var reader in usage.Readers)
+            {
+                readers.Add(UsageItemView(
+                    reader.SourceId,
+                    reader.Name,
+                    reader.File,
+                    reader.Count,
+                    reader.Context,
+                    reader.Line,
+                    reader.Detail));
+            }
+
+            view["readers"] = readers;
+        }
+
+        if (usage.Items.Count > 0)
+        {
+            var items = new JsonArray();
+            foreach (var item in usage.Items)
+            {
+                items.Add(UsageItemView(item.SourceId, item.Name, item.File, null, item.Context, item.Line, item.Detail));
+            }
+
+            view["items"] = items;
+        }
+
+        view["shown"] = usage.Shown;
+        return view;
+    }
+
+    /// <summary>Короткая сводка обращений для карточки узла: счётчики по контекстам и ссылка на metadata.</summary>
+    private static JsonObject UsageBrief(MetadataUsageSummary usage, string id)
+    {
+        var brief = new JsonObject
+        {
+            ["total"] = usage.Total,
+        };
+
+        if (usage.ByContext.Count > 0)
+        {
+            brief["byContext"] = ContextsView(usage.ByContext);
+        }
+
+        if (usage.Total > 0)
+        {
+            brief["hint"] = $"Подробнее — metadata с id=\"{id}\": читатели и примеры обращений.";
+        }
+
+        return brief;
+    }
+
+    /// <summary>Разбивка по контекстам с человеческими подписями: «в коде», «в запросах», «в типах».</summary>
+    private static JsonArray ContextsView(IReadOnlyList<MetadataUsageCount> contexts)
+    {
+        var view = new JsonArray();
+        foreach (var group in contexts)
+        {
+            view.Add(new JsonObject
+            {
+                ["context"] = group.Name,
+                ["label"] = MetadataRefContexts.Label(group.Name),
+                ["count"] = group.Count,
+            });
+        }
+
+        return view;
+    }
+
+    /// <summary>Одно обращение или читатель в ответе: кто, где и что именно.</summary>
+    private static JsonObject UsageItemView(
+        string sourceId,
+        string? name,
+        string? file,
+        int? count,
+        string context,
+        int? line,
+        string? detail)
+    {
+        var item = new JsonObject
+        {
+            ["source"] = sourceId,
+            ["context"] = context,
+        };
+
+        // У модуля имя совпадает с путём файла: второй раз оно не нужно, а у процедуры — нужно.
+        if (!string.IsNullOrWhiteSpace(name) && !string.Equals(name, file, StringComparison.Ordinal))
+        {
+            item["name"] = name;
+        }
+
+        if (!string.IsNullOrWhiteSpace(file))
+        {
+            item["file"] = file;
+        }
+
+        if (count is { } readerCount)
+        {
+            item["count"] = readerCount;
+        }
+
+        if (line is { } number)
+        {
+            item["line"] = number;
+        }
+
+        if (!string.IsNullOrWhiteSpace(detail))
+        {
+            item["detail"] = detail;
+        }
+
+        return item;
+    }
 
     /// <summary>
     /// Раздел ответа «form»: состав формы так, как его видит агент. Списки ограничены тем же пределом,
@@ -606,7 +772,12 @@ public sealed class ToolCatalog
     /// плоский список реквизитов не показывает, какие из них относятся к табличной части, а какие к объекту.
     /// Карточка уже ограничена глубиной, поэтому здесь только сборка JSON.
     /// </summary>
-    private static JsonObject MetadataNode(MetadataCard card)
+    /// <param name="card">Карточка объекта метаданных.</param>
+    /// <param name="usages">
+    /// Раздел обращений, который добавляется только корню карточки — до детей, чтобы он не терялся
+    /// при обрезке длинного ответа. У вложенных узлов его нет.
+    /// </param>
+    private static JsonObject MetadataNode(MetadataCard card, JsonObject? usages = null)
     {
         var node = new JsonObject
         {
@@ -634,6 +805,11 @@ public sealed class ToolCatalog
             }
 
             node["types"] = types;
+        }
+
+        if (usages is not null)
+        {
+            node["usages"] = usages;
         }
 
         if (card.Children.Count > 0)
@@ -1289,6 +1465,9 @@ public sealed class ToolCatalog
                     metadataObjects = index.MetadataObjects,
                     metadataItems = index.MetadataItems,
                     metadataRefs = index.MetadataRefs,
+                    metadataRefsCode = index.MetadataRefsCode,
+                    metadataRefsQuery = index.MetadataRefsQuery,
+                    metadataRefsByContext = index.MetadataRefsByContext,
                     forms = index.Forms,
                     platformNodes = index.PlatformNodes,
                     externalNodes = index.ExternalNodes,

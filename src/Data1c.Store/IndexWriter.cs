@@ -1188,7 +1188,7 @@ public sealed class IndexWriter
             {
                 refSource.Value = obj.Id;
                 refTarget.Value = reference.TargetId;
-                refContext.Value = ResourceContext(reference.Kind);
+                refContext.Value = MetadataRefContexts.FromReference(reference.Kind);
                 refDetail.Value = (object?)reference.Detail ?? DBNull.Value;
                 refs.ExecuteNonQuery();
                 counters.MetadataRefs++;
@@ -1392,19 +1392,6 @@ public sealed class IndexWriter
 
     private static string? Tag(GraphNode node, string key) =>
         node.Tags is not null && node.Tags.TryGetValue(key, out var value) ? value : null;
-
-    private static string ResourceContext(MdReferenceKind kind) => kind switch
-    {
-        MdReferenceKind.Type => "type",
-        MdReferenceKind.Content => "content",
-        MdReferenceKind.Field => "field",
-        MdReferenceKind.Form => "form",
-        MdReferenceKind.Template => "template",
-        MdReferenceKind.Command => "command",
-        MdReferenceKind.RoleRight => "rights",
-        MdReferenceKind.EventSource => "event",
-        _ => "other",
-    };
 
     /// <summary>Свойства объекта метаданных одним JSON-объектом: их читает карточка объекта.</summary>
     private static string? Properties(MdObject obj)

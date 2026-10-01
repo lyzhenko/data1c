@@ -88,4 +88,13 @@ public interface IGraphQuery
 
     /// <summary>Карточка объекта метаданных деревом: свойства, состав, типы, ссылки, модули.</summary>
     MetadataCard? GetMetadata(string? id, int depth = 3, int maxChildren = 200);
+
+    /// <summary>
+    /// Кто и в каком контексте обращается к объекту метаданных: счётчики по контекстам и видам связи,
+    /// топ модулей-читателей и примеры обращений. Нужна карточкам <c>metadata</c> и <c>node</c>,
+    /// чтобы агент видел, где искать примеры работы с объектом.
+    /// </summary>
+    /// <param name="id">Идентификатор объекта метаданных.</param>
+    /// <param name="limit">Предел числа примеров обращений; счётчики остаются полными.</param>
+    MetadataUsageSummary GetMetadataUsages(string? id, int limit = 20);
 }
