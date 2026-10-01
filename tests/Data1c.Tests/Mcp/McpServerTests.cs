@@ -44,7 +44,7 @@ public sealed class McpServerTests
         var responses = await ExchangeAsync(InitializeKnown, Initialized, """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""");
 
         var tools = Result(responses, 2)["tools"]!.AsArray();
-        Assert.Equal(15, tools.Count);
+        Assert.Equal(16, tools.Count);
 
         var names = tools.Select(tool => Text(tool!["name"])).ToList();
         Assert.Contains("status", names);
@@ -58,6 +58,7 @@ public sealed class McpServerTests
         Assert.Contains("check", names);
         Assert.Contains("types", names);
         Assert.Contains("rights", names);
+        Assert.Contains("conventions", names);
         Assert.Contains("reload", names);
 
         foreach (var tool in tools)
@@ -319,6 +320,54 @@ public sealed class McpServerTests
         Assert.Contains(visible, item => Text(item["name"]) == "Таблица" && Text(item["type"]) == "ТаблицаЗначений");
         Assert.Contains(visible, item => Text(item["name"]) == "Данные" && item["type"] is null);
         Assert.Contains(visible, item => Text(item["name"]) == "Результат" && item["type"] is null);
+    }
+
+    [Fact]
+    public async Task Инструмент_conventions_показывает_как_это_делают_по_индексу()
+    {
+        // Рабочий режим сервера: выгрузка на диске, ответ приходит из индекса. Пример вызова
+        // обязан содержать модуль и строку — иначе совет «так уже делают» бесполезен.
+        var root = TestDump.Materialize();
+        try
+        {
+            using var session = new AnalysisSession(new AnalysisRequest { DumpPaths = [root] });
+            await session.QueryAsync(CancellationToken.None);
+
+            var responses = await ExchangeAsync(
+                session,
+                InitializeKnown,
+                ToolCall(2, "conventions", """{"intent":"вывести сообщение пользователю"}"""));
+
+            var payload = Json(ContentText(responses, 2));
+            Assert.Equal("Сообщение пользователю", Text(payload["intent"]));
+
+            var routines = payload["routines"]!.AsArray().Select(item => item!).ToList();
+            var found = routines.Single(item => Text(item["name"]) == "ЗагрузитьДанные");
+            var module = Text(found["module"]);
+            Assert.Equal(SampleDump.SecondCommonModuleBslPath, module);
+            Assert.True(found["example"]!["line"]!.GetValue<int>() > 0);
+            Assert.Contains("ЗагрузитьДанные", Text(found["example"]!["call"]), StringComparison.Ordinal);
+            Assert.Equal("ЗагрузитьДанные", Text(found["id"]).Split('#')[^1]);
+            Assert.Contains("code", Text(payload["hint"]), StringComparison.Ordinal);
+
+            // В ответе есть и рейтинг модулей: агент видит, где в конфигурации это делают чаще.
+            var modules = payload["modules"]!.AsArray().Select(item => item!).ToList();
+            Assert.Contains(modules, item => Text(item["module"]) == "РаботаСДанными" && Text(item["path"]) == module);
+        }
+        finally
+        {
+            TestDump.Remove(root);
+        }
+    }
+
+    [Fact]
+    public async Task Инструмент_conventions_без_аргументов_подсказывает_что_указать()
+    {
+        var responses = await ExchangeAsync(ToolCall(2, "conventions", "{}"));
+
+        Assert.True(responses.Single(item => Text(item["id"]) == "2")["result"]!["isError"]!.GetValue<bool>());
+        Assert.Contains("intent", ContentText(responses, 2), StringComparison.Ordinal);
+        Assert.Contains("platform", ContentText(responses, 2), StringComparison.Ordinal);
     }
 
     [Fact]

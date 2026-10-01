@@ -18,6 +18,7 @@ using Data1c.Store;
 //   --module <путь>  модуль для замера частичной переиндексации
 //   --no-external    не включать внешние узлы в индекс (меньше размер, меньше связей)
 //   --platform       подключать справку платформы при разборе
+//   --conventions    замерить разбор конвенций: рейтинг модулей и процедур, типовые приёмы
 //
 // Нормы (выгрузка УНФ 2,9 ГБ, 65 045 файлов): разбор ~20 с, запись ~80 с, индекс ~3,0 ГБ;
 // частичная переиндексация модуля ~1 с; поиск по имени единицы миллисекунд, по подстроке — десятки.
@@ -106,6 +107,37 @@ Measure("объекты по синониму", () => reader.FindMetadataObjects
 Measure("состав объекта метаданных", () => reader.MetadataChildren("Catalog.Номенклатура", 200).Items.Count);
 Measure("карточка узла со связями", () => (reader.Incoming("Catalog.Номенклатура", null, 200).Count + reader.Outgoing("Catalog.Номенклатура", null, 200).Count));
 Measure("обход связей (глубина 2)", () => reader.Reach("Catalog.Номенклатура", 2, 200).Count);
+
+if (Has("--conventions"))
+{
+    Console.WriteLine();
+    Console.WriteLine("конвенции (Э2-6):");
+    var conventions = reader.ConventionQuery();
+    Measure("рейтинг процедур (топ 50)", () => reader.RankRoutines(50).Count);
+    Measure("кто вызывает Записать", () => reader.PlatformMatches("Записать", 50).Count);
+    Measure("кто вызывает Запрос.Выполнить", () => reader.PlatformMatches("Запрос.Выполнить", 50).Count);
+    Measure("кто вызывает Структура.Вставить", () => reader.PlatformMatches("Структура.Вставить", 50).Count);
+    Measure("символы топ-50 процедур", () => reader.SymbolsOf([.. reader.RankRoutines(50).Select(static item => item.RoutineId)]).Count);
+    Measure("намерение «записать объект»", () => Conventions.Suggest(conventions, "записать объект", null, 8).Routines.Count);
+    Measure("намерение «прочитать данные запросом»", () => Conventions.Suggest(conventions, "прочитать данные запросом", null, 8).Routines.Count);
+    Measure("намерение «вывести сообщение»", () => Conventions.Suggest(conventions, "вывести сообщение пользователю", null, 8).Routines.Count);
+    Measure("намерение «найти по наименованию»", () => Conventions.Suggest(conventions, "найти по наименованию", null, 8).Routines.Count);
+
+    var answer = Conventions.Suggest(conventions, "записать объект", null, 5);
+    Console.WriteLine();
+    Console.WriteLine($"  приём: {answer.Intent}");
+    foreach (var routine in answer.Routines)
+    {
+        Console.WriteLine($"    {routine.Name,-40} {routine.ModulePath}  вызовов {routine.Uses}, пример {routine.ExampleLine}");
+    }
+
+    var method = Conventions.Suggest(conventions, null, "Записать", 5);
+    Console.WriteLine($"  метод «Записать»: процедур {method.Routines.Count}, примеров вызова {method.CallSites.Count}");
+    foreach (var call in method.CallSites.Take(5))
+    {
+        Console.WriteLine($"    {call.ModulePath}:{call.Line}  {call.Detail}");
+    }
+}
 
 if (withPlatform)
 {
