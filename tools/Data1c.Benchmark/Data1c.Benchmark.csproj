@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>data1c-benchmark</AssemblyName>
+    <RootNamespace>Data1c.Benchmark</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Data1c.Core\Data1c.Core.csproj" />
+    <ProjectReference Include="..\..\src\Data1c.FileSystem\Data1c.FileSystem.csproj" />
+    <ProjectReference Include="..\..\src\Data1c.Store\Data1c.Store.csproj" />
+  </ItemGroup>
+
+</Project>

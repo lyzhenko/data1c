@@ -61,7 +61,17 @@ public sealed class SqliteIndex : IDisposable
             Pooling = false,
         }.ToString());
 
+        // Размер страницы задаётся до первой записи в файл: на миллионах строк связей крупная
+        // страница уменьшает глубину B-дерева. Существующий индекс своей страницы не меняет.
+        var fresh = !File.Exists(path);
         connection.Open();
+        if (fresh)
+        {
+            using var pageSize = connection.CreateCommand();
+            pageSize.CommandText = "PRAGMA page_size=8192";
+            pageSize.ExecuteNonQuery();
+        }
+
         var index = new SqliteIndex(path, connection, readOnly: false);
         index.ApplyPragmas();
         index.EnsureSchema();

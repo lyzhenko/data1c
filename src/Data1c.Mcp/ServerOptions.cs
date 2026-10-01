@@ -54,6 +54,12 @@ public sealed record ServerOptions
     /// <summary>Период наблюдения за выгрузкой в секундах; 0 — не наблюдать.</summary>
     public int WatchSeconds { get; init; }
 
+    /// <summary>
+    /// Держать в индексе внешние цели (вызовы, которые не удалось разрешить). Выключено —
+    /// индекс меньше, но у неразрешённых вызовов не остаётся узла-цели.
+    /// </summary>
+    public bool IncludeExternal { get; init; } = true;
+
     public const string Usage = """
         Data1c.Mcp — MCP-сервер над библиотекой Data1c.Core (stdio, JSON-RPC 2.0).
 
@@ -70,6 +76,8 @@ public sealed record ServerOptions
           --no-index             не использовать индекс: разбирать выгрузку в память при каждом запуске
           --watch <секунды>      следить за выгрузкой: при изменениях файлов индекс пересобирается сам
                                  (по умолчанию выключено)
+          --no-external           не держать в индексе внешние цели: индекс меньше, но у вызовов,
+                                 которые не удалось разрешить, не будет узла-цели
           --platform             подключить справку установленной платформы 1С (.hbk)
           --locale <код>         язык справочных файлов платформы (по умолчанию ru)
           --platform-root <путь> каталог установленных платформ (можно повторять)
@@ -100,6 +108,7 @@ public sealed record ServerOptions
         string? indexPath = null;
         var useIndex = true;
         var watchSeconds = 0;
+        var includeExternal = true;
 
         for (var index = 0; index < args.Length; index++)
         {
@@ -145,6 +154,10 @@ public sealed record ServerOptions
 
                 case "--no-index":
                     useIndex = false;
+                    break;
+
+                case "--no-external":
+                    includeExternal = false;
                     break;
 
                 case "--watch":
@@ -226,6 +239,7 @@ public sealed record ServerOptions
                 IndexPath = indexPath,
                 UseIndex = useIndex,
                 WatchSeconds = watchSeconds,
+                IncludeExternal = includeExternal,
             },
             false,
             null);

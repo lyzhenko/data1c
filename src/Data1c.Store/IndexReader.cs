@@ -951,14 +951,14 @@ public sealed class IndexReader
             var found = new List<(string Id, string Kind, string Name, string? Synonym)>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
 
-            void Collect(string condition, string? pattern, int take)
+            void Collect(string condition, string? pattern, int take, bool substring = false)
             {
                 if (take <= 0)
                 {
                     return;
                 }
 
-                foreach (var row in QueryMetadataObjects(condition, lower, pattern, take))
+                foreach (var row in QueryMetadataObjects(condition, lower, pattern, take, substring))
                 {
                     if (seen.Add(row.Id))
                     {
@@ -967,9 +967,18 @@ public sealed class IndexReader
                 }
             }
 
+            // Ступени идут по возрастанию цены и прерываются, как только набралось достаточно:
+            // просмотр по подстроке стоит скана всех 84 тысяч объектов.
             Collect("name_lower = @exact OR synonym_lower = @exact", null, bounded);
-            Collect(@"name_lower LIKE @prefix ESCAPE '\' OR synonym_lower LIKE @prefix ESCAPE '\'", EscapeLike(lower) + "%", bounded);
-            Collect(@"name_lower LIKE @like ESCAPE '\' OR synonym_lower LIKE @like ESCAPE '\'", "%" + EscapeLike(lower) + "%", bounded);
+            if (found.Count < bounded)
+            {
+                Collect(@"name_lower LIKE @prefix ESCAPE '\' OR synonym_lower LIKE @prefix ESCAPE '\'", EscapeLike(lower) + "%", bounded);
+            }
+
+            if (found.Count == 0)
+            {
+                Collect(@"name_lower LIKE @like ESCAPE '\' OR synonym_lower LIKE @like ESCAPE '\'", "%" + EscapeLike(lower) + "%", bounded, substring: true);
+            }
 
             return (IReadOnlyList<(string, string, string, string?)>)
             [
@@ -987,17 +996,21 @@ public sealed class IndexReader
         string condition,
         string lower,
         string? pattern,
-        int limit)
+        int limit,
+        bool substring = false)
     {
+        // Для подстроки порядок задаётся в C#: сортировка в SQL заставила бы просмотреть все объекты.
+        var candidates = substring ? Math.Clamp(limit * 12, 64, 2000) : limit;
+        var order = substring ? string.Empty : "ORDER BY length(name), name ";
         using var command = _index.CreateCommand(
             $"""
              SELECT id, kind, name, synonym FROM metadata_objects
              WHERE {condition}
-             ORDER BY length(name), name LIMIT @limit
+             {order}LIMIT @limit
              """);
         command.Parameters.AddWithValue("@exact", lower);
         command.Parameters.AddWithValue("@lower", lower);
-        command.Parameters.AddWithValue("@limit", limit);
+        command.Parameters.AddWithValue("@limit", candidates);
         if (pattern is not null)
         {
             command.Parameters.AddWithValue(condition.Contains("@prefix", StringComparison.Ordinal) ? "@prefix" : "@like", pattern);

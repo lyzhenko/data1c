@@ -49,6 +49,7 @@ internal static class Program
             PlatformRoots = options.PlatformRoots,
             IndexPath = options.IndexPath,
             UseIndex = options.UseIndex,
+            IncludeExternal = options.IncludeExternal,
         });
 
         // Готовый индекс означает, что разбор в память при старте не нужен: инструменты

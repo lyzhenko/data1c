@@ -41,6 +41,12 @@ public sealed record AnalysisRequest
     /// только читать. Выключено — работает старый путь с разбором в память.
     /// </summary>
     public bool UseIndex { get; init; } = true;
+
+    /// <summary>
+    /// Держать в индексе внешние цели — узлы для вызовов, которые не удалось разрешить.
+    /// Выключено — индекс заметно меньше, но у неразрешённых вызовов не остаётся узла-цели.
+    /// </summary>
+    public bool IncludeExternal { get; init; } = true;
 }
 
 /// <summary>
@@ -376,7 +382,7 @@ public sealed class AnalysisSession : IDisposable
             IncludeRoutines = _request.IncludeBsl,
             IncludeCalls = _request.IncludeBsl && _request.IncludeCalls,
             IncludeMetadataAccess = _request.IncludeBsl,
-            IncludeExternalNodes = true,
+            IncludeExternalNodes = _request.IncludeExternal,
         },
     };
 
