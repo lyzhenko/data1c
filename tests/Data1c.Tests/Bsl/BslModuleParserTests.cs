@@ -373,6 +373,46 @@ public sealed class BslModuleParserTests
     }
 
     [Fact]
+    public void ПроцедурыВнутриДирективПрепроцессораНаходятся()
+    {
+        // В реальных выгрузках почти весь код обёрнут в #Если. Раньше заголовки внутри них
+        // не разбирались: модуль оставался без символов, а строка «Процедура Метод(Отказ)»
+        // попадала в вызовы. Проверяем и объединение одноимённых ветвей.
+        var text = """
+            #Если Сервер Тогда
+            Процедура Обработка(Отказ)
+                Сообщить("сервер");
+            КонецПроцедуры
+            #Иначе
+            Процедура Обработка(Отказ)
+                Сообщить("клиент");
+            КонецПроцедуры
+            #КонецЕсли
+
+            #Если Клиент Тогда
+            Функция Значение() Экспорт
+                Возврат 1;
+            КонецФункции
+            #КонецЕсли
+            """;
+
+        var info = Парсер().Parse(Модуль(text));
+
+        // Ветви одного #Если дают одну процедуру, вызовы обеих ветвей остаются при ней.
+        Assert.Equal(2, info.Routines.Count);
+        var handler = Assert.Single(info.Routines, static routine => routine.Name == "Обработка");
+        Assert.Equal(BslRoutineKind.Procedure, handler.Kind);
+        Assert.Equal(new[] { "Отказ" }, handler.Parameters);
+        Assert.Equal(2, handler.Calls.Count);
+        Assert.DoesNotContain(info.Diagnostics, static diagnostic => diagnostic.Kind == BslDiagnosticKind.DuplicateRoutine);
+
+        var value = Assert.Single(info.Routines, static routine => routine.Name == "Значение");
+        Assert.Equal(BslRoutineKind.Function, value.Kind);
+        Assert.True(value.IsExport);
+        Assert.True(value.StartLine > handler.StartLine);
+    }
+
+    [Fact]
     public void ВложеннаяПроцедураЗакрываетПредыдущуюИДаётДиагностику()
     {
         // Вложенные процедуры в 1С запрещены: разбор не должен падать на таком тексте.

@@ -121,7 +121,7 @@ public sealed class BslModuleParser : IBslModuleParser
                     break;
 
                 case BslTokenKind.Identifier when IsRoutineKeyword(token):
-                case BslTokenKind.Keyword when IsRoutineKeyword(token) && _conditionalDepth == 0:
+                case BslTokenKind.Keyword when IsRoutineKeyword(token):
                     HandleRoutineHeader();
                     break;
 
@@ -176,9 +176,29 @@ public sealed class BslModuleParser : IBslModuleParser
             }
         }
 
+        // Одна и та же процедура может быть объявлена в нескольких ветках #Если (клиентская и серверная
+        // реализации). Такие объявления объединяем в первое: иначе идентификаторы узлов вида
+        // routine:модуль#Имя совпали бы, а вызовы из второй ветви потерялись бы. Повтор имени
+        // в обычном коде не объединяем — это ошибка, и обе процедуры должны быть видны.
+        var routineIndexByName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (var finished in _finished)
         {
-            _routines.Add(finished.Frame.ToRoutine(finished.EndLine));
+            var routine = finished.Frame.ToRoutine(finished.EndLine);
+            if (finished.Frame.Conditional && routineIndexByName.TryGetValue(routine.Name, out var known))
+            {
+                var first = _routines[known];
+                _routines[known] = first with
+                {
+                    EndLine = Math.Max(first.EndLine, routine.EndLine),
+                    Calls = [.. first.Calls, .. routine.Calls],
+                    MetadataAccesses = [.. first.MetadataAccesses, .. routine.MetadataAccesses],
+                    QueryReferences = [.. first.QueryReferences, .. routine.QueryReferences],
+                };
+                continue;
+            }
+
+            routineIndexByName[routine.Name] = _routines.Count;
+            _routines.Add(routine);
         }
 
         // Символы и типы строятся по тем же токенам, что и разбор: отдельного прохода по тексту нет.
@@ -381,7 +401,9 @@ public sealed class BslModuleParser : IBslModuleParser
             return;
         }
 
-        if (!_routineLines.TryAdd(frame.Name, frame.StartLine))
+        // Повтор имени внутри ветвей #Если — это не ошибка: так пишут клиентскую и серверную
+        // реализации одной процедуры. Ошибкой остаётся повтор в обычном коде.
+        if (!_routineLines.TryAdd(frame.Name, frame.StartLine) && !frame.Conditional)
         {
             _diagnostics.Add(new BslDiagnostic(
                 BslDiagnosticKind.DuplicateRoutine,
@@ -490,6 +512,7 @@ public sealed class BslModuleParser : IBslModuleParser
             Region = _regionStack.Count > 0 ? _regionStack.Peek().Name : null,
             Depth = _regionStack.Count,
             RequiredParameterCount = required,
+            Conditional = _conditionalDepth > 0,
         };
         return true;
     }
@@ -1176,6 +1199,12 @@ public sealed class BslModuleParser : IBslModuleParser
         public string? Region { get; init; }
 
         public int Depth { get; init; }
+
+        /// <summary>
+        /// Заголовок объявлен внутри директив препроцессора: одна и та же процедура может встретиться
+        /// в нескольких ветках <c>#Если</c> (клиентская и серверная реализации).
+        /// </summary>
+        public bool Conditional { get; init; }
 
         public List<BslCall> Calls { get; } = [];
 
