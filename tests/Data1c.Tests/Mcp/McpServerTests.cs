@@ -341,6 +341,13 @@ public sealed class McpServerTests
             var payload = Json(ContentText(responses, 2));
             Assert.Equal("Сообщение пользователю", Text(payload["intent"]));
 
+            // Распознавание объясняется в ответе: ступень, слова, вес и готовая фраза для агента.
+            var recognition = payload["recognition"]!;
+            Assert.Equal("keywords", Text(recognition["step"]));
+            Assert.Equal("вывести сообщение пользователю", Text(recognition["intentId"]));
+            Assert.Contains("сообщение", recognition["keywords"]!.AsArray().Select(Text), StringComparer.OrdinalIgnoreCase);
+            Assert.Contains("распознан", Text(recognition["summary"]), StringComparison.Ordinal);
+
             var routines = payload["routines"]!.AsArray().Select(item => item!).ToList();
             var found = routines.Single(item => Text(item["name"]) == "ЗагрузитьДанные");
             var module = Text(found["module"]);
