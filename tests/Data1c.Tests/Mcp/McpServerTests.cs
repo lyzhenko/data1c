@@ -44,7 +44,7 @@ public sealed class McpServerTests
         var responses = await ExchangeAsync(InitializeKnown, Initialized, """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""");
 
         var tools = Result(responses, 2)["tools"]!.AsArray();
-        Assert.Equal(13, tools.Count);
+        Assert.Equal(14, tools.Count);
 
         var names = tools.Select(tool => Text(tool!["name"])).ToList();
         Assert.Contains("status", names);
