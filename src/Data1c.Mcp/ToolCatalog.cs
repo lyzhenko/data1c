@@ -9,6 +9,7 @@ using Data1c.Core.Graph;
 using Data1c.Core.Metadata;
 using Data1c.Core.Platform;
 using Data1c.FileSystem;
+using Data1c.Store;
 
 namespace Data1c.Mcp;
 
@@ -607,28 +608,36 @@ public sealed class ToolCatalog
 
     private ToolSpec CheckTool() => new(
         "check",
-        "Структурная проверка одного модуля BSL прямо с диска (без 1С): процедуры, области, вызовы, "
-        + "обращения к метаданным и замечания разбора. Вызывайте после правки модуля.",
+        "Проверка модуля BSL без запуска 1С: структура (процедуры, области, вызовы, обращения к метаданным) "
+        + "и замечания с номерами строк — неизвестные процедуры, неверное число аргументов, отсутствующие "
+        + "объекты метаданных, неиспользуемые переменные и параметры, функция без «Возврат», код после «Возврат». "
+        + "Принимает path или id модуля из выгрузки либо text — черновик, которого в выгрузке ещё нет: "
+        + "проверяйте text перед вставкой кода в Конфигуратор.",
         [
             new ToolParameter("path", "string", "Путь файла модуля внутри выгрузки."),
             new ToolParameter("id", "string", "Идентификатор узла, если путь неизвестен."),
+            new ToolParameter("text", "string", "Текст черновика модуля: проверяется без файла в выгрузке (главный сценарий)."),
             new ToolParameter("calls", "boolean", "Показать список вызовов модуля."),
         ],
         async (arguments, token) =>
         {
+            var draft = arguments.GetString("text");
             var path = arguments.GetString("path");
-            if (path is null)
+            if (draft is null && path is null)
             {
-                var query = await QueryAsync(token);
                 var id = arguments.RequireString("id");
+                var query = await QueryAsync(token);
                 var node = query.FindNode(id) ?? throw new ToolException(
                     $"Узел «{id}» не найден. Уточните идентификатор инструментом search.");
 
                 path = node.SourcePath ?? throw new ToolException($"У узла «{id}» нет файла модуля.");
             }
 
-            var text = ReadFresh(path);
-            var module = new BslModuleParser().Parse(new BslModuleSource(path, text));
+            // Черновик проверяется без файла на диске; path в этом случае — только подпись места,
+            // куда код собираются вставить.
+            var modulePath = path is null ? DraftCheck.DefaultModulePath : DumpPath.Normalize(path);
+            var text = draft ?? ReadFresh(modulePath);
+            var module = new BslModuleParser().Parse(new BslModuleSource(modulePath, text));
             var showCalls = arguments.GetBool("calls", false);
 
             // Вызовы и обращения внутри процедур лежат в описании процедуры, а не модуля,
@@ -643,9 +652,13 @@ public sealed class ToolCatalog
                 .Concat(module.Routines.SelectMany(static routine => routine.MetadataAccesses))
                 .ToList();
 
+            var (checker, contextName) = await CreateDraftCheckAsync(token).ConfigureAwait(false);
+            var check = checker.Check(text, modulePath);
+
             return Render.JsonOf(new
             {
                 path = module.Path,
+                source = draft is null ? "file" : "text",
                 lines = module.LineCount,
                 routines = module.Routines.Select(routine => new
                 {
@@ -679,8 +692,64 @@ public sealed class ToolCatalog
                     message = diagnostic.Message,
                     line = diagnostic.Line,
                 }).ToList(),
+                problems = check.Problems.Select(static problem => new
+                {
+                    line = problem.Line,
+                    severity = problem.Severity.ToString(),
+                    code = problem.Kind.ToString(),
+                    message = problem.Message,
+                    hint = problem.Hint,
+                }).ToList(),
+                problemsCount = check.Problems.Count,
+                problemsBySeverity = new
+                {
+                    errors = check.Count(DraftProblemSeverity.Error),
+                    warnings = check.Count(DraftProblemSeverity.Warning),
+                    infos = check.Count(DraftProblemSeverity.Info),
+                },
+                context = contextName,
+                notes = check.Notes.Count > 0 ? check.Notes : null,
             });
         });
+
+    /// <summary>
+    /// Готовит проверку черновика: факты о конфигурации берутся из индекса, а если его нет — из уже
+    /// готового разбора в памяти. Разбор специально не запускается: check должен отвечать быстро,
+    /// но если он уже идёт, подождём совсем немного.
+    /// </summary>
+    private async Task<(DraftCheck Checker, string? ContextName)> CreateDraftCheckAsync(CancellationToken cancellationToken)
+    {
+        if (Session.GetIndexReader() is { } reader)
+        {
+            return (new DraftCheck(new IndexDraftContext(reader), Session.Platform), "индекс");
+        }
+
+        var result = Session.Result ?? await WaitForAnalysisAsync(cancellationToken).ConfigureAwait(false);
+        return result is null
+            ? (new DraftCheck(null, Session.Platform), null)
+            : (new DraftCheck(new AnalysisDraftContext(result), Session.Platform), "разбор в памяти");
+    }
+
+    /// <summary>Короткое ожидание разбора, который уже идёт: иначе проверка обойдётся без конфигурации.</summary>
+    private async Task<AnalysisResult?> WaitForAnalysisAsync(CancellationToken cancellationToken)
+    {
+        if (!Session.IsOpen || !Session.IsRunning)
+        {
+            return Session.Result;
+        }
+
+        try
+        {
+            return await Session
+                .GetAsync(cancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(3), cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            return Session.Result;
+        }
+    }
 
     private ToolSpec ReloadTool() => new(
         "reload",
