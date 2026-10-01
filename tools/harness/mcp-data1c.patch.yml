@@ -7,7 +7,7 @@
 # После правки профиль нужно перечитать: перезапустите harness.
 #
 # Инструменты сервера появятся у модели как mcp__data1c__<имя>:
-#   status, open, search, node, neighbors, code, metadata, platform, check, reload.
+#   status, open, search, grep, node, neighbors, code, metadata, platform, check, reload.
 #
 # Путь к выгрузке здесь намеренно не указан: агент открывает нужную выгрузку
 # инструментом open, поэтому одна и та же строка работает для любого проекта.
@@ -22,8 +22,12 @@
         args:
           - 'C:\Users\alexa\RiderProjects\Data1C\src\Data1c.Mcp\bin\Release\net10.0\Data1c.Mcp.dll'
           - '--platform'
-        # Первый вызов, которому нужен разбор (search, metadata, node), на большой
-        # выгрузке идёт минуты, поэтому таймаут увеличен. Поиск по тексту (grep)
-        # разбор не ждёт: у него свой предел waitMs.
-        toolCallTimeoutMs: 1800000
+          # Наблюдение за выгрузкой: новая выгрузка подхватывается сама, индекс
+          # пересобирается в фоне. Уберите ключ, если индекс обновляется вручную.
+          - '--watch'
+          - '60'
+        # Индекс строится при первом обращении (на выгрузке 2,9 ГБ около 100 с), дальше
+        # инструменты отвечают за миллисекунды: search 63 мс, node 16 мс, metadata 1 мс,
+        # grep 0,4 с. Запас по времени оставлен на первую сборку.
+        toolCallTimeoutMs: 600000
         failOnStartupError: false
