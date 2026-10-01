@@ -114,9 +114,51 @@ public sealed class PlatformCheckRunner
     }
 
     /// <summary>
+    /// Готовит базу: создаёт её при необходимости и загружает конфигурацию из выгрузки, не запуская
+    /// проверку. Так дорогую часть (на выгрузке 2,9 ГБ — около 14 минут) можно выполнить заранее,
+    /// а саму проверку запустить потом ключом <c>--check-only</c>.
+    /// </summary>
+    public (TimeSpan Create, TimeSpan Load) Prepare(string dumpPath, string infobasePath, TimeSpan? loadTimeout = null)
+    {
+        var dump = Path.GetFullPath(dumpPath);
+        var infobase = Path.GetFullPath(infobasePath);
+        RequireNoSpaces(dump, "выгрузка");
+        RequireNoSpaces(infobase, "информационная база");
+
+        if (!File.Exists(Path.Combine(dump, "Configuration.xml")))
+        {
+            throw new FileNotFoundException($"В выгрузке нет Configuration.xml: {dump}");
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(infobase)!);
+        var dataFile = Path.Combine(infobase, "1cv8.1CD");
+
+        var create = TimeSpan.Zero;
+        if (!File.Exists(dataFile))
+        {
+            _log?.Invoke("создаю файловую информационную базу");
+            create = RunOneC(
+                ["CREATEINFOBASE", $"File={infobase};", "/Out", LogPath(infobase, "create"), "/DisableStartupDialogs", "/DisableStartupMessages"],
+                TimeSpan.FromMinutes(5));
+        }
+        else
+        {
+            _log?.Invoke("информационная база уже есть");
+        }
+
+        _log?.Invoke("загружаю конфигурацию из файлов (на большой выгрузке это 10–15 минут)");
+        var load = RunOneC(
+            ["DESIGNER", "/F", infobase, "/LoadConfigFromFiles", dump, "/Out", LogPath(infobase, "load"), "/DisableStartupDialogs", "/DisableStartupMessages"],
+            loadTimeout ?? TimeSpan.FromMinutes(60));
+
+        return (create, load);
+    }
+
+    /// <summary>
     /// Проверяет выгрузку. База создаётся при необходимости, конфигурация загружается в неё, если
     /// база старше самого свежего файла выгрузки; при <paramref name="reuse"/> загрузка не делается
-    /// и в итоге отмечается, что проверялась прежняя конфигурация.
+    /// и в итоге отмечается, что проверялась прежняя конфигурация. При <paramref name="checkOnly"/>
+    /// устаревшая база не допускается вовсе: иначе проверка молча подтвердила бы старый код.
     /// </summary>
     public PlatformCheckOutcome Run(
         string dumpPath,
@@ -124,7 +166,8 @@ public sealed class PlatformCheckRunner
         PlatformCheckMode mode = PlatformCheckMode.Config,
         bool reuse = false,
         TimeSpan? timeout = null,
-        TimeSpan? loadTimeout = null)
+        TimeSpan? loadTimeout = null,
+        bool checkOnly = false)
     {
         var dump = Path.GetFullPath(dumpPath);
         var infobase = Path.GetFullPath(infobasePath);
@@ -157,6 +200,13 @@ public sealed class PlatformCheckRunner
         // не трогает Configuration.xml, поэтому сравнения только с ним недостаточно.
         var newest = NewestWriteTime(dump);
         var stale = !File.Exists(dataFile) || File.GetLastWriteTimeUtc(dataFile) < newest;
+
+        if (checkOnly && stale)
+        {
+            throw new InvalidOperationException(
+                "База старше выгрузки: сначала выполните подготовку (--prepare), иначе проверка подтвердила бы прежний код.");
+        }
+
         var skipLoad = reuse && stale;
 
         TimeSpan? loadTime = null;

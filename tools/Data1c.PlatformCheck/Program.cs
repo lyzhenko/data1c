@@ -11,6 +11,8 @@ using Data1c.Core.Platform;
 //   --one-c <путь>      путь к 1cv8.exe, если платформа не находится автоматически
 //   --modules           быстрая проверка модулей (/CheckModules): секунды, но ошибок в коде НЕ находит
 //   --config            проверка конфигурации (/CheckConfig) — по умолчанию; 5–10 минут, ловит ошибки
+//   --prepare           только создать базу и загрузить конфигурацию (дорогая часть), проверку не запускать
+//   --check-only        проверить уже подготовленную базу и отказаться, если она старше выгрузки
 //   --reuse             не перечитывать конфигурацию в базу, даже если выгрузка новее (итог помечается)
 //   --json              напечатать итог в JSON
 //   --clean             удалить каталог базы после проверки
@@ -21,6 +23,11 @@ using Data1c.Core.Platform;
 //
 // Замеры на выгрузке 2,9 ГБ: создание базы 4 с, загрузка конфигурации 844 с, проверка 430 с.
 // Проверка модулей синтаксических ошибок не находит — это проверено внесением заведомой ошибки.
+// Дешёвого пути нет и это проверено отдельно: `CheckConfig -ConfigDir <файлы>` ошибок в коде
+// не находит (484 с, та же картина, что у загруженной конфигурации), а частичная загрузка
+// `LoadConfigFromFiles -ListFile <файл>` отклоняется платформой («редактирование объекта
+// метаданных запрещено»). Поэтому правку модулей проверяет офлайн-`check`, а платформа —
+// финальный фильтр: `--prepare` заранее, `--check-only` после него.
 
 var dump = Value("--dump");
 if (dump is null)
@@ -45,7 +52,19 @@ Console.WriteLine();
 try
 {
     var runner = new PlatformCheckRunner(Value("--one-c"), message => Console.WriteLine("  " + message));
-    var outcome = runner.Run(dump, infobase, mode, reuse, timeout, loadTimeout);
+
+    if (Has("--prepare"))
+    {
+        var prepared = runner.Prepare(dump, infobase, loadTimeout);
+        Console.WriteLine();
+        Console.WriteLine($"создание базы:          {prepared.Create.TotalSeconds,8:F1} с");
+        Console.WriteLine($"загрузка конфигурации:  {prepared.Load.TotalSeconds,8:F1} с");
+        Console.WriteLine();
+        Console.WriteLine("база подготовлена: проверку можно запустить ключом --check-only");
+        return 0;
+    }
+
+    var outcome = runner.Run(dump, infobase, mode, reuse, timeout, loadTimeout, Has("--check-only"));
 
     Console.WriteLine();
     Console.WriteLine($"создание базы:          {outcome.CreateTime.TotalSeconds,8:F1} с");
