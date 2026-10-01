@@ -42,6 +42,7 @@ public sealed class ToolCatalog
             MetadataTool(),
             PlatformTool(),
             CheckTool(),
+            TypesTool(),
             ReloadTool(),
         ];
     }
@@ -750,6 +751,123 @@ public sealed class ToolCatalog
             return Session.Result;
         }
     }
+
+    private ToolSpec TypesTool() => new(
+        "types",
+        "Таблица символов модуля BSL и консервативный вывод типов: объявления (переменные модуля, параметры, "
+        + "локальные переменные) с позициями и областью видимости, выведенные типы, вызовы, разрешённые как методы "
+        + "платформы, и места, где тип вывести не удалось. Вызывайте перед правкой кода, чтобы понимать типы "
+        + "переменных. Пример: id=\"routine:module:CommonModules/ОбщегоНазначения/Ext/Module.bsl#МояПроцедура\".",
+        [
+            new ToolParameter("path", "string", "Путь файла модуля внутри выгрузки."),
+            new ToolParameter("id", "string", "Идентификатор узла модуля или процедуры, если путь неизвестен."),
+            new ToolParameter("line", "integer", "Строка модуля: дополнительно вернуть имена, видимые в этой строке, с типами."),
+            new ToolParameter("limit", "integer", "Сколько объявлений, типов и вызовов показать (1–500, по умолчанию 200)."),
+        ],
+        async (arguments, token) =>
+        {
+            var path = arguments.GetString("path");
+            if (path is null)
+            {
+                var query = await QueryAsync(token);
+                var id = arguments.RequireString("id");
+                var node = query.FindNode(id) ?? throw new ToolException(
+                    $"Узел «{id}» не найден. Уточните идентификатор инструментом search.");
+
+                path = node.SourcePath ?? throw new ToolException($"У узла «{id}» нет файла модуля.");
+            }
+
+            var limit = arguments.GetInt("limit", 200, 1, 500);
+            var line = arguments.GetInt("line", 0, 0, int.MaxValue);
+
+            // Модуль читается с диска заново: агент правит код и хочет видеть текущий текст,
+            // а не разобранный при старте сервера.
+            var text = ReadFresh(path);
+            var module = new BslModuleParser().Parse(new BslModuleSource(path, text));
+            var symbols = module.Symbols ?? SymbolTable.Build(module.Routines, BslLexer.Tokenize(text), module.LineCount);
+            var types = module.Types ?? TypeInference.Infer(module, symbols, BslLexer.Tokenize(text));
+
+            return Render.JsonOf(new
+            {
+                path = module.Path,
+                lines = module.LineCount,
+                note = "Типы выведены консервативно: «Новый X», «Новый(\"X\")», «ОписаниеТипов(…)», "
+                    + "«X.Создать()»/«X.Скопировать()», присваивание известного типа и типы параметров по аргументам "
+                    + "вызовов этого модуля. Поток данных не считается: ветвления и порядок вызовов не анализируются.",
+                routines = module.Routines.Select(routine => new
+                {
+                    name = routine.Name,
+                    kind = routine.Kind.ToString(),
+                    export = routine.IsExport,
+                    lines = $"{routine.StartLine}-{routine.EndLine}",
+                    parameters = routine.Parameters,
+                }).ToList(),
+                symbolsCount = symbols.Symbols.Count,
+                symbols = symbols.Symbols.Take(limit).Select(symbol => new
+                {
+                    name = symbol.Name,
+                    kind = symbol.Kind.ToString(),
+                    scope = symbol.Scope.ToString(),
+                    routine = symbol.Routine,
+                    line = symbol.Line,
+                    column = symbol.Column,
+                    export = symbol.IsExport ? true : (bool?)null,
+                    byValue = symbol.IsByValue ? true : (bool?)null,
+                    implicitlyDeclared = symbol.IsImplicit ? true : (bool?)null,
+                }).ToList(),
+                moduleVariables = symbols.ModuleVariables.Select(static symbol => symbol.Name).ToList(),
+                inferredTypesCount = types.Inferred.Count,
+                inferredTypes = types.Inferred.Take(limit).Select(inferred => new
+                {
+                    name = inferred.Name,
+                    type = inferred.TypeName,
+                    source = inferred.Source.ToString(),
+                    platformType = types.IsPlatformType(inferred.TypeName) ? true : (bool?)null,
+                    line = inferred.Line,
+                    column = inferred.Column,
+                    routine = inferred.Routine,
+                }).ToList(),
+                resolvedCallsCount = types.ResolvedCallCount,
+                resolvedCalls = types.PlatformCalls.Take(limit).Select(call => new
+                {
+                    call = call.Call.Callee,
+                    method = call.Call.Method,
+                    type = call.TypeName,
+                    platformCall = call.Callee,
+                    node = call.NodeId,
+                    line = call.Call.Line,
+                    routine = call.Routine,
+                }).ToList(),
+                unresolvedCallsCount = types.UnresolvedCallCount,
+                unresolvedCalls = types.UnresolvedCalls.Take(limit).Select(call => new
+                {
+                    call = call.Call.Callee,
+                    qualifier = call.Qualifier,
+                    reason = call.Reason,
+                    line = call.Call.Line,
+                    routine = call.Routine,
+                }).ToList(),
+                unresolvedTypesCount = types.Unresolved.Count,
+                unresolvedTypes = types.Unresolved.Take(limit).Select(unresolved => new
+                {
+                    name = unresolved.Name,
+                    reason = unresolved.Reason,
+                    line = unresolved.Line,
+                    column = unresolved.Column,
+                    routine = unresolved.Routine,
+                }).ToList(),
+                visibleAt = line > 0
+                    ? symbols.VisibleAt(line).Select(symbol => new
+                    {
+                        name = symbol.Name,
+                        kind = symbol.Kind.ToString(),
+                        declaredAt = symbol.Line,
+                        column = symbol.Column,
+                        type = types.TryGetType(symbol.Name, line, out var typeName) ? typeName : null,
+                    }).ToList()
+                    : null,
+            });
+        });
 
     private ToolSpec ReloadTool() => new(
         "reload",
