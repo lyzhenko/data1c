@@ -13,10 +13,10 @@ public sealed record ServerOptionsParse(ServerOptions? Options, bool Help, strin
 public sealed record ServerOptions
 {
     /// <summary>
-    /// Каталог выгрузки конфигурации 1С (формат «Выгрузить конфигурацию в файлы»). Можно не задавать:
-    /// тогда выгрузка открывается инструментом open, а строка подключения в клиенте не зависит от проекта.
+    /// Каталоги выгрузки в порядке наложения: первый — база конфигурации, следующие — расширения.
+    /// Ключ --dump можно повторять; можно не задавать вовсе — тогда выгрузку открывает инструмент open.
     /// </summary>
-    public string? DumpPath { get; init; }
+    public IReadOnlyList<string> DumpPaths { get; init; } = [];
 
     /// <summary>Разбирать модули BSL. Без них работает только навигация по метаданным.</summary>
     public bool IncludeBsl { get; init; } = true;
@@ -58,8 +58,10 @@ public sealed record ServerOptions
           Data1c.Mcp [--dump <каталог выгрузки>] [ключи]
 
         Ключи:
-          --dump <путь>          каталог выгрузки конфигурации 1С; можно не задавать и открыть
-                                 выгрузку позже инструментом open
+          --dump <путь>          каталог выгрузки конфигурации 1С; ключ можно повторять: первый
+                                 каталог — база, следующие — расширения (они перекрывают базу
+                                 по совпадающим путям). Можно не задавать и открыть выгрузку
+                                 позже инструментом open
           --index <путь>         путь к файлу индекса (по умолчанию <выгрузка>/.data1c/index.db);
                                  если индекса нет, сервер соберёт его один раз
           --no-index             не использовать индекс: разбирать выгрузку в память при каждом запуске
@@ -81,6 +83,7 @@ public sealed record ServerOptions
         ArgumentNullException.ThrowIfNull(args);
 
         string? dump = null;
+        List<string>? dumps = null;
         var platform = false;
         var locale = "ru";
         List<string>? roots = null;
@@ -106,6 +109,7 @@ public sealed record ServerOptions
                         return new ServerOptionsParse(null, false, dumpError);
                     }
 
+                    (dumps ??= []).Add(dump!);
                     break;
 
                 case "--platform":
@@ -187,15 +191,10 @@ public sealed record ServerOptions
             }
         }
 
-        if (string.IsNullOrWhiteSpace(dump))
-        {
-            dump = null;
-        }
-
         return new ServerOptionsParse(
             new ServerOptions
             {
-                DumpPath = dump,
+                DumpPaths = dumps ?? [],
                 IncludeBsl = includeBsl,
                 IncludeCalls = includeCalls,
                 Sections = sections,

@@ -12,7 +12,12 @@ namespace Data1c.Mcp;
 /// <summary>Что и как разбирать: переносится из <see cref="ServerOptions"/>.</summary>
 public sealed record AnalysisRequest
 {
-    public required string DumpPath { get; init; }
+    /// <summary>
+    /// Каталоги выгрузки в порядке наложения: первый — база конфигурации, следующие — расширения.
+    /// По совпадающим путям эффективным считается файл из последнего источника; корневые файлы
+    /// конфигурации всегда берутся из базы. Пустой список — выгрузка ещё не открыта.
+    /// </summary>
+    public IReadOnlyList<string> DumpPaths { get; init; } = [];
 
     public bool IncludeBsl { get; init; } = true;
 
@@ -83,7 +88,7 @@ public sealed class AnalysisSession : IDisposable
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(request.DumpPath))
+        if (request.DumpPaths.Count == 0)
         {
             _sourceError = "Выгрузка не открыта. Вызовите инструмент open с путём к каталогу выгрузки 1С.";
             _dumpPath = "<не открыта>";
@@ -93,15 +98,18 @@ public sealed class AnalysisSession : IDisposable
 
         try
         {
-            var fileSystem = new FileSystemDumpSource(request.DumpPath);
-            _source = fileSystem;
-            _code = new SourceCodeReader(fileSystem);
-            _dumpPath = fileSystem.RootPath;
+            var sources = request.DumpPaths
+                .Select(static path => (IDumpSource)new FileSystemDumpSource(path))
+                .ToList();
+
+            _source = sources.Count == 1 ? sources[0] : new CompositeDumpSource(sources);
+            _code = new SourceCodeReader(_source);
+            _dumpPath = _source.DisplayName;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
         {
             _sourceError = exception.Message;
-            _dumpPath = request.DumpPath;
+            _dumpPath = string.Join(" + ", request.DumpPaths);
             _state = "ошибка: " + exception.Message;
         }
     }
