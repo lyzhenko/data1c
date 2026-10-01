@@ -41,6 +41,7 @@ public sealed class ToolCatalog
             NeighborsTool(),
             CodeTool(),
             MetadataTool(),
+            EntryPointsTool(),
             PlatformTool(),
             CheckTool(),
             TypesTool(),
@@ -1012,6 +1013,210 @@ public sealed class ToolCatalog
         }
 
         return node;
+    }
+
+    /// <summary>Сколько источников подписки показывать: у «регистрации удаления» их сотни.</summary>
+    private const int SourcePreviewLimit = 20;
+
+    /// <summary>Сколько свойств объекта показывать в ответе.</summary>
+    private const int PropertyPreviewLimit = 12;
+
+    private ToolSpec EntryPointsTool() => new(
+        "entrypoints",
+        "Точки входа: код, который вызывает платформа, а не другая процедура конфигурации — подписки на события, "
+        + "регламентные задания и обработчики событий форм. Видны обработчик (путь модуля, процедура, строка), "
+        + "узел процедуры для инструмента code и объекты метаданных, на которые точка входа реагирует: "
+        + "правку обработчика видно с её последствиями. Пример: entrypoints metadata=\"Catalog.Товары\".",
+        [
+            new ToolParameter(
+                "metadata",
+                "string",
+                "Кто реагирует на изменения этого объекта: объект-источник подписки, общий модуль-обработчик, "
+                + "форма или объект-владелец формы (Catalog.Товары, CommonModule.ОбщегоНазначения)."),
+            new ToolParameter(
+                "kind",
+                "string",
+                "Оставить только эти точки входа.",
+                Values: ["subscription", "job", "form"]),
+            new ToolParameter(
+                "limit",
+                "integer",
+                $"Сколько точек входа вернуть ({1}–{EntryPoints.MaxLimit}, по умолчанию {EntryPoints.DefaultLimit})."),
+        ],
+        async (arguments, token) =>
+        {
+            if (!Session.IsOpen)
+            {
+                throw new ToolException("Выгрузка не открыта: вызовите open с путём к каталогу выгрузки 1С.");
+            }
+
+            var metadata = arguments.GetString("metadata");
+            var kind = ParseEntryPointKind(arguments.GetString("kind"));
+            var limit = arguments.GetInt("limit", EntryPoints.DefaultLimit, 1, EntryPoints.MaxLimit);
+
+            var facts = await EntryPointFactsAsync(token).ConfigureAwait(false);
+            if (facts is null)
+            {
+                return "Разбор выгрузки ещё идёт: точки входа появятся, когда он закончится. "
+                    + "Повторите запрос через несколько секунд (status покажет готовность).";
+            }
+
+            var report = EntryPoints.Collect(facts, new EntryPointFilter(metadata, kind, limit));
+            if (report.Items.Count == 0)
+            {
+                return EmptyEntryPointsMessage(metadata, kind);
+            }
+
+            return Render.JsonOf(new
+            {
+                metadata,
+                kind = kind is { } value ? EntryPoints.KindName(value) : null,
+                limit,
+                found = report.Items.Count,
+                truncated = report.Truncated ? true : (bool?)null,
+                counts = new
+                {
+                    subscription = report.CountsByKind[EntryPointKind.Subscription],
+                    job = report.CountsByKind[EntryPointKind.Job],
+                    form = report.CountsByKind[EntryPointKind.Form],
+                },
+                note = EntryPointsNote(report),
+                entryPoints = report.Items.Select(item => EntryPointView(item, metadata)).ToList(),
+            });
+        });
+
+    /// <summary>
+    /// Раздел ответа: одна точка входа так, как её видит агент. Списки источников и свойств
+    /// ограничены — подписка на «регистрацию удаления» иначе занимает весь ответ, — а полные
+    /// размеры остаются в полях-счётчиках. Источник, по которому сработал фильтр, показывается первым.
+    /// </summary>
+    private static object EntryPointView(EntryPointInfo item, string? metadata)
+    {
+        var sources = SourcePreview(item.Sources, metadata);
+
+        return new
+        {
+            kind = EntryPoints.KindName(item.Kind),
+            id = item.Id,
+            name = item.Name,
+            objectId = item.ObjectId,
+            objectKind = item.ObjectKind,
+            // event — ключевое слово C#: в ответе поле называется «event», поэтому идентификатор взят дословно.
+            @event = item.Event,
+            eventName = item.EventName,
+            element = item.Element,
+            sources,
+            sourcesCount = item.Sources.Count > SourcePreviewLimit ? item.Sources.Count : (int?)null,
+            module = item.ModulePath,
+            procedure = item.Procedure,
+            routine = item.RoutineId,
+            line = item.Line,
+            resolved = item.Resolved,
+            properties = item.Properties.Count == 0
+                ? null
+                : item.Properties.Take(PropertyPreviewLimit).ToDictionary(static property => property.Key, static property => property.Value),
+            file = item.SourcePath,
+        };
+    }
+
+    /// <summary>
+    /// Первые источники подписки для ответа: объект из фильтра идёт первым, чтобы при сотнях
+    /// источников было видно, почему точка входа попала в выдачу.
+    /// </summary>
+    private static List<string>? SourcePreview(IReadOnlyList<string> sources, string? metadata)
+    {
+        if (sources.Count == 0)
+        {
+            return null;
+        }
+
+        var preview = new List<string>(Math.Min(sources.Count, SourcePreviewLimit));
+        if (metadata is { Length: > 0 } filter && sources.Contains(filter, StringComparer.Ordinal))
+        {
+            preview.Add(filter);
+        }
+
+        foreach (var source in sources)
+        {
+            if (preview.Count >= SourcePreviewLimit)
+            {
+                break;
+            }
+
+            if (!preview.Contains(source, StringComparer.Ordinal))
+            {
+                preview.Add(source);
+            }
+        }
+
+        return preview;
+    }
+
+    /// <summary>Что осталось за пределами ответа: обрезка по пределу и ненайденные процедуры-обработчики.</summary>
+    private static string? EntryPointsNote(EntryPointReport report)
+    {
+        var parts = new List<string>(2);
+        if (report.Truncated)
+        {
+            parts.Add("Точек входа больше, чем показано: увеличьте limit или сузьте выборку аргументами kind и metadata.");
+        }
+
+        if (report.Items.Any(static item => !item.Resolved))
+        {
+            parts.Add("У части точек входа процедура-обработчик в модуле не найдена: узел процедуры пуст, проверьте имя процедуры в файле.");
+        }
+
+        return parts.Count == 0 ? null : string.Join(' ', parts);
+    }
+
+    /// <summary>
+    /// Источник точек входа: индекс, если он готов, иначе разбор в памяти. Ожидание разбора короткое —
+    /// инструмент не должен висеть, пока собирается индекс большой выгрузки.
+    /// </summary>
+    private async Task<IEntryPointFacts?> EntryPointFactsAsync(CancellationToken cancellationToken)
+    {
+        if (Session.GetIndexReader() is { } reader)
+        {
+            return new IndexEntryPoints(reader);
+        }
+
+        var result = Session.Result ?? await WaitForAnalysisAsync(cancellationToken).ConfigureAwait(false);
+        return result is null ? null : new AnalysisEntryPoints(result);
+    }
+
+    /// <summary>Ответ, когда подходящих точек входа нет: без него агент не отличит пустоту от ошибки фильтра.</summary>
+    private static string EmptyEntryPointsMessage(string? metadata, EntryPointKind? kind)
+    {
+        var what = kind switch
+        {
+            EntryPointKind.Subscription => "подписок на события",
+            EntryPointKind.Job => "регламентных заданий",
+            EntryPointKind.Form => "обработчиков событий форм",
+            _ => "точек входа (подписок на события, регламентных заданий, обработчиков событий форм)",
+        };
+
+        return metadata is null
+            ? $"В выгрузке не найдено {what}."
+            : $"По объекту «{metadata}» не найдено {what}. Убедитесь, что это идентификатор объекта метаданных "
+                + "(подскажет search, например Catalog.Товары), или уберите аргумент metadata.";
+    }
+
+    /// <summary>Вид точек входа из аргумента инструмента: subscription, job, form.</summary>
+    private static EntryPointKind? ParseEntryPointKind(string? value)
+    {
+        if (value is null)
+        {
+            return null;
+        }
+
+        if (EntryPoints.TryParseKind(value, out var kind))
+        {
+            return kind;
+        }
+
+        throw new ToolException(
+            $"Недопустимое значение kind: «{value}». Возможные: subscription (подписки на события), "
+            + "job (регламентные задания), form (обработчики событий форм).");
     }
 
     private ToolSpec PlatformTool() => new(

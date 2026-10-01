@@ -54,6 +54,7 @@ public sealed class McpServerTests
         Assert.Contains("grep", names);
         Assert.Contains("code", names);
         Assert.Contains("metadata", names);
+        Assert.Contains("entrypoints", names);
         Assert.Contains("check", names);
         Assert.Contains("types", names);
         Assert.Contains("reload", names);
