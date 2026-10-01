@@ -44,7 +44,7 @@ public sealed class McpServerTests
         var responses = await ExchangeAsync(InitializeKnown, Initialized, """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""");
 
         var tools = Result(responses, 2)["tools"]!.AsArray();
-        Assert.Equal(12, tools.Count);
+        Assert.Equal(13, tools.Count);
 
         var names = tools.Select(tool => Text(tool!["name"])).ToList();
         Assert.Contains("status", names);
@@ -55,6 +55,7 @@ public sealed class McpServerTests
         Assert.Contains("metadata", names);
         Assert.Contains("check", names);
         Assert.Contains("types", names);
+        Assert.Contains("rights", names);
         Assert.Contains("reload", names);
 
         foreach (var tool in tools)
@@ -63,6 +64,24 @@ public sealed class McpServerTests
             Assert.Equal("object", Text(tool["inputSchema"]!["type"]));
             Assert.NotNull(tool["inputSchema"]!["properties"]);
         }
+    }
+
+    [Fact]
+    public async Task Инструмент_rights_отвечает_через_протокол()
+    {
+        var session = new AnalysisSession(new AnalysisRequest(), RightsSampleDump.Create());
+        var responses = await ExchangeAsync(
+            session,
+            InitializeKnown,
+            ToolCall(2, "rights", """{"metadata":"Catalog.Товары","limit":5}"""));
+
+        var payload = Json(ContentText(responses, 2));
+        var metadata = payload["metadata"]!;
+
+        Assert.Equal("Catalog.Товары", Text(metadata["object"]));
+        Assert.Equal(2, metadata["rolesWithRights"]!.GetValue<int>());
+        Assert.Contains("Организация", Text(metadata["roles"]!.AsArray()[0]!["condition"]));
+        Assert.Contains("пользовател", Text(payload["note"]), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

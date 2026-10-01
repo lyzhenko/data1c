@@ -81,6 +81,12 @@ public static class MetadataRefContexts
 
     /// <summary>Обращение из текста запроса: «ИЗ Справочник.Товары».</summary>
     public const string Query = "query";
+
+    /// <summary>
+    /// Права роли на объект: в <c>detail</c> лежит сжатый перечень прав («Read=true;Insert=false»),
+    /// признак ограничения доступа к данным — метка «RLS».
+    /// </summary>
+    public const string Right = "right";
 }
 
 /// <summary>Сводная статистика графа.</summary>

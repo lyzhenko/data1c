@@ -23,8 +23,12 @@ public sealed class ToolCatalog
     private static readonly IReadOnlyCollection<string> DefaultGrepExtensions = [".bsl", ".xml"];
 
     private readonly Lock _sessionGate = new();
+    private readonly Lock _rightsGate = new();
     private readonly List<ToolSpec> _tools;
     private AnalysisSession _session;
+    private RoleRightsCatalog? _rights;
+    private AnalysisSession? _rightsSession;
+    private object? _rightsCode;
 
     public ToolCatalog(AnalysisSession session)
     {
@@ -43,6 +47,7 @@ public sealed class ToolCatalog
             PlatformTool(),
             CheckTool(),
             TypesTool(),
+            RightsTool(),
             ReloadTool(),
         ];
     }
@@ -995,6 +1000,299 @@ public sealed class ToolCatalog
                     : null,
             });
         });
+
+    private ToolSpec RightsTool() => new(
+        "rights",
+        "Права ролей конфигурации 1С: какие роли и какие права имеют на объект метаданных и что может конкретная роль. "
+        + "Источник — файлы Roles/<Имя>/Ext/Rights.xml: аргумент metadata отвечает «роль × права» на объект, "
+        + "включая ограничение доступа к данным (RLS) с текстом условия из файла роли, аргумент role — "
+        + "что может роль: её объекты с правами. В выгрузке видны только сами роли: назначение ролей пользователям "
+        + "(какие пользователи входят в роль) в файлы конфигурации не входит. "
+        + "Примеры: rights metadata=\"Catalog.Товары\"; rights role=\"Менеджер\".",
+        [
+            new ToolParameter("metadata", "string", "Идентификатор объекта метаданных: Catalog.Товары, Document.Заказ, Configuration."),
+            new ToolParameter("role", "string", "Роль: Менеджер, Role.Менеджер или Roles/Менеджер/Ext/Rights.xml."),
+            new ToolParameter("limit", "integer", "Сколько строк показать — ролей или объектов (1–500, по умолчанию 50); счётчики всегда полные."),
+        ],
+        (arguments, token) => RightsToolAsync(arguments, token));
+
+    /// <summary>Предел длины условия RLS в ответе: полный текст всегда лежит в файле роли.</summary>
+    private const int RightsConditionLimit = 4000;
+
+    /// <summary>
+    /// Права ролей: ответ об объекте, о роли или о том и другом сразу, если заданы оба аргумента.
+    /// </summary>
+    private async Task<string> RightsToolAsync(ToolArguments arguments, CancellationToken cancellationToken)
+    {
+        var metadata = arguments.GetString("metadata");
+        var role = arguments.GetString("role");
+        if (metadata is null && role is null)
+        {
+            throw new ToolException(
+                "Укажите metadata (объект метаданных) или role (роль): например rights metadata=\"Catalog.Товары\" "
+                + "или rights role=\"Менеджер\".");
+        }
+
+        var limit = arguments.GetInt("limit", 50, 1, 500);
+        var catalog = await RightsCatalogAsync(cancellationToken).ConfigureAwait(false);
+        var response = new JsonObject();
+        if (metadata is not null)
+        {
+            response["metadata"] = ObjectRightsView(catalog, metadata, limit);
+        }
+
+        if (role is not null)
+        {
+            response["role"] = RoleRightsView(catalog, role, limit);
+        }
+
+        if (catalog.Warnings.Count > 0)
+        {
+            var warnings = new JsonArray();
+            foreach (var warning in catalog.Warnings.Take(5))
+            {
+                warnings.Add(warning);
+            }
+
+            response["warnings"] = warnings;
+            response["warningsCount"] = catalog.Warnings.Count;
+        }
+
+        response["note"] = RightsNote(catalog);
+        return Render.JsonOf(response);
+    }
+
+    /// <summary>Что за права есть на объект: роли × права, признаки RLS и тексты условий.</summary>
+    private JsonObject ObjectRightsView(RoleRightsCatalog catalog, string metadata, int limit)
+    {
+        var objectId = RightsTargetResolver.TryResolve(metadata, out var resolved, out var kind)
+            ? resolved
+            : metadata.Trim();
+        var rows = catalog.RolesOnObject(objectId)
+            .OrderByDescending(static row => row.HasRestriction)
+            .ThenByDescending(static row => row.GrantedCount)
+            .ThenBy(static row => row.RoleName, StringComparer.Ordinal)
+            .ToList();
+        var found = SessionObjectExists(objectId);
+
+        var view = new JsonObject
+        {
+            ["object"] = objectId,
+            ["kind"] = kind.IsUnknown ? null : JsonValue.Create(kind.Name),
+            ["rolesTotal"] = catalog.RoleCount,
+            ["rolesWithRights"] = rows.Count,
+            ["rolesShown"] = Math.Min(limit, rows.Count),
+            ["rightsGranted"] = rows.Sum(static row => row.GrantedCount),
+            ["rightsDenied"] = rows.Sum(static row => row.DeniedCount),
+            ["rlsRoles"] = rows.Count(static row => row.HasRestriction),
+        };
+
+        if (found is not null)
+        {
+            view["found"] = found.Value;
+        }
+
+        var roles = new JsonArray();
+        foreach (var row in rows.Take(limit))
+        {
+            var item = new JsonObject
+            {
+                ["role"] = row.RoleId,
+                ["name"] = row.RoleName,
+                ["file"] = row.RoleFile,
+                ["granted"] = row.GrantedCount,
+                ["denied"] = row.DeniedCount,
+                ["rights"] = RightsJson(row.Rights),
+                ["rls"] = row.HasRestriction,
+            };
+
+            if (row.HasRestriction)
+            {
+                // Текст условия читается из файла роли: в сводке прав его нет.
+                item["condition"] = ConditionText(catalog.Condition(row.RoleName, objectId));
+            }
+
+            roles.Add(item);
+        }
+
+        view["roles"] = roles;
+        if (rows.Count == 0)
+        {
+            view["note"] = NoRightsNote(catalog, objectId, found);
+        }
+
+        return view;
+    }
+
+    /// <summary>Что может роль: признаки роли, объекты с правами и условия RLS показанных объектов.</summary>
+    private JsonObject RoleRightsView(RoleRightsCatalog catalog, string role, int limit)
+    {
+        if (!catalog.TryGetRole(role, out var summary))
+        {
+            throw new ToolException(MissingRoleText(catalog, role));
+        }
+
+        var detailed = catalog.RoleWithConditions(summary.Role) ?? summary;
+        var objects = detailed.Objects
+            .OrderByDescending(static obj => obj.GrantedCount)
+            .ThenBy(static obj => obj.Name, StringComparer.Ordinal)
+            .ToList();
+
+        var view = new JsonObject
+        {
+            ["role"] = detailed.RoleId,
+            ["name"] = detailed.Role,
+            ["file"] = detailed.SourcePath,
+            ["setForNewObjects"] = detailed.SetForNewObjects,
+            ["setForAttributesByDefault"] = detailed.SetForAttributesByDefault,
+            ["independentRightsOfChildObjects"] = detailed.IndependentRightsOfChildObjects,
+            ["objectsTotal"] = objects.Count,
+            ["objectsShown"] = Math.Min(limit, objects.Count),
+            ["objectsResolved"] = objects.Count(static obj => obj.IsResolved),
+            ["rightsGranted"] = objects.Sum(static obj => obj.GrantedCount),
+            ["rightsDenied"] = objects.Sum(static obj => obj.DeniedCount),
+            ["rlsObjects"] = objects.Count(static obj => obj.HasRestriction),
+        };
+
+        var items = new JsonArray();
+        foreach (var obj in objects.Take(limit))
+        {
+            var item = new JsonObject
+            {
+                ["object"] = obj.IsResolved ? obj.ObjectId : obj.Name,
+                ["resolved"] = obj.IsResolved,
+                ["kind"] = obj.Kind.IsUnknown ? null : JsonValue.Create(obj.Kind.Name),
+                ["granted"] = obj.GrantedCount,
+                ["denied"] = obj.DeniedCount,
+                ["rights"] = RightsJson(obj.Rights),
+                ["rls"] = obj.HasRestriction,
+            };
+
+            if (obj.HasRestriction)
+            {
+                item["condition"] = ConditionText(obj.Condition);
+            }
+
+            items.Add(item);
+        }
+
+        view["objects"] = items;
+        return view;
+    }
+
+    /// <summary>
+    /// Сводка прав ролей собирается один раз на сессию: файлы прав читаются с диска, а после
+    /// open или reload сводка пересобирается — их видно по подмене сессии и читателя исходников.
+    /// </summary>
+    private async Task<RoleRightsCatalog> RightsCatalogAsync(CancellationToken cancellationToken)
+    {
+        var session = Session;
+        var code = session.Code;
+        lock (_rightsGate)
+        {
+            if (_rights is not null && ReferenceEquals(_rightsSession, session) && ReferenceEquals(_rightsCode, code))
+            {
+                return _rights;
+            }
+        }
+
+        // Список файлов прав берётся из индекса, если он готов: обход каталога выгрузки стоит секунды.
+        var paths = session.GetIndexReader()?.FilePaths([".xml"], ["Roles/"]);
+        var catalog = await Task.Run(
+            () => RoleRightsCatalog.Build(session.Source, paths, cancellationToken),
+            cancellationToken).ConfigureAwait(false);
+
+        lock (_rightsGate)
+        {
+            _rights = catalog;
+            _rightsSession = session;
+            _rightsCode = code;
+        }
+
+        return catalog;
+    }
+
+    /// <summary>Права в виде объекта «имя права → значение»: читаемее, чем строка detail из индекса.</summary>
+    private static JsonObject RightsJson(IReadOnlyList<RoleRightEntry> rights)
+    {
+        var result = new JsonObject();
+        foreach (var right in rights.OrderBy(static right => right.Name, StringComparer.Ordinal))
+        {
+            result[right.Name] = right.Value;
+        }
+
+        return result;
+    }
+
+    /// <summary>Условие RLS для ответа: длинный текст обрезается, полный лежит в файле роли.</summary>
+    private static string? ConditionText(string? condition)
+    {
+        if (string.IsNullOrEmpty(condition))
+        {
+            return null;
+        }
+
+        return condition.Length <= RightsConditionLimit
+            ? condition
+            : condition[..RightsConditionLimit]
+                + $"\n… условие обрезано до {RightsConditionLimit} символов: полный текст лежит в файле роли.";
+    }
+
+    /// <summary>
+    /// Есть ли такой объект в конфигурации: из индекса — сразу, из готового разбора — по модели,
+    /// а пока нет ни того ни другого, проверка не делается (null).
+    /// </summary>
+    private bool? SessionObjectExists(string objectId)
+    {
+        if (Session.GetIndexReader() is { } reader)
+        {
+            return reader.GetMetadataObject(objectId) is not null;
+        }
+
+        var result = Session.Result;
+        return result is null ? null : result.Metadata.Find(objectId) is not null;
+    }
+
+    /// <summary>Понятный ответ, когда объект в правах не упомянут ни одной ролью.</summary>
+    private static string NoRightsNote(RoleRightsCatalog catalog, string objectId, bool? found) => found switch
+    {
+        false => $"Объект «{objectId}» не найден в конфигурации: проверьте идентификатор инструментом search.",
+        true => $"Ни одна из {catalog.RoleCount} ролей выгрузки не даёт прав на «{objectId}»: прав на объект нет ни в одной роли.",
+        _ => $"Ни одна из {catalog.RoleCount} ролей выгрузки не упоминает «{objectId}» в правах; "
+            + "существование объекта не проверено — разбор выгрузки ещё не готов (status).",
+    };
+
+    /// <summary>Ответ на неизвестную роль: сколько ролей есть и какие имена похожи.</summary>
+    private static string MissingRoleText(RoleRightsCatalog catalog, string role)
+    {
+        if (catalog.RoleCount == 0)
+        {
+            return "В выгрузке не найдено файлов прав ролей (Roles/<Имя>/Ext/Rights.xml): права не разобраны.";
+        }
+
+        var name = RoleRightsCatalog.NormalizeRoleName(role);
+        var similar = catalog.RoleNames
+            .Where(candidate => candidate.Contains(name, StringComparison.OrdinalIgnoreCase))
+            .Take(8)
+            .ToList();
+        var hint = similar.Count > 0 ? " Похожие роли: " + string.Join(", ", similar) + "." : string.Empty;
+        return $"Роль «{role}» не найдена среди {catalog.RoleCount} ролей выгрузки.{hint}";
+    }
+
+    /// <summary>Оговорка о том, чего в выгрузке конфигурации нет: назначения ролей пользователям.</summary>
+    private static string RightsNote(RoleRightsCatalog catalog)
+    {
+        var note = "Права собраны из файлов Roles/<Имя>/Ext/Rights.xml: видны только сами роли и их права. "
+            + "Назначение ролей пользователям (какие пользователи входят в роль) в выгрузку конфигурации не входит — "
+            + "это данные информационной базы, а не файлов конфигурации. RLS — ограничение доступа к данным "
+            + "на уровне записей: в ответе приведён текст условия, прочитанный из файла роли.";
+        if (catalog.RoleCount == 0)
+        {
+            note += " Файлов прав ролей в выгрузке не найдено.";
+        }
+
+        return note;
+    }
 
     private ToolSpec ReloadTool() => new(
         "reload",
