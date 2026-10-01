@@ -33,6 +33,7 @@ internal static class Program
                 "scan" => RunScan(options),
                 "stats" => RunStats(options),
                 "index" => RunIndex(options),
+                "search" => RunSearch(options),
                 "view" => RunView(options),
                 "platform" => RunPlatform(options),
                 _ => Fail($"Неизвестная команда «{args[0]}». Запустите: data1c help"),
@@ -123,6 +124,41 @@ internal static class Program
     /// Показывает модель платформы из установленной 1С: найденные версии и справочные файлы,
     /// поиск по синтакс-помощнику или тему целиком.
     /// </summary>
+    /// <summary>
+    /// Ищет текст по модулям и XML выгрузки: просмотр файлов с ограничением по времени
+    /// и по числу совпадений на файл, с контекстом вокруг находки.
+    /// </summary>
+    private static int RunSearch(CliOptions options)
+    {
+        if (options.Path is null || options.Query is null)
+        {
+            return Fail("Укажите каталог и текст: data1c search <каталог-выгрузки> <текст> [--top N] [--regex]");
+        }
+
+        var source = new FileSystemDumpSource(options.Path);
+        var result = new CodeSearchService(source).Search(options.Query, new CodeSearchOptions
+        {
+            MaxResults = Math.Max(1, options.Top),
+            Regex = options.Regex,
+        });
+
+        WriteLine($"Поиск: «{options.Query}»{(options.Regex ? " (регулярное выражение)" : string.Empty)}");
+        WriteLine($"Файлов просмотрено: {N(result.ScannedFiles)}, совпадений: {N(result.Hits.Count)}" +
+            $"{(result.Truncated ? ", ответ обрезан лимитом" : string.Empty)}, время {result.Duration.TotalMilliseconds:F0} мс");
+
+        foreach (var hit in result.Hits)
+        {
+            WriteLine(string.Empty);
+            WriteLine($"{hit.Path}:{hit.Line}");
+            foreach (var line in hit.Context)
+            {
+                WriteLine("    " + line);
+            }
+        }
+
+        return result.Hits.Count > 0 ? 0 : 1;
+    }
+
     private static int RunPlatform(CliOptions options)
     {
         Version? preferred = null;
@@ -607,12 +643,15 @@ internal static class Program
               data1c stats <каталог-выгрузки> [опции]     сводка по выгрузке и графу
               data1c scan  <каталог-выгрузки> [опции]     разобрать и сохранить граф
               data1c index <каталог-выгрузки> [опции]     разобрать и сохранить SQLite-индекс
+              data1c search <каталог-выгрузки> <текст>    поиск текста по модулям и XML
               data1c view  <каталог-выгрузки> [опции]     интерактивный просмотрщик графа
               data1c platform [тема|запрос] [опции]       справка установленной платформы 1С (.hbk)
               data1c help                                 эта справка
 
-            Опции команды index:
+            Опции команды index и search:
               --out <файл>        куда положить индекс (по умолчанию <выгрузка>/.data1c/index.db)
+              --top N             сколько совпадений вернуть в search (по умолчанию 20)
+              --regex             искать регулярным выражением
               остальные опции разбора: --platform, --sections, --no-bsl, --no-calls, --max-dop, --quiet
 
             Опции команды platform:
@@ -691,6 +730,12 @@ internal sealed record CliOptions
 
     /// <summary>Подключить модель платформы: неразрешённые вызовы проверяются по синтакс-помощнику.</summary>
     public bool Platform { get; init; }
+
+    /// <summary>Текст поиска для команды search.</summary>
+    public string? Query { get; init; }
+
+    /// <summary>Искать регулярным выражением.</summary>
+    public bool Regex { get; init; }
 
     /// <summary>Поиск по справке платформы (команда platform).</summary>
     public string? PlatformSearch { get; init; }
@@ -819,18 +864,28 @@ internal sealed record CliOptions
                 case "--quiet":
                     options = options with { Quiet = true };
                     break;
+                case "--regex":
+                    options = options with { Regex = true };
+                    break;
                 default:
                     if (arg.StartsWith("--", StringComparison.Ordinal))
                     {
                         throw new InvalidOperationException($"Неизвестная опция «{arg}». Запустите: data1c help");
                     }
 
-                    if (options.Path is not null)
+                    if (options.Path is null)
                     {
-                        throw new InvalidOperationException($"Лишний аргумент «{arg}»: путь уже задан ({options.Path}).");
+                        options = options with { Path = arg };
+                    }
+                    else if (options.Query is null)
+                    {
+                        options = options with { Query = arg };
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException($"Лишний аргумент «{arg}»: путь и текст уже заданы.");
                     }
 
-                    options = options with { Path = arg };
                     break;
             }
         }

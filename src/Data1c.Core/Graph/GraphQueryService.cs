@@ -57,7 +57,7 @@ public sealed record GraphNodeDetails(GraphNode Node, IReadOnlyList<GraphEdge> I
 /// Запросы к готовому графу для интерактивного просмотра: поиск узлов, окружение узла, карточка узла.
 /// Граф при этом не копируется, поэтому сервис можно держать в памяти всё время работы просмотрщика.
 /// </summary>
-public sealed class GraphQueryService
+public sealed class GraphQueryService : IGraphQuery
 {
     private readonly DependencyGraph _graph;
 

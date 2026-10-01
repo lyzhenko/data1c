@@ -20,6 +20,25 @@ public sealed class IndexReader
         _index = index;
     }
 
+    /// <summary>Сколько узлов каждого вида: нужно для статистики графа.</summary>
+    public IReadOnlyDictionary<string, int> CountNodesByKind() => CountByKind("nodes");
+
+    /// <summary>Сколько связей каждого вида.</summary>
+    public IReadOnlyDictionary<string, int> CountEdgesByKind() => CountByKind("edges");
+
+    private IReadOnlyDictionary<string, int> CountByKind(string table) => _index.WithLock(() =>
+    {
+        using var command = _index.CreateCommand($"SELECT kind, COUNT(*) FROM {table} GROUP BY kind");
+        using var reader = command.ExecuteReader();
+        var result = new Dictionary<string, int>(StringComparer.Ordinal);
+        while (reader.Read())
+        {
+            result[reader.GetString(0)] = reader.GetInt32(1);
+        }
+
+        return (IReadOnlyDictionary<string, int>)result;
+    });
+
     /// <summary>Сводка по индексу.</summary>
     public IndexStatistics GetStatistics() => _index.WithLock(() =>
     {
@@ -274,6 +293,91 @@ public sealed class IndexReader
 
         return result;
     });
+
+    /// <summary>
+    /// «Умный» поиск символа: точное имя, затем префикс, затем смысловые термы (BM25), и только
+    /// в конце — просмотр по подстроке. Ступени идут по возрастанию цены.
+    /// </summary>
+    public IReadOnlyList<SymbolRow> SmartSearch(string query, int limit = 20)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return [];
+        }
+
+        var text = query.Trim();
+        var lower = text.ToLowerInvariant();
+        var bounded = Math.Clamp(limit, 1, 200);
+
+        var hits = QuerySymbols("s.name_lower = @lower", lower, null, bounded);
+        if (hits.Count > 0)
+        {
+            return hits;
+        }
+
+        hits = QuerySymbols(@"s.name_lower LIKE @prefix ESCAPE '\'", lower, EscapeLike(lower) + "%", bounded);
+        if (hits.Count > 0)
+        {
+            return hits;
+        }
+
+        hits = SearchSymbolsByTerms(text, bounded);
+        return hits.Count > 0
+            ? hits
+            : QuerySymbols(@"s.name_lower LIKE @like ESCAPE '\'", lower, "%" + EscapeLike(lower) + "%", bounded);
+    }
+
+    /// <summary>Поиск по смысловым термам: имя по частям, шапка комментария, имена параметров.</summary>
+    public IReadOnlyList<SymbolRow> SearchSymbolsByTerms(string query, int limit = 20)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return [];
+        }
+
+        var match = EscapeFtsPrefix(query);
+        if (match.Length == 0)
+        {
+            return [];
+        }
+
+        return _index.WithLock(() =>
+        {
+            using var command = _index.CreateCommand(
+                """
+                SELECT s.id, s.node_id, s.module_path, s.owner_id, s.name, s.kind, s.is_export, s.start_line,
+                       s.end_line, s.region, s.parameters, s.comment_head
+                FROM terms_fts t
+                JOIN symbols s ON s.id = CAST(t.symbol_id AS INTEGER)
+                WHERE terms_fts MATCH @match
+                ORDER BY bm25(terms_fts), length(s.name)
+                LIMIT @limit
+                """);
+            command.Parameters.AddWithValue("@match", match);
+            command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 200));
+
+            using var reader = command.ExecuteReader();
+            var result = new List<SymbolRow>();
+            while (reader.Read())
+            {
+                result.Add(new SymbolRow(
+                    reader.GetInt64(0),
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    reader.IsDBNull(3) ? null : reader.GetString(3),
+                    reader.GetString(4),
+                    reader.GetString(5),
+                    reader.GetInt32(6) != 0,
+                    reader.GetInt32(7),
+                    reader.GetInt32(8),
+                    reader.IsDBNull(9) ? null : reader.GetString(9),
+                    reader.IsDBNull(10) ? null : reader.GetString(10),
+                    reader.IsDBNull(11) ? null : reader.GetString(11)));
+            }
+
+            return (IReadOnlyList<SymbolRow>)result;
+        });
+    }
 
     /// <summary>Поиск процедур и функций по имени (точный, по префиксу и по подстроке).</summary>
     public IReadOnlyList<SymbolRow> FindSymbols(string name, int limit = 20, bool exact = false)
