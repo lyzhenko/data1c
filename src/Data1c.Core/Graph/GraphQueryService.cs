@@ -134,8 +134,67 @@ public sealed class GraphQueryService : IGraphQuery
         ];
     }
 
-    private static string TopLevelId(MdObject obj)
+    /// <summary>Карточка объекта метаданных из модели в памяти.</summary>
+    public MetadataCard? GetMetadata(string? id, int depth = 3, int maxChildren = 200)
     {
+        if (_metadata is null || string.IsNullOrWhiteSpace(id))
+        {
+            return null;
+        }
+
+        var obj = _metadata.Find(id.Trim());
+        return obj is null ? null : Card(obj, Math.Clamp(depth, 1, 4), Math.Clamp(maxChildren, 1, 500));
+    }
+
+    private static MetadataCard Card(MdObject obj, int depth, int maxChildren)
+    {
+        var properties = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var property in obj.Properties)
+        {
+            if (!string.IsNullOrWhiteSpace(property.Value) && properties.Count < 40)
+            {
+                properties[property.Key] = property.Value;
+            }
+        }
+
+        var children = new List<MetadataCard>();
+        if (depth > 1)
+        {
+            foreach (var child in obj.Children.Take(maxChildren))
+            {
+                children.Add(Card(child, depth - 1, maxChildren));
+            }
+        }
+
+        return new MetadataCard(
+            obj.Id,
+            obj.Kind.Name,
+            obj.Name,
+            obj.Synonym,
+            obj.Comment,
+            obj.Uuid?.ToString(),
+            obj.IsTopLevel,
+            obj.Parent is null || obj.Parent.Kind == MdKind.Configuration ? null : obj.Parent.Id,
+            obj.SourcePath,
+            [.. obj.References
+                .Where(static reference => reference.Kind == MdReferenceKind.Type)
+                .Select(static reference => reference.TargetId)
+                .Distinct(StringComparer.Ordinal)
+                .Take(10)],
+            properties,
+            [.. obj.References
+                .Where(static reference => reference.Kind != MdReferenceKind.Type)
+                .Take(60)
+                .Select(static reference => new MetadataReferenceInfo(
+                    reference.Kind.ToString(),
+                    reference.TargetId,
+                    reference.Detail))],
+            [.. obj.Modules.Select(static module => module.RelativePath)],
+            children,
+            Math.Max(0, obj.Children.Count - children.Count));
+    }
+
+    private static string TopLevelId(MdObject obj)    {
         var current = obj;
         while (current.Parent is not null && current.Parent.Kind != MdKind.Configuration)
         {

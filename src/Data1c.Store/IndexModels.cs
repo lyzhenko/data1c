@@ -29,13 +29,31 @@ public sealed record SymbolRow(
     string? Parameters = null,
     string? CommentHead = null);
 
+/// <summary>Объект метаданных целиком: свойства, признак верхнего уровня и владелец.</summary>
+public sealed record MetadataObjectRow(
+    string Id,
+    string Kind,
+    string Name,
+    string? Synonym = null,
+    string? Uuid = null,
+    string? SourcePath = null,
+    string? Comment = null,
+    bool IsTopLevel = false,
+    string? ParentId = null,
+    string? Properties = null);
+
 /// <summary>Вложенный объект метаданных: реквизит, табличная часть, форма, макет, команда.</summary>
 public sealed record MetadataItemRow(
     string ObjectId,
     string Kind,
     string Name,
     string? TypeInfo = null,
-    string? ParentId = null);
+    string? ParentId = null,
+    string? Synonym = null,
+    string? Comment = null);
+
+/// <summary>Страница состава объекта: показанные дети и их общее число.</summary>
+public sealed record MetadataChildrenPage(IReadOnlyList<MetadataItemRow> Items, int Total);
 
 /// <summary>Обращение к объекту метаданных: из кода, из текста запроса, тип реквизита, право роли.</summary>
 public sealed record MetadataRefRow(

@@ -623,6 +623,98 @@ public sealed class IndexReader
         return result;
     });
 
+    /// <summary>Объект метаданных по идентификатору: свойства, признак верхнего уровня, владелец.</summary>
+    public MetadataObjectRow? GetMetadataObject(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+        {
+            return null;
+        }
+
+        return _index.WithLock(() =>
+        {
+            using var command = _index.CreateCommand(
+                """
+                SELECT id, kind, name, synonym, uuid, source_path, comment, is_top_level, parent_id, properties
+                FROM metadata_objects WHERE id = @id
+                """);
+            command.Parameters.AddWithValue("@id", id.Trim());
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                return (MetadataObjectRow?)null;
+            }
+
+            return new MetadataObjectRow(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.IsDBNull(3) ? null : reader.GetString(3),
+                reader.IsDBNull(4) ? null : reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                reader.IsDBNull(6) ? null : reader.GetString(6),
+                reader.GetInt32(7) != 0,
+                reader.IsDBNull(8) ? null : reader.GetString(8),
+                reader.IsDBNull(9) ? null : reader.GetString(9));
+        });
+    }
+
+    /// <summary>Дети объекта метаданных вместе с их общим числом: состав дерева для карточки.</summary>
+    public MetadataChildrenPage MetadataChildren(string parentId, int limit = 500) => _index.WithLock(() =>
+    {
+        var items = new List<MetadataItemRow>();
+        using (var command = _index.CreateCommand(
+            """
+            SELECT object_id, kind, name, type_info, parent_id, synonym, comment
+            FROM metadata_items WHERE parent_id = @id ORDER BY kind, name LIMIT @limit
+            """))
+        {
+            command.Parameters.AddWithValue("@id", parentId);
+            command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 5000));
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                items.Add(new MetadataItemRow(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    reader.IsDBNull(3) ? null : reader.GetString(3),
+                    reader.IsDBNull(4) ? null : reader.GetString(4),
+                    reader.IsDBNull(5) ? null : reader.GetString(5),
+                    reader.IsDBNull(6) ? null : reader.GetString(6)));
+            }
+        }
+
+        using var count = _index.CreateCommand("SELECT COUNT(*) FROM metadata_items WHERE parent_id = @id");
+        count.Parameters.AddWithValue("@id", parentId);
+        var total = Convert.ToInt32(count.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
+        return new MetadataChildrenPage(items, total);
+    });
+
+    /// <summary>Пути модулей объекта: связи Contains ведут от объекта к его модулям.</summary>
+    public IReadOnlyList<string> ModulePaths(string ownerId, int limit = 50) => _index.WithLock(() =>
+    {
+        using var command = _index.CreateCommand(
+            """
+            SELECT DISTINCT n.source_path FROM edges e JOIN nodes n ON n.id = e.target_id
+            WHERE e.source_id = @id AND e.kind = 'Contains' AND n.kind = 'Module' AND n.source_path IS NOT NULL
+            ORDER BY n.source_path LIMIT @limit
+            """);
+        command.Parameters.AddWithValue("@id", ownerId);
+        command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 500));
+        using var reader = command.ExecuteReader();
+        var result = new List<string>();
+        while (reader.Read())
+        {
+            if (!reader.IsDBNull(0))
+            {
+                result.Add(reader.GetString(0));
+            }
+        }
+
+        return (IReadOnlyList<string>)result;
+    });
+
     /// <summary>Поиск объектов метаданных по имени и синониму.</summary>
     public IReadOnlyList<(string Id, string Kind, string Name, string? Synonym)> FindMetadataObjects(string query, int limit = 20)
     {

@@ -18,7 +18,7 @@ namespace Data1c.Store;
 internal static class IndexSchema
 {
     /// <summary>Версия схемы. Меняется вместе с DDL.</summary>
-    internal const int Version = 3;
+    internal const int Version = 4;
 
     internal static readonly string[] Statements =
     [
@@ -96,7 +96,11 @@ internal static class IndexSchema
             name_lower TEXT NOT NULL,
             synonym TEXT,
             uuid TEXT,
-            source_path TEXT
+            source_path TEXT,
+            comment TEXT,
+            is_top_level INTEGER NOT NULL DEFAULT 0,
+            parent_id TEXT,
+            properties TEXT
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_objects_kind ON metadata_objects(kind)",
@@ -110,11 +114,14 @@ internal static class IndexSchema
             name TEXT NOT NULL,
             name_lower TEXT NOT NULL,
             type_info TEXT,
-            parent_id TEXT
+            parent_id TEXT,
+            synonym TEXT,
+            comment TEXT
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_items_object ON metadata_items(object_id)",
         "CREATE INDEX IF NOT EXISTS idx_items_name ON metadata_items(name_lower)",
+        "CREATE INDEX IF NOT EXISTS idx_items_parent ON metadata_items(parent_id)",
 
         """
         CREATE TABLE IF NOT EXISTS metadata_refs (

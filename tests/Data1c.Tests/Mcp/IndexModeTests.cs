@@ -37,6 +37,11 @@ public sealed class IndexModeTests
 
             Assert.Contains(query.Search("Товары", 5), static hit => hit.Id == "Catalog.Товары");
             Assert.Contains(query.SearchNested("Артикул", 5), static hit => hit.Id == "Catalog.Товары/Attribute.Артикул");
+
+            // Карточка объекта тоже приходит из индекса: состава и типов достаточно, чтобы писать код.
+            var card = query.GetMetadata("Catalog.Товары");
+            Assert.NotNull(card);
+            Assert.Contains(card.Children, static child => child.Name == "Артикул");
         }
         finally
         {

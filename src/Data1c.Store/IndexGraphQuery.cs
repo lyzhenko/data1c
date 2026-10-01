@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Data1c.Core.Graph;
 
 namespace Data1c.Store;
@@ -141,6 +142,111 @@ public sealed class IndexGraphQuery : IGraphQuery
             [.. nodes.Select(Map)],
             MapEdges(edges),
             reached.Count >= request.MaxNodes);
+    }
+
+    /// <summary>Карточка объекта метаданных из таблиц индекса.</summary>
+    public MetadataCard? GetMetadata(string? id, int depth = 3, int maxChildren = 200)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+        {
+            return null;
+        }
+
+        var row = _reader.GetMetadataObject(id.Trim());
+        return row is null ? null : Card(row, Math.Clamp(depth, 1, 4), Math.Clamp(maxChildren, 1, 500));
+    }
+
+    private MetadataCard Card(MetadataObjectRow row, int depth, int maxChildren)
+    {
+        var references = _reader.ReferencesOf(row.Id, limit: 400);
+        var page = _reader.MetadataChildren(row.Id, maxChildren);
+
+        var children = new List<MetadataCard>();
+        if (depth > 1)
+        {
+            children.AddRange(page.Items.Select(item => Item(row.Id, item, depth - 1, maxChildren)));
+        }
+
+        return new MetadataCard(
+            row.Id,
+            row.Kind,
+            row.Name,
+            row.Synonym,
+            row.Comment,
+            row.Uuid,
+            row.IsTopLevel,
+            row.ParentId,
+            row.SourcePath,
+            [.. references
+                .Where(static reference => reference.Context == "type")
+                .Select(static reference => reference.TargetId)
+                .Distinct(StringComparer.Ordinal)
+                .Take(10)],
+            ParseProperties(row.Properties),
+            [.. references
+                .Where(static reference => reference.Context != "type")
+                .Take(60)
+                .Select(static reference => new MetadataReferenceInfo(reference.Context, reference.TargetId, reference.Detail))],
+            _reader.ModulePaths(row.Id),
+            children,
+            Math.Max(0, page.Total - children.Count));
+    }
+
+    /// <summary>
+    /// Вложенный объект собирается из записи состава: вид, имя, синоним, комментарий и типы,
+    /// а его собственные дети — из следующих уровней таблицы состава.
+    /// </summary>
+    private MetadataCard Item(string ownerId, MetadataItemRow item, int depth, int maxChildren)
+    {
+        var id = $"{ownerId}/{item.Kind}.{item.Name}";
+        var children = new List<MetadataCard>();
+        var hidden = 0;
+        if (depth > 1)
+        {
+            var page = _reader.MetadataChildren(id, maxChildren);
+            children.AddRange(page.Items.Select(child => Item(id, child, depth - 1, maxChildren)));
+            hidden = Math.Max(0, page.Total - children.Count);
+        }
+
+        return new MetadataCard(
+            id,
+            item.Kind,
+            item.Name,
+            item.Synonym,
+            item.Comment,
+            Uuid: null,
+            IsTopLevel: false,
+            ParentId: ownerId,
+            SourcePath: null,
+            ParseTypes(item.TypeInfo),
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            [],
+            [],
+            children,
+            hidden);
+    }
+
+    private static IReadOnlyList<string> ParseTypes(string? typeInfo) =>
+        typeInfo is null
+            ? []
+            : [.. typeInfo.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)];
+
+    private static IReadOnlyDictionary<string, string> ParseProperties(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return new Dictionary<string, string>(StringComparer.Ordinal);
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<Dictionary<string, string>>(json)
+                ?? new Dictionary<string, string>(StringComparer.Ordinal);
+        }
+        catch (JsonException)
+        {
+            return new Dictionary<string, string>(StringComparer.Ordinal);
+        }
     }
 
     /// <summary>Узел по идентификатору без загрузки связей.</summary>

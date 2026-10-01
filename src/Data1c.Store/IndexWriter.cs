@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 using Data1c.Core.Analysis;
 using Data1c.Core.Bsl;
 using Data1c.Core.Dump;
@@ -277,8 +278,9 @@ public sealed class IndexWriter
         using var objects = connection.CreateCommand();
         objects.CommandText =
             """
-            INSERT OR REPLACE INTO metadata_objects (id, kind, name, name_lower, synonym, uuid, source_path)
-            VALUES (@id, @kind, @name, @nameLower, @synonym, @uuid, @path)
+            INSERT OR REPLACE INTO metadata_objects
+                (id, kind, name, name_lower, synonym, uuid, source_path, comment, is_top_level, parent_id, properties)
+            VALUES (@id, @kind, @name, @nameLower, @synonym, @uuid, @path, @comment, @top, @parent, @properties)
             """;
         var objectId = objects.Parameters.Add("@id", SqliteType.Text);
         var objectKind = objects.Parameters.Add("@kind", SqliteType.Text);
@@ -287,16 +289,23 @@ public sealed class IndexWriter
         var synonym = objects.Parameters.Add("@synonym", SqliteType.Text);
         var uuid = objects.Parameters.Add("@uuid", SqliteType.Text);
         var objectPath = objects.Parameters.Add("@path", SqliteType.Text);
+        var objectComment = objects.Parameters.Add("@comment", SqliteType.Text);
+        var objectTopLevel = objects.Parameters.Add("@top", SqliteType.Integer);
+        var objectParent = objects.Parameters.Add("@parent", SqliteType.Text);
+        var objectProperties = objects.Parameters.Add("@properties", SqliteType.Text);
 
         using var items = connection.CreateCommand();
         items.CommandText =
-            "INSERT INTO metadata_items (object_id, kind, name, name_lower, type_info, parent_id) VALUES (@object, @kind, @name, @nameLower, @type, @parent)";
+            "INSERT INTO metadata_items (object_id, kind, name, name_lower, type_info, parent_id, synonym, comment) "
+            + "VALUES (@object, @kind, @name, @nameLower, @type, @parent, @synonym, @comment)";
         var itemObject = items.Parameters.Add("@object", SqliteType.Text);
         var itemKind = items.Parameters.Add("@kind", SqliteType.Text);
         var itemName = items.Parameters.Add("@name", SqliteType.Text);
         var itemNameLower = items.Parameters.Add("@nameLower", SqliteType.Text);
         var itemType = items.Parameters.Add("@type", SqliteType.Text);
         var itemParent = items.Parameters.Add("@parent", SqliteType.Text);
+        var itemSynonym = items.Parameters.Add("@synonym", SqliteType.Text);
+        var itemComment = items.Parameters.Add("@comment", SqliteType.Text);
 
         using var refs = connection.CreateCommand();
         refs.CommandText = "INSERT INTO metadata_refs (source_id, target_id, context, line, detail) VALUES (@source, @target, @context, NULL, @detail)";
@@ -319,7 +328,14 @@ public sealed class IndexWriter
             objectNameLower.Value = obj.Name.ToLowerInvariant();
             synonym.Value = (object?)obj.Synonym ?? DBNull.Value;
             uuid.Value = obj.Uuid is { } value ? value.ToString() : DBNull.Value;
-            objectPath.Value = (object?)obj.Directory ?? DBNull.Value;
+            // Путь файла объекта, как его показывает карточка: по нему агент читает и правит XML.
+            objectPath.Value = (object?)obj.SourcePath ?? DBNull.Value;
+            objectComment.Value = (object?)obj.Comment ?? DBNull.Value;
+            objectTopLevel.Value = obj.IsTopLevel ? 1 : 0;
+            objectParent.Value = obj.Parent is null || obj.Parent.Kind == MdKind.Configuration
+                ? DBNull.Value
+                : obj.Parent.Id;
+            objectProperties.Value = (object?)Properties(obj) ?? DBNull.Value;
             objects.ExecuteNonQuery();
             counters.MetadataObjects++;
 
@@ -342,6 +358,8 @@ public sealed class IndexWriter
                 itemNameLower.Value = child.Name.ToLowerInvariant();
                 itemType.Value = (object?)TypeInfo(obj, child) ?? DBNull.Value;
                 itemParent.Value = child.Parent is null || child.Parent.Kind == MdKind.Configuration ? DBNull.Value : child.Parent.Id;
+                itemSynonym.Value = (object?)child.Synonym ?? DBNull.Value;
+                itemComment.Value = (object?)child.Comment ?? DBNull.Value;
                 items.ExecuteNonQuery();
                 counters.MetadataItems++;
             }
@@ -387,6 +405,21 @@ public sealed class IndexWriter
         MdReferenceKind.EventSource => "event",
         _ => "other",
     };
+
+    /// <summary>Свойства объекта метаданных одним JSON-объектом: их читает карточка объекта.</summary>
+    private static string? Properties(MdObject obj)
+    {
+        var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var property in obj.Properties)
+        {
+            if (!string.IsNullOrWhiteSpace(property.Value) && values.Count < 40)
+            {
+                values[property.Key] = property.Value;
+            }
+        }
+
+        return values.Count == 0 ? null : JsonSerializer.Serialize(values);
+    }
 
     /// <summary>
     /// Тип реквизита: сначала собственные ссылки вложенного объекта (в XML тип описан внутри самого

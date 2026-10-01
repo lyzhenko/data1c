@@ -404,136 +404,105 @@ public sealed class ToolCatalog
         ],
         async (arguments, token) =>
         {
-            var result = await AnalysisAsync(token);
+            var query = await QueryAsync(token);
             var id = arguments.RequireString("id");
             var depth = arguments.GetInt("depth", 3, 1, 4);
             var maxChildren = arguments.GetInt("maxChildren", 200, 1, 500);
-            var obj = result.Metadata.Find(id);
 
-            if (obj is null)
+            var card = query.GetMetadata(id, depth, maxChildren);
+            if (card is null)
             {
-                var query = new GraphQueryService(result.Graph);
                 var candidates = query.Search(id, 10).Select(hit => hit.Id).ToList();
                 var hint = candidates.Count > 0 ? " Похожие идентификаторы: " + string.Join(", ", candidates) : string.Empty;
                 throw new ToolException($"Объект метаданных «{id}» не найден.{hint}");
             }
 
-            var card = MetadataNode(obj, depth, maxChildren);
-            card["uuid"] = obj.Uuid?.ToString();
-            card["file"] = obj.SourcePath;
-            card["isTopLevel"] = obj.IsTopLevel;
-            card["parent"] = obj.Parent?.Id;
+            var root = MetadataNode(card);
+            root["uuid"] = card.Uuid;
+            root["file"] = card.SourcePath;
+            root["isTopLevel"] = card.IsTopLevel;
+            root["parent"] = card.ParentId;
 
             var properties = new JsonObject();
-            foreach (var property in obj.Properties.Where(static property => !string.IsNullOrWhiteSpace(property.Value)).Take(40))
+            foreach (var property in card.Properties)
             {
                 properties[property.Key] = property.Value;
             }
 
-            card["properties"] = properties.Count > 0 ? properties : null;
+            root["properties"] = properties.Count > 0 ? properties : null;
 
             var references = new JsonArray();
-            foreach (var reference in obj.References.Where(static reference => reference.Kind != MdReferenceKind.Type).Take(60))
+            foreach (var reference in card.References)
             {
                 references.Add(new JsonObject
                 {
-                    ["kind"] = reference.Kind.ToString(),
-                    ["target"] = reference.TargetId,
+                    ["kind"] = reference.Kind,
+                    ["target"] = reference.Target,
                     ["detail"] = reference.Detail,
                 });
             }
 
-            card["references"] = references.Count > 0 ? references : null;
+            root["references"] = references.Count > 0 ? references : null;
 
             var modules = new JsonArray();
-            foreach (var module in obj.Modules)
+            foreach (var path in card.ModulePaths)
             {
-                modules.Add(new JsonObject
-                {
-                    ["path"] = module.RelativePath,
-                    ["kind"] = module.Kind.ToString(),
-                });
+                modules.Add(new JsonObject { ["path"] = path });
             }
 
-            card["modules"] = modules.Count > 0 ? modules : null;
-            return Render.JsonOf(card);
+            root["modules"] = modules.Count > 0 ? modules : null;
+            return Render.JsonOf(root);
         });
 
     /// <summary>
     /// Узел дерева состава объекта: сам объект, его типы и дети. Вложенность важна для табличных частей —
     /// плоский список реквизитов не показывает, какие из них относятся к табличной части, а какие к объекту.
+    /// Карточка уже ограничена глубиной, поэтому здесь только сборка JSON.
     /// </summary>
-    private static JsonObject MetadataNode(MdObject obj, int depth, int maxChildren)
+    private static JsonObject MetadataNode(MetadataCard card)
     {
         var node = new JsonObject
         {
-            ["id"] = obj.Id,
-            ["kind"] = obj.Kind.Name,
-            ["name"] = obj.Name,
+            ["id"] = card.Id,
+            ["kind"] = card.Kind,
+            ["name"] = card.Name,
         };
 
-        if (!string.IsNullOrWhiteSpace(obj.Synonym))
+        if (!string.IsNullOrWhiteSpace(card.Synonym))
         {
-            node["synonym"] = obj.Synonym;
+            node["synonym"] = card.Synonym;
         }
 
-        if (!string.IsNullOrWhiteSpace(obj.Comment))
+        if (!string.IsNullOrWhiteSpace(card.Comment))
         {
-            node["comment"] = obj.Comment;
+            node["comment"] = card.Comment;
         }
 
-        if (obj.IsNameOnlyReference)
+        if (card.Types.Count > 0)
         {
-            node["nameOnly"] = true;
-        }
-
-        var types = obj.References
-            .Where(static reference => reference.Kind == MdReferenceKind.Type)
-            .Select(static reference => reference.TargetId)
-            .Distinct(StringComparer.Ordinal)
-            .Take(10)
-            .ToList();
-
-        if (types.Count > 0)
-        {
-            var values = new JsonArray();
-            foreach (var type in types)
+            var types = new JsonArray();
+            foreach (var type in card.Types)
             {
-                values.Add(type);
+                types.Add(type);
             }
 
-            node["types"] = values;
+            node["types"] = types;
         }
 
-        if (obj.Children.Count == 0)
+        if (card.Children.Count > 0)
         {
-            return node;
-        }
-
-        if (depth <= 1)
-        {
-            // Глубина исчерпана: показываем хотя бы состав по видам, чтобы не терять структуру.
-            var kinds = new JsonObject();
-            foreach (var group in obj.Children.GroupBy(static child => child.Kind.Name).OrderBy(static group => group.Key, StringComparer.Ordinal))
+            var children = new JsonArray();
+            foreach (var child in card.Children)
             {
-                kinds[group.Key] = group.Count();
+                children.Add(MetadataNode(child));
             }
 
-            node["childrenCount"] = obj.Children.Count;
-            node["childrenOfKinds"] = kinds;
-            return node;
+            node["children"] = children;
         }
 
-        var children = new JsonArray();
-        foreach (var child in obj.Children.Take(maxChildren))
+        if (card.ChildrenNotShown > 0)
         {
-            children.Add(MetadataNode(child, depth - 1, maxChildren));
-        }
-
-        node["children"] = children;
-        if (obj.Children.Count > maxChildren)
-        {
-            node["childrenTruncated"] = obj.Children.Count - maxChildren;
+            node[card.Children.Count > 0 ? "childrenTruncated" : "childrenCount"] = card.ChildrenNotShown;
         }
 
         return node;
@@ -1148,27 +1117,6 @@ public sealed class ToolCatalog
 
         await Task.WhenAny(warmup, Task.Delay(TimeSpan.FromSeconds(3), cancellationToken)).ConfigureAwait(false);
         return Session.Platform;
-    }
-
-    private async Task<AnalysisResult> AnalysisAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            return await Session.GetAsync(cancellationToken);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (ToolException)
-        {
-            throw;
-        }
-        catch (Exception exception)
-        {
-            var stage = Session.State;
-            throw new ToolException($"Разбор выгрузки не удался ({stage}): {exception.Message}", exception);
-        }
     }
 
     /// <summary>

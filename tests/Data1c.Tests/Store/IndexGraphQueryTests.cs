@@ -58,6 +58,45 @@ public sealed class IndexGraphQueryTests
         Assert.Equal(fixture.Nodes, statistics.NodesByKind.GetValueOrDefault("MetadataObject"));
     }
 
+    [Fact]
+    public void Карточка_объекта_берётся_из_индекса_с_составом_и_типами()
+    {
+        using var fixture = new QueryFixture();
+
+        var card = fixture.Query.GetMetadata("Catalog.Товары", depth: 3, maxChildren: 50);
+
+        Assert.NotNull(card);
+        Assert.Equal("Catalog", card.Kind);
+        Assert.Equal("Товары", card.Name);
+        Assert.True(card.IsTopLevel);
+        Assert.Null(card.ParentId);
+        Assert.Equal("Catalogs/Товары.xml", card.SourcePath);
+
+        // Реквизиты объекта лежат в составе: имя, вид и тип значения.
+        var article = Assert.Single(card.Children, static child => child.Name == "Артикул");
+        Assert.Equal("Attribute", article.Kind);
+        Assert.Equal("Catalog.Товары/Attribute.Артикул", article.Id);
+
+        var unit = Assert.Single(card.Children, static child => child.Name == "Единица");
+        Assert.Contains("Catalog.ЕдиницыИзмерения", unit.Types);
+
+        // Модули — только файлы BSL: XML форм и макетов в этом списке быть не должно.
+        Assert.All(card.ModulePaths, static path => Assert.EndsWith(".bsl", path));
+    }
+
+    [Fact]
+    public void Вложенный_объект_находится_по_составному_идентификатору()
+    {
+        using var fixture = new QueryFixture();
+
+        var card = fixture.Query.GetMetadata("Catalog.Товары/Attribute.Единица");
+
+        Assert.NotNull(card);
+        Assert.Equal("Attribute", card.Kind);
+        Assert.Equal("Catalog.Товары", card.ParentId);
+        Assert.Contains("Catalog.ЕдиницыИзмерения", card.Types);
+    }
+
     private sealed class QueryFixture : IDisposable
     {
         private readonly SqliteIndex _index;

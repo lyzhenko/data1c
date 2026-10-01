@@ -17,6 +17,35 @@ public sealed record GraphNestedHit(
     string? ParentId,
     IReadOnlyList<string> Types);
 
+/// <summary>Ссылка объекта метаданных: тип реквизита, содержимое подсистемы, право роли, форма.</summary>
+/// <param name="Kind">Вид связи (type, query, rights, form, …).</param>
+/// <param name="Target">Идентификатор цели.</param>
+/// <param name="Detail">Уточнение: имя реквизита, имя права, роль.</param>
+public sealed record MetadataReferenceInfo(string Kind, string Target, string? Detail);
+
+/// <summary>
+/// Карточка объекта метаданных деревом: сам объект, его свойства, состав, типы, ссылки и модули.
+/// Нужна, чтобы писать код по реальной структуре объекта, не поднимая весь разбор выгрузки.
+/// </summary>
+/// <param name="Children">Дети в пределах запрошенной глубины.</param>
+/// <param name="ChildrenNotShown">Сколько детей не попало в ответ: глубина или предел.</param>
+public sealed record MetadataCard(
+    string Id,
+    string Kind,
+    string Name,
+    string? Synonym,
+    string? Comment,
+    string? Uuid,
+    bool IsTopLevel,
+    string? ParentId,
+    string? SourcePath,
+    IReadOnlyList<string> Types,
+    IReadOnlyDictionary<string, string> Properties,
+    IReadOnlyList<MetadataReferenceInfo> References,
+    IReadOnlyList<string> ModulePaths,
+    IReadOnlyList<MetadataCard> Children,
+    int ChildrenNotShown);
+
 /// <summary>
 /// Запросы к графу зависимостей независимо от того, где он лежит: собран в памяти
 /// (<see cref="GraphQueryService"/>) или прочитан из SQLite-индекса.
@@ -52,4 +81,7 @@ public interface IGraphQuery
     /// поэтому поиск вынесен в общий контракт.
     /// </summary>
     IReadOnlyList<GraphNestedHit> SearchNested(string? query, int limit = 20, IReadOnlyCollection<string>? metadataKinds = null);
+
+    /// <summary>Карточка объекта метаданных деревом: свойства, состав, типы, ссылки, модули.</summary>
+    MetadataCard? GetMetadata(string? id, int depth = 3, int maxChildren = 200);
 }
