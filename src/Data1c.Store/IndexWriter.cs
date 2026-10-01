@@ -1045,9 +1045,9 @@ public sealed class IndexWriter
             """
             INSERT INTO symbols
                 (node_id, module_path, owner_id, name, name_lower, kind, is_export, start_line, end_line,
-                 region, parameters, directives, comment_head)
+                 region, parameters, parameters_count, required_count, directives, comment_head)
             VALUES (@nodeId, @module, @owner, @name, @nameLower, @kind, @isExport, @start, @end,
-                    @region, @parameters, @directives, @comment)
+                    @region, @parameters, @parametersCount, @requiredCount, @directives, @comment)
             """;
         var nodeId = insert.Parameters.Add("@nodeId", SqliteType.Text);
         var module = insert.Parameters.Add("@module", SqliteType.Text);
@@ -1060,6 +1060,8 @@ public sealed class IndexWriter
         var end = insert.Parameters.Add("@end", SqliteType.Integer);
         var region = insert.Parameters.Add("@region", SqliteType.Text);
         var parameters = insert.Parameters.Add("@parameters", SqliteType.Text);
+        var parametersCount = insert.Parameters.Add("@parametersCount", SqliteType.Integer);
+        var requiredCount = insert.Parameters.Add("@requiredCount", SqliteType.Integer);
         var directives = insert.Parameters.Add("@directives", SqliteType.Text);
         var comment = insert.Parameters.Add("@comment", SqliteType.Text);
 
@@ -1097,6 +1099,8 @@ public sealed class IndexWriter
                 end.Value = routine.EndLine;
                 region.Value = (object?)routine.Region ?? DBNull.Value;
                 parameters.Value = routine.Parameters.Count == 0 ? DBNull.Value : string.Join(", ", routine.Parameters);
+                parametersCount.Value = routine.Parameters.Count;
+                requiredCount.Value = routine.RequiredCount;
                 directives.Value = routine.Directives.Count == 0 ? DBNull.Value : string.Join(", ", routine.Directives);
                 comment.Value = (object?)commentHead ?? DBNull.Value;
                 insert.ExecuteNonQuery();
@@ -1261,9 +1265,9 @@ public sealed class IndexWriter
         forms.CommandText =
             """
             INSERT OR REPLACE INTO form_models
-                (id, name, name_lower, form_kind, source_path, object_id,
+                (id, name, name_lower, form_kind, source_path, module_path, object_id,
                  attribute_count, element_count, command_count, handler_count, resolved_handler_count)
-            VALUES (@id, @name, @nameLower, @kind, @path, @object,
+            VALUES (@id, @name, @nameLower, @kind, @path, @modulePath, @object,
                     @attributes, @elements, @commands, @handlers, @resolved)
             """;
         var formId = forms.Parameters.Add("@id", SqliteType.Text);
@@ -1271,6 +1275,7 @@ public sealed class IndexWriter
         var formNameLower = forms.Parameters.Add("@nameLower", SqliteType.Text);
         var formKind = forms.Parameters.Add("@kind", SqliteType.Text);
         var formPath = forms.Parameters.Add("@path", SqliteType.Text);
+        var formModulePath = forms.Parameters.Add("@modulePath", SqliteType.Text);
         var formObject = forms.Parameters.Add("@object", SqliteType.Text);
         var formAttributes = forms.Parameters.Add("@attributes", SqliteType.Integer);
         var formElements = forms.Parameters.Add("@elements", SqliteType.Integer);
@@ -1298,6 +1303,10 @@ public sealed class IndexWriter
         var itemIsMain = items.Parameters.Add("@isMain", SqliteType.Integer);
         var itemIsResolved = items.Parameters.Add("@isResolved", SqliteType.Integer);
 
+        // Форма и её модуль читаются разными проходами, но связь между ними известна: модуль формы
+        // объявляет владельцем саму форму. Путь модуля нужен проверке черновика.
+        var moduleByOwner = FormModulePaths(result.Modules);
+
         foreach (var obj in result.Metadata.Objects)
         {
             if (obj.Form is not { } form)
@@ -1312,6 +1321,7 @@ public sealed class IndexWriter
             formNameLower.Value = form.Name.ToLowerInvariant();
             formKind.Value = form.Kind.ToString();
             formPath.Value = (object?)form.SourcePath ?? DBNull.Value;
+            formModulePath.Value = moduleByOwner.TryGetValue(obj.Id, out var modulePath) ? modulePath : DBNull.Value;
             formObject.Value = obj.Parent is null || obj.Parent.Kind == MdKind.Configuration
                 ? DBNull.Value
                 : obj.Parent.Id;
@@ -1392,6 +1402,24 @@ public sealed class IndexWriter
 
     private static string? Tag(GraphNode node, string key) =>
         node.Tags is not null && node.Tags.TryGetValue(key, out var value) ? value : null;
+
+    /// <summary>
+    /// Пути модулей форм по идентификатору формы: модуль формы объявляет владельцем саму форму,
+    /// поэтому связь «форма → её модуль» восстанавливается из разбора без чтения XML заново.
+    /// </summary>
+    private static Dictionary<string, string> FormModulePaths(IReadOnlyList<BslModuleInfo> modules)
+    {
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var module in modules)
+        {
+            if (module.Kind == BslModuleKind.FormModule && module.OwnerId is { Length: > 0 } owner)
+            {
+                result.TryAdd(owner, module.Path);
+            }
+        }
+
+        return result;
+    }
 
     private static string ResourceContext(MdReferenceKind kind) => kind switch
     {

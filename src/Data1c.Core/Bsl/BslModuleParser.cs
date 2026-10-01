@@ -427,6 +427,7 @@ public sealed class BslModuleParser : IBslModuleParser
         i++;
 
         var parameters = new List<string>();
+        var required = 0;
         var next = i;
         var open = SkipTrivia(i);
         var hasParameterList = open < count && IsOperator(_tokens[open], "(");
@@ -467,7 +468,7 @@ public sealed class BslModuleParser : IBslModuleParser
                 return false;
             }
 
-            parameters = ParseParameters(open + 1, close, nameToken.Line);
+            (parameters, required) = ParseParameters(open + 1, close, nameToken.Line);
             next = close + 1;
         }
 
@@ -488,14 +489,25 @@ public sealed class BslModuleParser : IBslModuleParser
         {
             Region = _regionStack.Count > 0 ? _regionStack.Peek().Name : null,
             Depth = _regionStack.Count,
+            RequiredParameterCount = required,
         };
         return true;
     }
 
-    /// <summary>Собирает имена параметров между скобками; значения по умолчанию пропускает.</summary>
-    private List<string> ParseParameters(int start, int end, int line)
+    /// <summary>
+    /// Собирает имена параметров между скобками и считает, сколько из них обязательно передать.
+    /// Параметр со значением по умолчанию («Режим = Неопределено») можно не передавать: само значение
+    /// пропускается, чтобы его содержимое не попало в список параметров. Значения по умолчанию
+    /// разрешены только у последних параметров, поэтому обязательные — это те, что идут до первого «=».
+    /// </summary>
+    /// <param name="start">Индекс первого токена списка.</param>
+    /// <param name="end">Индекс закрывающей скобки.</param>
+    /// <param name="line">Строка заголовка: нужна для диагностики.</param>
+    /// <returns>Имена параметров в порядке объявления и число обязательных.</returns>
+    private (List<string> Names, int Required) ParseParameters(int start, int end, int line)
     {
         var parameters = new List<string>();
+        var required = -1;
         var i = start;
         while (i < end)
         {
@@ -520,25 +532,47 @@ public sealed class BslModuleParser : IBslModuleParser
 
             if (token.Kind == BslTokenKind.Operator && IsOperator(token, "="))
             {
-                // Значение по умолчанию пропускаем до запятой или закрывающей скобки,
-                // чтобы его содержимое не попало в список параметров.
-                var after = i + 1;
-                if (after < end && _tokens[after].Kind == BslTokenKind.Identifier)
+                // Значение по умолчанию принадлежит параметру, перед которым стоит «=»: он и все
+                // объявленные раньше обязательны. «=» без имени — уже ошибка в самом заголовке.
+                var named = HasNameBefore(i, start);
+                if (required < 0)
+                {
+                    required = named ? Math.Max(0, parameters.Count - 1) : parameters.Count;
+                }
+
+                // Значение по умолчанию пропускаем до запятой или закрывающей скобки.
+                if (!named)
                 {
                     _diagnostics.Add(new BslDiagnostic(
                         BslDiagnosticKind.UnexpectedToken,
-                        $"Параметр «{_tokens[after].GetText()}» объявлен без имени.",
+                        "Параметр объявлен без имени: значение по умолчанию указано там, где ожидалось имя.",
                         line));
                 }
 
-                i = SkipDefaultValue(after, end);
+                i = SkipDefaultValue(i + 1, end);
                 continue;
             }
 
             i++;
         }
 
-        return parameters;
+        return (parameters, required < 0 ? parameters.Count : required);
+    }
+
+    /// <summary>Стоит ли перед «=» имя параметра: переводы строк и комментарии пропускаются.</summary>
+    private bool HasNameBefore(int index, int start)
+    {
+        for (var i = index - 1; i >= start; i--)
+        {
+            if (_tokens[i].Kind is BslTokenKind.NewLine or BslTokenKind.Comment or BslTokenKind.Directive)
+            {
+                continue;
+            }
+
+            return _tokens[i].Kind == BslTokenKind.Identifier;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1129,6 +1163,9 @@ public sealed class BslModuleParser : IBslModuleParser
 
         public List<string> Parameters { get; } = parameters;
 
+        /// <summary>Сколько параметров обязательно передать: у остальных есть значение по умолчанию.</summary>
+        public int RequiredParameterCount { get; init; }
+
         public int StartLine { get; } = startLine;
 
         /// <summary>Индекс токена, с которого начинается тело процедуры, сразу после заголовка.</summary>
@@ -1161,6 +1198,7 @@ public sealed class BslModuleParser : IBslModuleParser
             Metadata)
         {
             QueryReferences = Queries,
+            RequiredParameterCount = RequiredParameterCount,
         };
     }
 
