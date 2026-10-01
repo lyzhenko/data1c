@@ -13,9 +13,6 @@ public sealed record MetadataReadOptions
     /// <summary>Привязывать файлы модулей (.bsl) к объектам метаданных.</summary>
     public bool AttachModules { get; init; } = true;
 
-    /// <summary>Разбирать права ролей (Ext/Rights.xml). Даёт сотни тысяч рёбер, по умолчанию выключено.</summary>
-    public bool IncludeRoleRights { get; init; }
-
     /// <summary>Разбирать описания форм (Ext/Form.xml): реквизиты, элементы, команды, обработчики событий.</summary>
     public bool ParseForms { get; init; } = true;
 
@@ -92,7 +89,6 @@ public sealed class MetadataDumpReader
         var warnings = new ConcurrentBag<string>();
         var xmlFiles = new List<DumpFile>();
         var bslFiles = new List<DumpFile>();
-        var rightsFiles = new List<DumpFile>();
         var formFiles = new List<DumpFile>();
         var hasConfigurationFile = false;
 
@@ -122,11 +118,8 @@ public sealed class MetadataDumpReader
                     }
                     else if (string.Equals(fileName, "Rights.xml", StringComparison.OrdinalIgnoreCase))
                     {
-                        if (options.IncludeRoleRights)
-                        {
-                            rightsFiles.Add(file);
-                        }
-
+                        // Права ролей разбирает отдельный RightsDumpReader: здесь файл только
+                        // пропускается, чтобы Rights.xml не считался объектом метаданных.
                         break;
                     }
                     else if (options.ParseForms && string.Equals(fileName, "Form.xml", StringComparison.OrdinalIgnoreCase))
@@ -226,11 +219,6 @@ public sealed class MetadataDumpReader
         if (formFiles.Count > 0)
         {
             AttachForms(source, formFiles, dirIndex, warnings, cancellationToken);
-        }
-
-        if (rightsFiles.Count > 0)
-        {
-            AttachRoleRights(source, rightsFiles, dirIndex, configuration, warnings, cancellationToken);
         }
 
         var model = new MdObjectModel(configuration, allObjects);
@@ -475,33 +463,6 @@ public sealed class MetadataDumpReader
         "Ordinary" or "Обычная" => FormKind.Ordinary,
         _ => null,
     };
-
-    private static void AttachRoleRights(
-        IDumpSource source,
-        List<DumpFile> rightsFiles,
-        Dictionary<string, MdObject> dirIndex,
-        MdObject configuration,
-        ConcurrentBag<string> warnings,
-        CancellationToken cancellationToken)
-    {
-        Parallel.ForEach(
-            rightsFiles,
-            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount, CancellationToken = cancellationToken },
-            file =>
-            {
-                var owner = FindOwnerByDirectory(file.RelativePath, dirIndex) ?? configuration;
-                try
-                {
-                    using var stream = source.OpenRead(file);
-                    var references = ParseRights(stream, file.RelativePath);
-                    owner.ReferencesMutable.AddRange(references);
-                }
-                catch (Exception ex)
-                {
-                    warnings.Add($"Права роли «{file.RelativePath}» не разобраны: {ex.Message}");
-                }
-            });
-    }
 
     // --- Разбор XML -------------------------------------------------------------------------
 
@@ -882,86 +843,6 @@ public sealed class MetadataDumpReader
             text);
 
         obj.AddReference(reference);
-    }
-
-    private static List<MdReference> ParseRights(Stream stream, string sourcePath)
-    {
-        var references = new List<MdReference>();
-        using var reader = XmlReader.Create(DumpTextReader.CreateTextReader(stream), ReaderSettings);
-        if (!MoveToElement(reader))
-        {
-            return references;
-        }
-
-        var depth = reader.Depth;
-        if (reader.IsEmptyElement)
-        {
-            return references;
-        }
-
-        while (reader.Read())
-        {
-            if (reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth)
-            {
-                break;
-            }
-
-            if (reader.NodeType != XmlNodeType.Element)
-            {
-                continue;
-            }
-
-            if (!string.Equals(reader.LocalName, "object", StringComparison.Ordinal))
-            {
-                SkipCurrent(reader);
-                continue;
-            }
-
-            ReadRightsObject(reader, references, sourcePath);
-        }
-
-        return references;
-    }
-
-    private static void ReadRightsObject(XmlReader reader, List<MdReference> references, string sourcePath)
-    {
-        if (reader.IsEmptyElement)
-        {
-            return;
-        }
-
-        var depth = reader.Depth;
-        while (reader.Read())
-        {
-            if (reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth)
-            {
-                break;
-            }
-
-            if (reader.NodeType != XmlNodeType.Element)
-            {
-                continue;
-            }
-
-            if (string.Equals(reader.LocalName, "name", StringComparison.Ordinal))
-            {
-                var text = ReadLeafText(reader);
-                if (MdRefParser.TryParse(text, out var kind, out var name, out var rest) && !kind.IsUnknown)
-                {
-                    references.Add(new MdReference(
-                        MdNaming.CreateId(kind, name),
-                        kind,
-                        name,
-                        MdReferenceKind.RoleRight,
-                        rest,
-                        text));
-                }
-
-                continue;
-            }
-
-            SkipCurrent(reader);
-        }
     }
 
     private readonly record struct ParsedFile(string Path, MdObject Object);
