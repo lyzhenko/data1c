@@ -28,6 +28,10 @@ public sealed class BslModuleParserTests
         Assert.Equal(BslRoutineKind.Function, routine.Kind);
         Assert.True(routine.IsExport);
         Assert.Equal(["Документ", "ИмяМакета", "Режим"], routine.Parameters);
+
+        // Значения по умолчанию делают параметры необязательными: обязателен только «Документ».
+        Assert.Equal(1, routine.RequiredCount);
+        Assert.Equal(["Документ"], routine.RequiredParameters);
         Assert.Equal(4, routine.StartLine);
         Assert.Equal(6, routine.EndLine);
         Assert.Equal(3, routine.LineCount);
@@ -447,6 +451,38 @@ public sealed class BslModuleParserTests
         Assert.Equal(BslModuleKind.FormModule, info.Kind);
         Assert.Equal("CommonForm.Форма", info.OwnerId);
         Assert.Equal("module:CommonForms/Форма/Ext/Form/Module.bsl", info.Id);
+    }
+
+    [Fact]
+    public void ЗначенияПоУмолчаниюВыражениямиНеСчитаютсяПараметрами()
+    {
+        // Значение по умолчанию — выражение: имена внутри него параметрами не являются,
+        // а обязательные параметры заканчиваются на первом «=».
+        var text = """
+            Функция Период(Дата, Начало = НачалоМесяца(Дата), Конец = КонецМесяца(Дата))
+                Возврат Начало;
+            КонецФункции
+            """;
+
+        var info = Парсер().Parse(Модуль(text));
+
+        var routine = Assert.Single(info.Routines);
+        Assert.Equal(["Дата", "Начало", "Конец"], routine.Parameters);
+        Assert.Equal(1, routine.RequiredCount);
+        Assert.Empty(info.Diagnostics);
+    }
+
+    [Fact]
+    public void ПараметрБезИмениПередЗначениемПоУмолчаниюДаётДиагностику()
+    {
+        var info = Парсер().Parse(Модуль("Процедура П(А, = 1)\nКонецПроцедуры"));
+
+        var routine = Assert.Single(info.Routines);
+        Assert.Equal(["А"], routine.Parameters);
+
+        // «=» без имени — ошибка заголовка; объявленный параметр от этого обязательным быть не перестаёт.
+        Assert.Equal(1, routine.RequiredCount);
+        Assert.Contains(info.Diagnostics, static diagnostic => diagnostic.Kind == BslDiagnosticKind.UnexpectedToken);
     }
 
     private static BslModuleParser Парсер() => new();

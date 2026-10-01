@@ -8,18 +8,26 @@ namespace Data1c.Store;
 /// <list type="bullet">
 /// <item><c>files</c> — файлы выгрузки с размером и временем правки: основа инкрементальной переиндексации;</item>
 /// <item><c>nodes</c>, <c>edges</c> — граф зависимостей (объекты, модули, процедуры, платформа, внешние цели);</item>
-/// <item><c>symbols</c> — процедуры и функции с номерами строк: поиск и проверка кода;</item>
+/// <item><c>symbols</c> — процедуры и функции с номерами строк, именами и числом параметров: поиск и проверка кода;</item>
 /// <item><c>calls</c> — вызовы с текстом цели: работает даже когда цель не разрешена;</item>
 /// <item><c>metadata_objects</c>, <c>metadata_items</c> — объекты конфигурации, реквизиты, формы, макеты;</item>
 /// <item><c>metadata_refs</c> — обращения к метаданным из кода, из текстов запросов, типы и права;</item>
-/// <item><c>form_models</c>, <c>form_items</c> — описания форм: реквизиты, элементы, команды и обработчики;</item>
+/// <item><c>form_models</c>, <c>form_items</c> — описания форм: реквизиты, элементы, команды и обработчики;
+/// <c>form_models.module_path</c> ведёт к модулю формы, поэтому по пути модуля видно, какие его процедуры
+/// зарегистрированы обработчиками;</item>
 /// <item><c>*_fts</c> — полнотекстовый поиск: триграммы для имён (поиск по подстроке), unicode61 для термов и BM25.</item>
 /// </list>
 /// </remarks>
 internal static class IndexSchema
 {
     /// <summary>Версия схемы. Меняется вместе с DDL.</summary>
-    internal const int Version = 6;
+    /// <remarks>
+    /// v7 добавила <c>symbols.parameters_count</c> и <c>symbols.required_count</c> — число объявленных
+    /// параметров процедуры и число обязательных (без значений по умолчанию) — и
+    /// <c>form_models.module_path</c>, связывающий форму с её модулем. Старый индекс несовместим
+    /// и пересобирается.
+    /// </remarks>
+    internal const int Version = 7;
 
     internal static readonly string[] Statements =
     [
@@ -66,6 +74,10 @@ internal static class IndexSchema
         // Поиск вызывающих по тексту вызова (имя цели) — частый запрос агента: имя известно, узла нет.
         "CREATE INDEX IF NOT EXISTS idx_edges_calls_detail ON edges(detail) WHERE kind = 'Calls'",
 
+        // Имена параметров хранятся одной строкой (нужны для подсказки в сообщении), а их число —
+        // отдельными целыми: проверке черновика они нужны на каждый вызов, и разбирать строку ради
+        // счётчиков незачем. Обязательных параметров может быть меньше объявленных: у остальных
+        // есть значение по умолчанию («Режим = Неопределено»), и передавать их не обязательно.
         """
         CREATE TABLE IF NOT EXISTS symbols (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,6 +92,8 @@ internal static class IndexSchema
             end_line INTEGER NOT NULL,
             region TEXT,
             parameters TEXT,
+            parameters_count INTEGER NOT NULL DEFAULT 0,
+            required_count INTEGER NOT NULL DEFAULT 0,
             directives TEXT,
             comment_head TEXT
         )
@@ -145,6 +159,8 @@ internal static class IndexSchema
         // Описания форм (Ext/Form.xml): отдельная таблица на форму и построчный состав.
         // Реквизиты, элементы, команды и обработчики лежат в одной таблице: у них общий набор
         // полей (имя, привязка, обработчик, строка), а вид строки различается значением kind.
+        // module_path — путь модуля формы: по нему проверка черновика узнаёт зарегистрированные
+        // обработчики, не разбирая XML заново.
         """
         CREATE TABLE IF NOT EXISTS form_models (
             id TEXT PRIMARY KEY,
@@ -152,6 +168,7 @@ internal static class IndexSchema
             name_lower TEXT NOT NULL,
             form_kind TEXT,
             source_path TEXT,
+            module_path TEXT,
             object_id TEXT,
             attribute_count INTEGER NOT NULL DEFAULT 0,
             element_count INTEGER NOT NULL DEFAULT 0,
@@ -162,6 +179,7 @@ internal static class IndexSchema
         """,
         "CREATE INDEX IF NOT EXISTS idx_forms_object ON form_models(object_id)",
         "CREATE INDEX IF NOT EXISTS idx_forms_name ON form_models(name_lower)",
+        "CREATE INDEX IF NOT EXISTS idx_forms_module ON form_models(module_path)",
 
         """
         CREATE TABLE IF NOT EXISTS form_items (

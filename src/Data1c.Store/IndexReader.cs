@@ -586,7 +586,7 @@ public sealed class IndexReader
             using var command = _index.CreateCommand(
                 """
                 SELECT s.id, s.node_id, s.module_path, s.owner_id, s.name, s.kind, s.is_export, s.start_line,
-                       s.end_line, s.region, s.parameters, s.comment_head
+                       s.end_line, s.region, s.parameters, s.parameters_count, s.required_count, s.comment_head
                 FROM terms_fts t
                 JOIN symbols s ON s.id = CAST(t.symbol_id AS INTEGER)
                 WHERE terms_fts MATCH @match
@@ -596,26 +596,7 @@ public sealed class IndexReader
             command.Parameters.AddWithValue("@match", match);
             command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 200));
 
-            using var reader = command.ExecuteReader();
-            var result = new List<SymbolRow>();
-            while (reader.Read())
-            {
-                result.Add(new SymbolRow(
-                    reader.GetInt64(0),
-                    reader.GetString(1),
-                    reader.GetString(2),
-                    reader.IsDBNull(3) ? null : reader.GetString(3),
-                    reader.GetString(4),
-                    reader.GetString(5),
-                    reader.GetInt32(6) != 0,
-                    reader.GetInt32(7),
-                    reader.GetInt32(8),
-                    reader.IsDBNull(9) ? null : reader.GetString(9),
-                    reader.IsDBNull(10) ? null : reader.GetString(10),
-                    reader.IsDBNull(11) ? null : reader.GetString(11)));
-            }
-
-            return (IReadOnlyList<SymbolRow>)result;
+            return (IReadOnlyList<SymbolRow>)ReadSymbols(command);
         });
     }
 
@@ -663,7 +644,7 @@ public sealed class IndexReader
             var sql =
                 $"""
                  SELECT s.id, s.node_id, s.module_path, s.owner_id, s.name, s.kind, s.is_export, s.start_line,
-                        s.end_line, s.region, s.parameters, s.comment_head
+                        s.end_line, s.region, s.parameters, s.parameters_count, s.required_count, s.comment_head
                  FROM symbols s
                  WHERE {condition}
                  {order}LIMIT @limit
@@ -712,7 +693,9 @@ public sealed class IndexReader
                 reader.GetInt32(8),
                 reader.IsDBNull(9) ? null : reader.GetString(9),
                 reader.IsDBNull(10) ? null : reader.GetString(10),
-                reader.IsDBNull(11) ? null : reader.GetString(11)));
+                reader.GetInt32(11),
+                reader.GetInt32(12),
+                reader.IsDBNull(13) ? null : reader.GetString(13)));
         }
 
         return result;
@@ -858,30 +841,12 @@ public sealed class IndexReader
     {
         using var command = _index.CreateCommand(
             """
-            SELECT id, node_id, module_path, owner_id, name, kind, is_export, start_line, end_line, region, parameters, comment_head
+            SELECT id, node_id, module_path, owner_id, name, kind, is_export, start_line, end_line, region,
+                   parameters, parameters_count, required_count, comment_head
             FROM symbols WHERE module_path = @path ORDER BY start_line
             """);
         command.Parameters.AddWithValue("@path", modulePath);
-        using var reader = command.ExecuteReader();
-        var result = new List<SymbolRow>();
-        while (reader.Read())
-        {
-            result.Add(new SymbolRow(
-                reader.GetInt64(0),
-                reader.GetString(1),
-                reader.GetString(2),
-                reader.IsDBNull(3) ? null : reader.GetString(3),
-                reader.GetString(4),
-                reader.GetString(5),
-                reader.GetInt32(6) != 0,
-                reader.GetInt32(7),
-                reader.GetInt32(8),
-                reader.IsDBNull(9) ? null : reader.GetString(9),
-                reader.IsDBNull(10) ? null : reader.GetString(10),
-                reader.IsDBNull(11) ? null : reader.GetString(11)));
-        }
-
-        return result;
+        return (IReadOnlyList<SymbolRow>)ReadSymbols(command);
     });
 
     /// <summary>Процедуры и функции одного объекта-владельца: «CommonModule.ОбщегоНазначения».</summary>
@@ -898,12 +863,56 @@ public sealed class IndexReader
         {
             using var command = _index.CreateCommand(
                 """
-                SELECT id, node_id, module_path, owner_id, name, kind, is_export, start_line, end_line, region, parameters, comment_head
+                SELECT id, node_id, module_path, owner_id, name, kind, is_export, start_line, end_line, region,
+                       parameters, parameters_count, required_count, comment_head
                 FROM symbols WHERE owner_id = @owner ORDER BY start_line LIMIT @limit
                 """);
             command.Parameters.AddWithValue("@owner", ownerId.Trim());
             command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 1000));
             return (IReadOnlyList<SymbolRow>)ReadSymbols(command);
+        });
+    }
+
+    /// <summary>
+    /// Зарегистрирована ли процедура модуля обработчиком события или команды формы. Нужно проверке
+    /// черновика: параметры обработчиков задаёт платформа, и «неиспользуемый параметр» для них
+    /// ничего не значит.
+    /// </summary>
+    /// <remarks>
+    /// Сравнение имён идёт в памяти: <c>lower()</c> в SQLite кириллицу не знает, а имена процедур
+    /// записаны так, как их написали в конфигурации. Обработчиков у формы единицы, поэтому перебор
+    /// строк дешевле лишней колонки с приведённым именем.
+    /// </remarks>
+    /// <param name="modulePath">Путь модуля формы внутри выгрузки.</param>
+    /// <param name="routineName">Имя процедуры модуля.</param>
+    public bool IsEventHandler(string modulePath, string routineName)
+    {
+        if (string.IsNullOrWhiteSpace(modulePath) || string.IsNullOrWhiteSpace(routineName))
+        {
+            return false;
+        }
+
+        var name = routineName.Trim();
+        return _index.WithLock(() =>
+        {
+            using var command = _index.CreateCommand(
+                """
+                SELECT i.handler
+                FROM form_models m
+                JOIN form_items i ON i.form_id = m.id
+                WHERE m.module_path = @path AND i.handler IS NOT NULL
+                """);
+            command.Parameters.AddWithValue("@path", modulePath.Trim());
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(0), name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         });
     }
 

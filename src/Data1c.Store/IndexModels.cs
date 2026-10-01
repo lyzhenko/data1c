@@ -15,6 +15,22 @@ public sealed record NodeRow(
 public sealed record EdgeRow(string SourceId, string TargetId, string Kind, int? Line = null, string? Detail = null);
 
 /// <summary>Процедура или функция в индексе.</summary>
+/// <param name="Id">Идентификатор строки символа.</param>
+/// <param name="NodeId">Идентификатор узла графа: «routine:module:…».</param>
+/// <param name="ModulePath">Путь модуля, в котором объявлена процедура.</param>
+/// <param name="OwnerId">Идентификатор объекта-владельца модуля.</param>
+/// <param name="Name">Имя процедуры или функции.</param>
+/// <param name="Kind">Вид: «Procedure» или «Function».</param>
+/// <param name="IsExport">Объявлена с ключевым словом «Экспорт».</param>
+/// <param name="StartLine">Строка заголовка.</param>
+/// <param name="EndLine">Строка завершения.</param>
+/// <param name="Region">Область препроцессора, если процедура внутри области.</param>
+/// <param name="Parameters">Имена параметров через запятую; null — параметров нет.</param>
+/// <param name="ParametersCount">Число объявленных параметров.</param>
+/// <param name="RequiredCount">
+/// Сколько параметров обязательно передать: у остальных есть значение по умолчанию.
+/// </param>
+/// <param name="CommentHead">Шапка комментария над процедурой.</param>
 public sealed record SymbolRow(
     long Id,
     string NodeId,
@@ -27,6 +43,8 @@ public sealed record SymbolRow(
     int EndLine,
     string? Region = null,
     string? Parameters = null,
+    int ParametersCount = 0,
+    int RequiredCount = 0,
     string? CommentHead = null);
 
 /// <summary>Объект метаданных целиком: свойства, признак верхнего уровня и владелец.</summary>

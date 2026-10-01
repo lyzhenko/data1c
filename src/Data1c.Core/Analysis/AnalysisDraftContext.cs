@@ -133,6 +133,38 @@ public sealed class AnalysisDraftContext : IDraftContext
         !string.IsNullOrWhiteSpace(kind) &&
         _result.Metadata.Objects.Any(item => string.Equals(item.Kind.Name, kind, StringComparison.OrdinalIgnoreCase));
 
+    /// <inheritdoc/>
+    public bool IsEventHandler(string modulePath, string routineName)
+    {
+        if (string.IsNullOrWhiteSpace(modulePath) || string.IsNullOrWhiteSpace(routineName))
+        {
+            return false;
+        }
+
+        var path = modulePath.Trim();
+        var name = routineName.Trim();
+        foreach (var module in _modules)
+        {
+            if (!string.Equals(module.Path, path, StringComparison.OrdinalIgnoreCase) ||
+                module.OwnerId is not { Length: > 0 } owner)
+            {
+                continue;
+            }
+
+            // Обработчики формы и её команд ссылаются на процедуры модуля по имени.
+            var form = _result.Metadata.Find(owner)?.Form;
+            if (form is null)
+            {
+                return false;
+            }
+
+            return form.Handlers.Any(handler => string.Equals(handler.Procedure, name, StringComparison.OrdinalIgnoreCase))
+                || form.Commands.Any(command => string.Equals(command.Handler, name, StringComparison.OrdinalIgnoreCase));
+        }
+
+        return false;
+    }
+
     private static DraftSymbol ToDraft(BslModuleInfo module, BslRoutine routine) => new(
         routine.Name,
         routine.Kind.ToString(),
@@ -140,6 +172,7 @@ public sealed class AnalysisDraftContext : IDraftContext
         module.Path,
         module.OwnerId,
         routine.Parameters,
+        routine.RequiredCount,
         routine.StartLine,
         routine.EndLine);
 

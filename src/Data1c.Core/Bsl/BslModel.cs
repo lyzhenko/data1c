@@ -132,6 +132,22 @@ public enum BslDiagnosticKind
 public sealed record BslDiagnostic(BslDiagnosticKind Kind, string Message, int Line);
 
 /// <summary>Процедура или функция модуля.</summary>
+/// <param name="Name">Имя процедуры или функции.</param>
+/// <param name="Kind">Процедура или функция.</param>
+/// <param name="IsExport">Объявлена с ключевым словом «Экспорт».</param>
+/// <param name="Parameters">Имена параметров в порядке объявления.</param>
+/// <param name="StartLine">Строка заголовка.</param>
+/// <param name="EndLine">Строка завершения.</param>
+/// <param name="Depth">Глубина вложенности областей.</param>
+/// <param name="Region">Область, в которой объявлена процедура.</param>
+/// <param name="Directives">Директивы компиляции перед заголовком.</param>
+/// <param name="Calls">Вызовы в теле.</param>
+/// <param name="MetadataAccesses">Обращения к метаданным в теле.</param>
+/// <param name="RequiredParameterCount">
+/// Сколько параметров обязательно передать. Параметры со значением по умолчанию
+/// («Режим = Неопределено») можно не передавать, поэтому обязательных может быть меньше объявленных.
+/// <see langword="null"/> — заголовок собран не разборщиком: тогда обязательны все параметры.
+/// </param>
 public sealed record BslRoutine(
     string Name,
     BslRoutineKind Kind,
@@ -143,12 +159,21 @@ public sealed record BslRoutine(
     string? Region,
     IReadOnlyList<string> Directives,
     IReadOnlyList<BslCall> Calls,
-    IReadOnlyList<BslMetadataAccess> MetadataAccesses)
+    IReadOnlyList<BslMetadataAccess> MetadataAccesses,
+    int? RequiredParameterCount = null)
 {
     /// <summary>
     /// Таблицы метаданных из текстов запросов процедуры: номер строки и фрагмент запроса.
     /// </summary>
     public IReadOnlyList<BslQueryReference> QueryReferences { get; init; } = [];
+
+    /// <summary>
+    /// Сколько параметров обязательно передать: объявленные, у которых нет значения по умолчанию.
+    /// </summary>
+    public int RequiredCount => RequiredParameterCount ?? Parameters.Count;
+
+    /// <summary>Имена обязательных параметров: они идут первыми, значения по умолчанию — только у последних.</summary>
+    public IEnumerable<string> RequiredParameters => Parameters.Take(RequiredCount);
 
     /// <summary>Число строк тела процедуры.</summary>
     public int LineCount => EndLine - StartLine + 1;

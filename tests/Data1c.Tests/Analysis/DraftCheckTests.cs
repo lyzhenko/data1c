@@ -1,4 +1,5 @@
 using Data1c.Core.Analysis;
+using Data1c.Core.Dump;
 using Data1c.Core.Platform;
 using Data1c.Store;
 using Data1c.Tests.Platform;
@@ -267,6 +268,209 @@ public sealed class DraftCheckTests
     }
 
     [Fact]
+    public void Нехватка_аргументов_даёт_ошибку_с_числом_и_именами()
+    {
+        // В BSL необязательных параметров нет: и «ни одного из двух», и «один из двух» — ошибка,
+        // и в сообщении должны быть и число, и имена, чтобы агент не гадал, что передать.
+        using var fixture = new Fixture(dump: () => CreateArgumentsDump());
+
+        var result = fixture.Check(
+            """
+            Процедура Тест()
+                РаботаСДанными.ЗагрузитьДанные();
+                РаботаСДанными.ЗагрузитьДанные("Ссылка");
+            КонецПроцедуры
+            """);
+
+        Assert.Equal(2, result.Problems.Count);
+        Assert.All(result.Problems, static problem =>
+        {
+            Assert.Equal(DraftProblemKind.WrongArgumentCount, problem.Kind);
+            Assert.Equal(DraftProblemSeverity.Error, problem.Severity);
+        });
+
+        Assert.Equal(2, result.Problems[0].Line);
+        Assert.Contains("ЗагрузитьДанные", result.Problems[0].Message, StringComparison.Ordinal);
+        Assert.Contains("ожидается 2 (Ссылка, Режим), передано 0", result.Problems[0].Message, StringComparison.Ordinal);
+
+        Assert.Equal(3, result.Problems[1].Line);
+        Assert.Contains("ожидается 2 (Ссылка, Режим), передано 1", result.Problems[1].Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Значения_по_умолчанию_не_считаются_нехваткой_аргументов()
+    {
+        // У «ЗагрузитьДанныеПоФильтру» обязателен только первый параметр: остальные объявлены
+        // со значениями по умолчанию, поэтому вызов с одним и с двумя аргументами верен.
+        using var fixture = new Fixture(dump: () => CreateArgumentsDump());
+
+        var result = fixture.Check(
+            """
+            Процедура Тест()
+                РаботаСДанными.ЗагрузитьДанныеПоФильтру("Ссылка");
+                РаботаСДанными.ЗагрузитьДанныеПоФильтру("Ссылка", Истина);
+                ОбработатьЛокально("Ссылка");
+            КонецПроцедуры
+
+            Процедура ОбработатьЛокально(Ссылка, Режим = Неопределено)
+                Сообщить(Ссылка);
+                Сообщить(Режим);
+            КонецПроцедуры
+            """);
+
+        Assert.Empty(result.Problems);
+    }
+
+    [Fact]
+    public void Нехватка_обязательных_аргументов_учитывает_значения_по_умолчанию()
+    {
+        using var fixture = new Fixture(dump: () => CreateArgumentsDump());
+
+        var result = fixture.Check(
+            """
+            Процедура Тест()
+                РаботаСДанными.ЗагрузитьДанныеПоФильтру();
+            КонецПроцедуры
+            """);
+
+        var problem = Assert.Single(result.Problems);
+        Assert.Equal(DraftProblemKind.WrongArgumentCount, problem.Kind);
+        Assert.Equal(DraftProblemSeverity.Error, problem.Severity);
+        Assert.Contains("ожидается 1 (Ссылка), передано 0", problem.Message, StringComparison.Ordinal);
+        Assert.Contains("Режим, Дата", problem.Hint, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Вызов_без_квалификатора_не_судится_по_одноимённому_методу_другого_модуля()
+    {
+        // Вызов без получателя адресует свой модуль или глобальный метод общего модуля; одноимённые
+        // процедуры разных модулей объявлены по-разному, поэтому по первому совпадению не судим.
+        using var fixture = new Fixture(dump: () => CreateArgumentsDump());
+
+        var result = fixture.Check(
+            """
+            Процедура Тест()
+                ЗагрузитьДанные("Ссылка");
+            КонецПроцедуры
+            """);
+
+        Assert.Empty(result.Problems);
+    }
+
+    [Fact]
+    public void Вызов_неэкспортного_метода_общего_модуля_даёт_ошибку()
+    {
+        using var fixture = new Fixture(dump: () => CreateArgumentsDump());
+
+        var result = fixture.Check(
+            """
+            Процедура Тест()
+                РаботаСДанными.ВнутренняяОбработка();
+            КонецПроцедуры
+            """);
+
+        var problem = Assert.Single(result.Problems);
+        Assert.Equal(2, problem.Line);
+        Assert.Equal(DraftProblemKind.MethodNotExported, problem.Kind);
+        Assert.Equal(DraftProblemSeverity.Error, problem.Severity);
+        Assert.Contains("РаботаСДанными.ВнутренняяОбработка", problem.Message, StringComparison.Ordinal);
+        Assert.Contains("не экспортирован", problem.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Вызов_неэкспортного_метода_из_своего_модуля_разрешён()
+    {
+        // На реальной выгрузке таких вызовов сотни тысяч: свой модуль видит свои же процедуры
+        // без «Экспорт», и замечание на них было бы ложным.
+        using var fixture = new Fixture(dump: () => CreateArgumentsDump());
+
+        var result = fixture.Check(
+            """
+            Процедура Тест()
+                РаботаСДанными.ВнутренняяОбработка();
+            КонецПроцедуры
+            """,
+            SampleDump.SecondCommonModuleBslPath);
+
+        Assert.Empty(result.Problems);
+    }
+
+    [Fact]
+    public void Параметры_обработчиков_формы_не_считаются_неиспользуемыми()
+    {
+        // Обработчики формы зарегистрированы в её описании: параметры им задаёт платформа,
+        // поэтому «Отказ», «Элемент» и «Команда» не обязаны употребляться в теле процедуры.
+        using var fixture = new Fixture(dump: () => FormSampleDump.Create());
+
+        var result = fixture.Check(FormSampleDump.FormModuleBsl, FormSampleDump.FormModulePath);
+
+        Assert.Empty(result.Problems);
+    }
+
+    [Fact]
+    public void Неиспользуемый_параметр_зарегистрированного_обработчика_не_даёт_замечания()
+    {
+        // Имя параметра здесь нештатное: признак «это обработчик» берётся из данных формы,
+        // а не из списка привычных имён.
+        var source = FormSampleDump.Create();
+        source.AddText(
+            FormSampleDump.FormModulePath,
+            """
+            &НаКлиенте
+            Процедура ПриОткрытии(ДополнительныйКонтекст)
+            	Сообщить("Открытие");
+            КонецПроцедуры
+            """);
+
+        using var fixture = new Fixture(dump: () => source);
+
+        var result = fixture.Check(
+            """
+            &НаКлиенте
+            Процедура ПриОткрытии(ДополнительныйКонтекст)
+            	Сообщить("Открытие");
+            КонецПроцедуры
+            """,
+            FormSampleDump.FormModulePath);
+
+        Assert.Empty(result.Problems);
+    }
+
+    [Fact]
+    public void Параметры_штатных_обработчиков_не_считаются_неиспользуемыми_без_данных_формы()
+    {
+        // Формы в конфигурации может ещё не быть: тогда обработчик узнаётся по штатным параметрам.
+        using var fixture = new Fixture();
+
+        var result = fixture.Check(
+            """
+            Процедура ПередЗаписью(Отказ, СтандартнаяОбработка)
+                Сообщить("запись");
+            КонецПроцедуры
+            """);
+
+        Assert.Empty(result.Problems);
+    }
+
+    [Fact]
+    public void Обычный_неиспользуемый_параметр_остаётся_замечанием()
+    {
+        using var fixture = new Fixture();
+
+        var result = fixture.Check(
+            """
+            Процедура Обработать(Ссылка, Режим)
+                Сообщить(Ссылка);
+            КонецПроцедуры
+            """);
+
+        var problem = Assert.Single(result.Problems);
+        Assert.Equal(DraftProblemKind.UnusedParameter, problem.Kind);
+        Assert.Equal(DraftProblemSeverity.Warning, problem.Severity);
+        Assert.Contains("Режим", problem.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Черновик_без_пути_проверяется_по_контексту_в_памяти()
     {
         // Путь у черновика может отсутствовать, а индекс — ещё не собраться: тогда факты берутся
@@ -308,14 +512,39 @@ public sealed class DraftCheckTests
         Assert.Equal(new[] { 1, 4, 5 }, result.Problems.Select(static p => p.Line).ToArray());
     }
 
+    /// <summary>
+    /// Выгрузка <see cref="SampleDump"/> с другим общим модулем «РаботаСДанными»: в нём есть процедура
+    /// с двумя параметрами и процедура без «Экспорт» — на них проверяются аргументы и доступность.
+    /// </summary>
+    private static InMemoryDumpSource CreateArgumentsDump()
+    {
+        var source = SampleDump.Create();
+        source.AddText(SampleDump.SecondCommonModuleBslPath, ArgumentsModuleBsl);
+        return source;
+    }
+
+    private const string ArgumentsModuleBsl = """
+        Процедура ЗагрузитьДанные(Ссылка, Режим) Экспорт
+            Сообщить(Ссылка);
+        КонецПроцедуры
+
+        Процедура ЗагрузитьДанныеПоФильтру(Ссылка, Режим = Неопределено, Дата = Неопределено) Экспорт
+            Сообщить(Ссылка);
+        КонецПроцедуры
+
+        Процедура ВнутренняяОбработка()
+            Сообщить("внутри");
+        КонецПроцедуры
+        """;
+
     /// <summary>Выгрузка <see cref="SampleDump"/> в SQLite-индексе плюс синтетическая справка платформы.</summary>
     private sealed class Fixture : IDisposable
     {
         private readonly SqliteIndex _index;
 
-        internal Fixture(bool withPlatform = true)
+        internal Fixture(bool withPlatform = true, Func<IDumpSource>? dump = null)
         {
-            var source = SampleDump.Create();
+            var source = (dump ?? (() => SampleDump.Create()))();
             var analysis = new DumpAnalyzer().Analyze(source);
             _index = SqliteIndex.OpenInMemory();
             new IndexWriter(_index) { IncludeComments = false }.Write(source, analysis);
@@ -327,7 +556,8 @@ public sealed class DraftCheckTests
 
         internal PlatformHelpIndex? Platform { get; }
 
-        internal DraftCheckResult Check(string text) => new DraftCheck(Context, Platform).Check(text);
+        internal DraftCheckResult Check(string text, string? path = null) =>
+            new DraftCheck(Context, Platform).Check(text, path);
 
         public void Dispose() => _index.Dispose();
 

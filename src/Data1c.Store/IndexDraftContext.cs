@@ -4,7 +4,7 @@ namespace Data1c.Store;
 
 /// <summary>
 /// Факты о конфигурации для проверки черновика (Э2-2) поверх готового SQLite-индекса:
-/// процедуры и функции, их параметры и объекты метаданных.
+/// процедуры и функции, их параметры, объекты метаданных и обработчики форм.
 /// </summary>
 /// <remarks>
 /// Индекс — основной источник для <see cref="DraftCheck"/>: он отвечает без разбора всей выгрузки.
@@ -45,22 +45,28 @@ public sealed class IndexDraftContext : IDraftContext
     /// <inheritdoc/>
     public bool HasMetadataKind(string kind) => _reader.HasMetadataKind(kind);
 
+    /// <inheritdoc/>
+    public bool IsEventHandler(string modulePath, string routineName) =>
+        _reader.IsEventHandler(modulePath, routineName);
+
     private static DraftSymbol ToDraft(SymbolRow row) => new(
         row.Name,
         row.Kind,
         row.IsExport,
         row.ModulePath,
         row.OwnerId,
-        ParseParameters(row.Parameters),
+        ParseParameters(row.Parameters, row.ParametersCount),
+        row.RequiredCount,
         row.StartLine,
         row.EndLine);
 
     /// <summary>
     /// Разбирает строку параметров из индекса: писатель складывает имена через запятую.
+    /// Число параметров берётся из отдельной колонки: если она говорит «ноль», строка не разбирается.
     /// </summary>
-    private static IReadOnlyList<string> ParseParameters(string? parameters)
+    private static IReadOnlyList<string> ParseParameters(string? parameters, int parametersCount)
     {
-        if (string.IsNullOrWhiteSpace(parameters))
+        if (parametersCount <= 0 || string.IsNullOrWhiteSpace(parameters))
         {
             return [];
         }

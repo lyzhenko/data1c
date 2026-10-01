@@ -249,6 +249,72 @@ public sealed class SqliteIndexTests
         }
     }
 
+    [Fact]
+    public void Число_и_имена_параметров_доезжают_до_индекса()
+    {
+        using var fixture = new IndexFixture();
+
+        // Схема v7 хранит и имена параметров, и их число: проверке черновика нужны оба.
+        var withParameter = Assert.Single(fixture.Reader.FindSymbols("ПриОткрытии", exact: true));
+        Assert.Equal(1, withParameter.ParametersCount);
+        Assert.Equal("Отказ", withParameter.Parameters);
+
+        var withoutParameters = Assert.Single(fixture.Reader.FindSymbols("ДругаяПроцедура", exact: true));
+        Assert.Equal(0, withoutParameters.ParametersCount);
+        Assert.Null(withoutParameters.Parameters);
+
+        // Те же данные видны проверке черновика через контекст индекса.
+        var context = new IndexDraftContext(fixture.Reader);
+        var symbol = Assert.Single(context.FindSymbols("ПриОткрытии", exact: true));
+        Assert.Equal(["Отказ"], symbol.Parameters);
+    }
+
+    [Fact]
+    public void Число_обязательных_параметров_доезжает_до_индекса()
+    {
+        // Параметры со значением по умолчанию необязательны: индекс хранит и общее число, и обязательное.
+        var source = SampleDump.Create();
+        source.AddText(SampleDump.SecondCommonModuleBslPath, """
+            Процедура ЗагрузитьДанные(Ссылка, Режим = Неопределено, Дата = Неопределено) Экспорт
+                Сообщить(Ссылка);
+            КонецПроцедуры
+            """);
+        var analysis = new DumpAnalyzer().Analyze(source);
+        using var index = SqliteIndex.OpenInMemory();
+        new IndexWriter(index) { IncludeComments = false }.Write(source, analysis);
+        var reader = new IndexReader(index);
+
+        var symbol = Assert.Single(reader.FindSymbols("ЗагрузитьДанные", exact: true));
+        Assert.Equal(3, symbol.ParametersCount);
+        Assert.Equal(1, symbol.RequiredCount);
+
+        var context = new IndexDraftContext(reader);
+        var draft = Assert.Single(context.FindSymbols("ЗагрузитьДанные", exact: true));
+        Assert.Equal(["Ссылка", "Режим", "Дата"], draft.Parameters);
+        Assert.Equal(1, draft.RequiredCount);
+    }
+
+    [Fact]
+    public void Обработчики_формы_находятся_по_пути_модуля()
+    {
+        var source = FormSampleDump.Create();
+        var result = new DumpAnalyzer().Analyze(source);
+        using var index = SqliteIndex.OpenInMemory();
+        new IndexWriter(index) { IncludeComments = false }.Write(source, result);
+        var reader = new IndexReader(index);
+
+        // Обработчик события формы, обработчик изменения элемента и команда формы: все три
+        // зарегистрированы в описании формы, и модуль формы связан с ней путём модуля.
+        Assert.True(reader.IsEventHandler(FormSampleDump.FormModulePath, "ПриОткрытии"));
+        Assert.True(reader.IsEventHandler(FormSampleDump.FormModulePath, "АртикулПриИзменении"));
+        Assert.True(reader.IsEventHandler(FormSampleDump.FormModulePath, "Печать"));
+
+        // Регистр в BSL не важен, а чужие имена и пути обработчиками не считаются.
+        Assert.True(reader.IsEventHandler(FormSampleDump.FormModulePath, "приоткрытии"));
+        Assert.False(reader.IsEventHandler(FormSampleDump.FormModulePath, "Сообщить"));
+        Assert.False(reader.IsEventHandler(SampleDump.CommonModuleBslPath, "ПриОткрытии"));
+    }
+
     private static int IndexSchemaVersion => SqliteIndex.SupportedSchemaVersion;
 
     /// <summary>Индекс, собранный из тестовой выгрузки через полный разбор.</summary>

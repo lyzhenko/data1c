@@ -25,6 +25,9 @@ public enum DraftProblemKind
     /// <summary>Число аргументов вызова не совпадает с числом параметров вызываемого.</summary>
     WrongArgumentCount,
 
+    /// <summary>Метод общего модуля вызван из другого модуля, но объявлен без ключевого слова «Экспорт».</summary>
+    MethodNotExported,
+
     /// <summary>Обращение к объекту метаданных, которого нет в конфигурации.</summary>
     UnknownMetadataObject,
 
@@ -66,7 +69,11 @@ public sealed record DraftProblem(
 /// <param name="IsExport">Объявлена с ключевым словом «Экспорт».</param>
 /// <param name="ModulePath">Путь модуля, в котором она объявлена.</param>
 /// <param name="OwnerId">Идентификатор объекта-владельца: «CommonModule.ОбщегоНазначения».</param>
-/// <param name="Parameters">Имена параметров в порядке объявления. Про необязательные параметры сведений нет.</param>
+/// <param name="Parameters">Имена параметров в порядке объявления.</param>
+/// <param name="RequiredCount">
+/// Сколько параметров обязательно передать: у остальных есть значение по умолчанию
+/// («Режим = Неопределено»), и их можно не передавать.
+/// </param>
 /// <param name="StartLine">Строка заголовка в модуле-объявлении.</param>
 /// <param name="EndLine">Строка завершения в модуле-объявлении.</param>
 public sealed record DraftSymbol(
@@ -76,6 +83,7 @@ public sealed record DraftSymbol(
     string ModulePath,
     string? OwnerId,
     IReadOnlyList<string> Parameters,
+    int RequiredCount,
     int StartLine,
     int EndLine)
 {
@@ -126,6 +134,14 @@ public interface IDraftContext
     /// </summary>
     /// <param name="kind">Вид объекта метаданных.</param>
     bool HasMetadataKind(string kind);
+
+    /// <summary>
+    /// Зарегистрирована ли процедура модуля обработчиком события или команды формы: такую процедуру
+    /// вызывает платформа, и часть её параметров может не использоваться в коде.
+    /// </summary>
+    /// <param name="modulePath">Путь модуля внутри выгрузки; для черновика без места — его подпись.</param>
+    /// <param name="routineName">Имя процедуры или функции модуля.</param>
+    bool IsEventHandler(string modulePath, string routineName);
 }
 
 /// <summary>Результат проверки черновика: замечания и оговорки о том, что проверить не удалось.</summary>

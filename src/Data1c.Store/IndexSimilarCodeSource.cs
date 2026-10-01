@@ -333,7 +333,7 @@ public sealed class IndexSimilarCodeSource : ISimilarCodeSource
             using (var command = _index.CreateCommand(
                 $"""
                  SELECT id, node_id, module_path, owner_id, name, kind, is_export, start_line, end_line,
-                        region, parameters, comment_head
+                        region, parameters, parameters_count, required_count, comment_head
                  FROM symbols WHERE node_id IN ({placeholders})
                  """))
             {
@@ -353,7 +353,9 @@ public sealed class IndexSimilarCodeSource : ISimilarCodeSource
                         reader.GetInt32(8),
                         reader.IsDBNull(9) ? null : reader.GetString(9),
                         reader.IsDBNull(10) ? null : reader.GetString(10),
-                        reader.IsDBNull(11) ? null : reader.GetString(11)));
+                        reader.GetInt32(11),
+                        reader.GetInt32(12),
+                        reader.IsDBNull(13) ? null : reader.GetString(13)));
                 }
             }
 
