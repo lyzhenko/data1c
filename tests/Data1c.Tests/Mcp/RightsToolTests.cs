@@ -365,6 +365,25 @@ public sealed class RightsToolTests
             static item => Text(item!["object"]) == "Catalog.Склады");
     }
 
+    [Fact]
+    public async Task Условие_объекта_который_не_разрешился_читается_из_файла_роли()
+    {
+        using var dump = new IndexDump();
+        using var session = new AnalysisSession(
+            new AnalysisRequest { UseIndex = true, IndexPath = dump.IndexPath },
+            dump.Source);
+        await session.QueryAsync(CancellationToken.None);
+
+        var response = await CallAsync(new ToolCatalog(session), new JsonObject { ["role"] = "Менеджер" });
+        var objects = response["role"]!["objects"]!.AsArray();
+
+        // Имя объекта прав не разрешилось в идентификатор: строки в индексе нет, условие берётся из файла.
+        var unresolved = Assert.Single(objects, static item => Text(item!["object"]) == RlsConditionDump.UnresolvedName);
+        Assert.False(unresolved!["resolved"]!.GetValue<bool>());
+        Assert.True(unresolved["rls"]!.GetValue<bool>());
+        Assert.Contains("Секрет", Text(unresolved["condition"]));
+    }
+
     /// <summary>Выгрузка с условиями RLS, выложенная на диск, и собранный по ней индекс.</summary>
     private sealed class IndexDump : IDisposable
     {

@@ -1750,6 +1750,7 @@ public sealed class ToolCatalog
         };
 
         var items = new JsonArray();
+        RoleRights? withConditions = null;
         foreach (var obj in objects.Take(limit))
         {
             var item = new JsonObject
@@ -1765,8 +1766,20 @@ public sealed class ToolCatalog
 
             if (obj.HasRestriction)
             {
-                item["condition"] = ConditionText(
-                    StoredCondition(conditions, obj.ObjectId) ?? catalog.Condition(detailed.Role, obj.ObjectId));
+                var condition = StoredCondition(conditions, obj.ObjectId);
+                if (condition is null)
+                {
+                    // В индексе условия нет: строка прав без текста или права в индекс не писались.
+                    // Тогда файл роли читается один раз на роль, а объект ищется по имени из файла —
+                    // так условие видно и у объектов, чьё имя не разрешилось в идентификатор.
+                    withConditions ??= catalog.RoleWithConditions(detailed.Role);
+                    condition = withConditions?.Objects
+                        .FirstOrDefault(candidate => candidate.HasRestriction
+                            && string.Equals(candidate.Name, obj.Name, StringComparison.Ordinal))
+                        ?.Condition;
+                }
+
+                item["condition"] = ConditionText(condition);
             }
 
             items.Add(item);

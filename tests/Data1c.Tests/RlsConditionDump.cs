@@ -25,6 +25,15 @@ internal static class RlsConditionDump
     public const string OrderCondition = "ГДЕ Ответственный = &ТекущийПользователь";
 
     /// <summary>
+    /// Имя объекта прав, которое не разрешается в идентификатор метаданных: такие строки в индекс
+    /// не пишутся, и условие для них инструмент читает из файла роли.
+    /// </summary>
+    public const string UnresolvedName = "НеизвестныйВид.СекретныйОбъект";
+
+    /// <summary>Условие RLS неразрешённого объекта: в индекс не попадает.</summary>
+    public const string UnresolvedCondition = "ГДЕ Секрет = &Секрет";
+
+    /// <summary>
     /// Длинное условие RLS роли «Менеджер» на справочник «Склады»: содержит то же слово «Организация»,
     /// поэтому поиск по подстроке находит оба объекта роли.
     /// </summary>
@@ -83,6 +92,16 @@ internal static class RlsConditionDump
                     <name>Read</name>
                     <value>true</value>
                 </right>
+            </object>
+            <object>
+                <name>{UnresolvedName}</name>
+                <right>
+                    <name>Read</name>
+                    <value>true</value>
+                </right>
+                <restrictionByCondition>
+                    <condition>{Escape(UnresolvedCondition)}</condition>
+                </restrictionByCondition>
             </object>
         </Rights>
         """;
