@@ -15,11 +15,15 @@ namespace Data1c.Core.Analysis;
 /// <see cref="IDraftContext"/> (обычно поверх SQLite-индекса), методы платформы проверяются по
 /// <see cref="PlatformHelpIndex"/>. Полный вывод типов не делается: обращения к реквизитам через
 /// переменные («Объект.Артикул») и вызовы методов объектов не проверяются — для них тип неизвестен.</para>
-/// <para>Если модель платформы не подключена, неизвестный локальный вызов может оказаться глобальной
-/// функцией платформы («Сообщить»), поэтому такое замечание понижается до предупреждения.</para>
+/// <para>Строгость не зависит от того, прогрелась ли справка платформы. Глобальные функции платформы
+/// («Сообщить», «СтрНайти») узнаются по встроенному списку <see cref="PlatformGlobalFunctions"/>,
+/// поэтому неизвестный локальный вызов — всегда ошибка, а вызов реальной глобальной функции —
+/// никогда не замечание; одинаковый код и текст замечания получаются и со справкой, и без неё.
+/// Справка, когда она подключена, даёт подсказку (заголовок темы) и число параметров метода платформы.</para>
 /// <para>Число аргументов проверяется только там, где цель вызова известна точно: у процедуры самого
-/// модуля и у метода общего модуля, названного с квалификатором. Вызов без квалификатора, имя которого
-/// нашлось лишь в другом модуле, не судится: одноимённые процедуры разных модулей объявлены по-разному.</para>
+/// модуля, у метода общего модуля, названного с квалификатором, и у метода платформы из справки.
+/// Вызов без квалификатора, имя которого нашлось лишь в другом модуле, не судится: одноимённые
+/// процедуры разных модулей объявлены по-разному.</para>
 /// <para>Устроено так, чтобы платформенная проверка (1cv8 DESIGNER /CheckModules) добавлялась рядом:
 /// её результат — те же <see cref="DraftProblem"/>, и список замечаний просто станет длиннее.</para>
 /// </remarks>
@@ -69,8 +73,8 @@ public sealed class DraftCheck
         var platform = _platform is { IsAvailable: true } ? _platform : null;
         if (platform is null)
         {
-            notes.Add("Справка платформы не подключена: методы платформы не проверяются, "
-                + "а неизвестный локальный вызов может оказаться глобальной функцией платформы.");
+            notes.Add("Справка платформы не подключена: глобальные функции платформы узнаются по встроенному "
+                + "списку, но число аргументов у методов платформы не проверяется, и подсказок из справки нет.");
         }
 
         if (_context is null)
@@ -148,17 +152,25 @@ public sealed class DraftCheck
                     continue;
                 }
 
-                if (ResolvePlatform(platform, call) is { } localPlatform)
+                if (PlatformGlobalFunctions.IsKnown(call.Method))
                 {
-                    CheckPlatformCall(call, localPlatform, problems);
+                    // Это глобальная функция платформы («Сообщить»), а не процедура конфигурации.
+                    // Важность замечания не должна зависеть от того, прогрелась ли справка, поэтому
+                    // имя ищется во встроенном списке, а справка уточняет только число параметров.
+                    if (platform?.FindGlobalFunction(call.Method) is { } globalFunction)
+                    {
+                        CheckPlatformCall(call, globalFunction, problems);
+                    }
+
                     continue;
                 }
 
                 problems.Add(new DraftProblem(
                     call.Line,
-                    platform is null ? DraftProblemSeverity.Warning : DraftProblemSeverity.Error,
+                    DraftProblemSeverity.Error,
                     DraftProblemKind.UnknownProcedure,
-                    $"Неизвестная процедура или функция «{call.Method}»: её нет ни в модуле, ни в конфигурации.",
+                    $"Неизвестная процедура или функция «{call.Method}»: её нет ни в модуле, ни в конфигурации, "
+                        + "ни среди глобальных функций платформы.",
                     SimilarSymbolsHint(call.Method)));
                 continue;
             }
@@ -170,7 +182,7 @@ public sealed class DraftCheck
                 continue;
             }
 
-            if (ResolvePlatform(platform, call) is { } platformTopic)
+            if (ResolvePlatformMember(platform, call) is { } platformTopic)
             {
                 CheckPlatformCall(call, platformTopic, problems);
                 continue;
@@ -209,23 +221,13 @@ public sealed class DraftCheck
     }
 
     /// <summary>
-    /// Ищет вызов в справке платформы: сначала по полному имени («Массив.Добавить»), затем для
-    /// вызова без получателя — среди глобальных функций («Сообщить» — это «Глобальный контекст.Сообщить»).
+    /// Ищет в справке метод платформы по полному имени вызова с получателем: <c>Массив.Добавить</c>
+    /// там есть, а <c>Объект.Добавить</c> и <c>ДополнительныеПараметры.Вставить</c> (вызовы через
+    /// переменные) — нет, поэтому правило точное. Вызов без получателя сюда не попадает: его судьбу
+    /// решает встроенный список глобальных функций (<see cref="PlatformGlobalFunctions"/>).
     /// </summary>
-    private static PlatformTopic? ResolvePlatform(PlatformHelpIndex? platform, BslCall call)
-    {
-        if (platform is null)
-        {
-            return null;
-        }
-
-        if (platform.ContainsMember(call.Callee))
-        {
-            return platform.Find(call.Callee);
-        }
-
-        return call.Qualifier is null ? platform.FindGlobalFunction(call.Method) : null;
-    }
+    private static PlatformTopic? ResolvePlatformMember(PlatformHelpIndex? platform, BslCall call) =>
+        platform is not null && platform.ContainsMember(call.Callee) ? platform.Find(call.Callee) : null;
 
     /// <summary>Проверяет число аргументов метода платформы, если его удалось узнать из справки.</summary>
     private static void CheckPlatformCall(BslCall call, PlatformTopic topic, List<DraftProblem> problems)
@@ -260,10 +262,16 @@ public sealed class DraftCheck
         }
     }
 
-    /// <summary>Ключевые слова языка, которые иногда записывают со скобками как вызов.</summary>
+    /// <summary>
+    /// Ключевые слова языка, которые записывают со скобками как вызов: оператор «ВызватьИсключение "текст"»
+    /// и конструктор «Новый("Массив")». Их нет в списке глобальных функций, потому что это не функции,
+    /// но неизвестной процедурой такой вызов тоже не является.
+    /// </summary>
     private static bool IsLanguageOperator(string callee) =>
         callee.Equals("ВызватьИсключение", StringComparison.OrdinalIgnoreCase) ||
-        callee.Equals("Raise", StringComparison.OrdinalIgnoreCase);
+        callee.Equals("Raise", StringComparison.OrdinalIgnoreCase) ||
+        callee.Equals("Новый", StringComparison.OrdinalIgnoreCase) ||
+        callee.Equals("New", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Проверки, которые нужны для разрешённого вызова: аргументы и вид цели.</summary>
     /// <param name="call">Вызов в черновике.</param>

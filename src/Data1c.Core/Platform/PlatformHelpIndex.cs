@@ -179,6 +179,21 @@ public sealed class PlatformHelpIndex
         return _globalFunctions.TryGetValue(key, out var topic) ? topic : null;
     }
 
+    /// <summary>
+    /// Короткие имена глобальных функций платформы, найденные в справке, — русские и английские,
+    /// как в заголовках тем («Глобальный контекст.Сообщить (Global context.Message)» даёт «Сообщить»
+    /// и «Message»). Свойства и события раздела «Глобальный контекст» сюда не попадают: они не функции.
+    /// По этому перечню сверяется встроенный список <see cref="PlatformGlobalFunctions"/>.
+    /// </summary>
+    public IReadOnlyCollection<string> GlobalFunctionNames
+    {
+        get
+        {
+            EnsureLoaded();
+            return _globalFunctions.Keys;
+        }
+    }
+
     /// <summary>Известен ли такой идентификатор платформы: тип, метод, свойство или глобальная функция.</summary>
     public bool KnownIdentifier(string? name)
     {
@@ -281,11 +296,12 @@ public sealed class PlatformHelpIndex
                     topics.Add(item);
                     _byName.TryAdd(topic.Name, item);
                     _byLastSegment.TryAdd(LastSegment(topic.Name), item);
+                    var globalContextMethod = IsGlobalContextMethod(topic.Name);
                     foreach (var alias in TitleAliases(topic.Title))
                     {
                         _byTitle.TryAdd(alias, item);
                         _byTitleSegment.TryAdd(LastSegment(alias), item);
-                        if (TryGlobalFunctionName(alias, out var globalName))
+                        if (globalContextMethod && TryGlobalFunctionName(alias, out var globalName))
                         {
                             _globalFunctions.TryAdd(globalName, item);
                         }
@@ -430,6 +446,16 @@ public sealed class PlatformHelpIndex
         name = string.Empty;
         return false;
     }
+
+    /// <summary>
+    /// Страница подраздела «Методы» раздела «Глобальный контекст»: только они — глобальные функции
+    /// («Глобальный контекст.Сообщить»). В том же разделе справки лежат свойства
+    /// (<c>…Global context.properties.…</c>, например «Глобальный контекст.Метаданные») и события
+    /// модулей (<c>…Global context.events.…</c>) — их вызывать нельзя, поэтому глобальными функциями
+    /// они не считаются: иначе вызов несуществующей процедуры с таким именем не был бы замечен.
+    /// </summary>
+    private static bool IsGlobalContextMethod(string topicName) =>
+        topicName.Split('.').Contains("methods", StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Как в справке платформы назван раздел глобальных функций: русская и английская локаль.</summary>
     private static readonly string[] GlobalContextPrefixes = ["Глобальный контекст.", "Global context."];
