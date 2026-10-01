@@ -34,6 +34,12 @@ public interface IDumpSource
     /// Реализация может выбросить <see cref="IOException"/>, если файл занят другим процессом.
     /// </summary>
     Stream OpenRead(DumpFile file);
+
+    /// <summary>
+    /// Файл по относительному пути, если источник умеет отдать его без обхода всей выгрузки.
+    /// Каталог умеет; источники, которые не умеют, возвращают null — вызывающий обойдёт список сам.
+    /// </summary>
+    DumpFile? FindFile(string relativePath) => null;
 }
 
 /// <summary>

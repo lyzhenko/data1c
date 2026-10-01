@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using Data1c.Core.Analysis;
@@ -46,9 +47,9 @@ public sealed class IndexWriter
 
                 Clear(connection);
                 WriteFiles(source, connection, counters, cancellationToken);
-                WriteNodes(result, connection, counters, cancellationToken);
-                WriteEdges(result, connection, counters, cancellationToken);
-                WriteSymbols(source, result, connection, counters, cancellationToken);
+                WriteNodes(result.Graph.Nodes, connection, counters, cancellationToken);
+                WriteEdges(result.Graph.Edges, connection, counters, cancellationToken);
+                WriteSymbols(source, result.Modules, connection, counters, cancellationToken);
                 WriteMetadata(result, connection, counters, cancellationToken);
 
                 _index.SetMeta("dump_path", result.SourceName);
@@ -77,6 +78,401 @@ public sealed class IndexWriter
                 _index.Execute("PRAGMA synchronous=NORMAL");
             }
         });
+    }
+
+    /// <summary>
+    /// Частичная переиндексация: строки изменённых модулей удаляются, затем записываются заново
+    /// из разбора только этих модулей. Остальной индекс не переписывается, поэтому правка одного
+    /// модуля стоит секунды, а не минуты.
+    /// </summary>
+    /// <remarks>
+    /// Частичный разбор не видит процедуры других модулей, поэтому после записи вызовы связываются
+    /// по имени с настоящими узлами процедур, а вызовы к только что появившимся процедурам
+    /// перенаправляются с внешних заглушек на них.
+    /// </remarks>
+    public IndexWriteResult WriteModules(
+        IDumpSource source,
+        AnalysisResult result,
+        IndexScope scope,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(result);
+        ArgumentNullException.ThrowIfNull(scope);
+        var stopwatch = Stopwatch.StartNew();
+
+        return _index.WithLock(() =>
+        {
+            _index.Execute("PRAGMA synchronous=OFF");
+            try
+            {
+                using var transaction = _index.Connection.BeginTransaction();
+                var connection = transaction.Connection!;
+                var counters = new Counters();
+
+                var scopePaths = new HashSet<string>(scope.ModuleFiles, StringComparer.OrdinalIgnoreCase);
+                var scopeNodes = result.Graph.Nodes
+                    .Where(node => node.SourcePath is not null && scopePaths.Contains(node.SourcePath))
+                    .ToList();
+                var scopeIds = new HashSet<string>(scopeNodes.Select(static node => node.Id), StringComparer.Ordinal);
+                var scopeEdges = result.Graph.Edges
+                    .Where(edge => scopeIds.Contains(edge.SourceId)
+                        || (edge.Kind == GraphEdgeKind.Contains && scopeIds.Contains(edge.TargetId)))
+                    .ToList();
+
+                // Цели связей, которых нет среди узлов области: внешние заглушки вызовов и методы
+                // платформы. Их нужно добавить в индекс, иначе связь будет вести в никуда.
+                var referenced = new HashSet<string>(
+                    scopeEdges.Where(edge => !scopeIds.Contains(edge.TargetId)).Select(static edge => edge.TargetId),
+                    StringComparer.Ordinal);
+                var present = referenced.Count == 0
+                    ? []
+                    : ReadIds(connection, count => $"SELECT id FROM nodes WHERE id IN ({Placeholders(count)})", [.. referenced]);
+                var presentSet = new HashSet<string>(present, StringComparer.Ordinal);
+                var extraNodes = result.Graph.Nodes
+                    .Where(node => referenced.Contains(node.Id) && !presentSet.Contains(node.Id))
+                    .ToList();
+
+                var nodesToWrite = new List<GraphNode>(scopeNodes.Count + extraNodes.Count);
+                nodesToWrite.AddRange(scopeNodes);
+                nodesToWrite.AddRange(extraNodes);
+
+                // Процедуры, которых в индексе ещё не было: только для них нужно искать вызовы
+                // из других модулей, а это дорогой проход по внешним вызовам.
+                var routineNames = scopeNodes
+                    .Where(static node => node.Kind == GraphNodeKind.Routine)
+                    .Select(static node => node.Name.ToLowerInvariant())
+                    .Distinct(StringComparer.Ordinal)
+                    .ToList();
+                var knownNames = routineNames.Count == 0
+                    ? []
+                    : ReadIds(
+                        connection,
+                        count => $"SELECT name_lower FROM nodes WHERE kind = 'Routine' AND name_lower IN ({Placeholders(count)})",
+                        routineNames);
+                var known = new HashSet<string>(knownNames, StringComparer.Ordinal);
+                var addedRoutines = routineNames.Where(name => !known.Contains(name)).ToList();
+
+                DeleteScope(connection, scope, scopePaths, new HashSet<string>(nodesToWrite.Select(static node => node.Id), StringComparer.Ordinal));
+                WriteNodes(nodesToWrite, connection, counters, cancellationToken);
+                WriteEdges(scopeEdges, connection, counters, cancellationToken);
+                WriteSymbols(source, result.Modules, connection, counters, cancellationToken);
+                TouchFiles(source, connection, scope, counters, cancellationToken);
+                RepairCalls(connection, scopeIds, addedRoutines, cancellationToken);
+                RecountCounters(connection);
+
+                _index.SetMeta("indexed_at", DateTimeOffset.UtcNow.ToString("O"));
+                transaction.Commit();
+                stopwatch.Stop();
+
+                return new IndexWriteResult(
+                    counters.Nodes,
+                    counters.Edges,
+                    counters.Symbols,
+                    counters.Calls,
+                    0,
+                    0,
+                    0,
+                    counters.Files,
+                    stopwatch.Elapsed);
+            }
+            finally
+            {
+                _index.Execute("PRAGMA synchronous=NORMAL");
+            }
+        });
+    }
+
+    /// <summary>
+    /// Убирает из индекса всё, что относится к указанным файлам. Входящие связи удаляются только
+    /// у исчезнувших узлов: у процедуры, которая осталась на месте, идентификатор не меняется,
+    /// и вызовы из других модулей должны сохраниться.
+    /// </summary>
+    private static void DeleteScope(
+        SqliteConnection connection,
+        IndexScope scope,
+        HashSet<string> scopePaths,
+        HashSet<string> keepIds)
+    {
+        var paths = new List<string>(scopePaths);
+        if (scope.RemovedFiles is { Count: > 0 } removed)
+        {
+            paths.AddRange(removed);
+        }
+
+        if (paths.Count == 0)
+        {
+            return;
+        }
+
+        var oldNodeIds = ReadIds(connection, count => $"SELECT id FROM nodes WHERE source_path IN ({Placeholders(count)})", paths);
+        var symbolIds = ReadIds(connection, count => $"SELECT id FROM symbols WHERE module_path IN ({Placeholders(count)})", paths);
+        var goneNodeIds = oldNodeIds.Where(id => !keepIds.Contains(id)).ToList();
+
+        ExecuteIds(connection, count => $"DELETE FROM edges WHERE source_id IN ({Placeholders(count)})", oldNodeIds);
+        ExecuteIds(connection, count => $"DELETE FROM edges WHERE kind = 'Contains' AND target_id IN ({Placeholders(count)})", oldNodeIds);
+        ExecuteIds(connection, count => $"DELETE FROM edges WHERE target_id IN ({Placeholders(count)})", goneNodeIds);
+        ExecuteIds(connection, count => $"DELETE FROM metadata_refs WHERE source_id IN ({Placeholders(count)})", oldNodeIds);
+        ExecuteIds(connection, count => $"DELETE FROM nodes_fts WHERE node_id IN ({Placeholders(count)})", oldNodeIds);
+        ExecuteIds(connection, count => $"DELETE FROM nodes WHERE id IN ({Placeholders(count)})", oldNodeIds);
+        ExecuteIds(connection, count => $"DELETE FROM terms_fts WHERE symbol_id IN ({Placeholders(count)})", symbolIds);
+        ExecuteIds(connection, count => $"DELETE FROM symbols WHERE module_path IN ({Placeholders(count)})", paths);
+        ExecuteIds(connection, count => $"DELETE FROM files WHERE path IN ({Placeholders(count)})", [.. scope.RemovedFiles ?? []]);
+    }
+
+    /// <summary>Обновляет строки файлов, которые перезаписаны, и убирает исчезнувшие.</summary>
+    private static void TouchFiles(
+        IDumpSource source,
+        SqliteConnection connection,
+        IndexScope scope,
+        Counters counters,
+        CancellationToken cancellationToken)
+    {
+        if (scope.ModuleFiles.Count == 0)
+        {
+            return;
+        }
+
+        // Сначала спрашиваем файлы по одному: обход всей выгрузки ради десятка файлов
+        // стоит секунды на большой конфигурации.
+        var changed = new List<DumpFile>(scope.ModuleFiles.Count);
+        var missing = new List<string>();
+        foreach (var path in scope.ModuleFiles)
+        {
+            var file = source.FindFile(path);
+            if (file is null)
+            {
+                missing.Add(path);
+            }
+            else
+            {
+                changed.Add(file);
+            }
+        }
+
+        if (missing.Count > 0)
+        {
+            var wanted = new HashSet<string>(missing, StringComparer.OrdinalIgnoreCase);
+            foreach (var file in source.EnumerateFiles(cancellationToken))
+            {
+                if (wanted.Contains(file.RelativePath))
+                {
+                    changed.Add(file);
+                }
+            }
+        }
+
+        using var command = connection.CreateCommand();
+        command.CommandText = "INSERT OR REPLACE INTO files (path, size, mtime) VALUES (@path, @size, @mtime)";
+        var pathParameter = command.Parameters.Add("@path", SqliteType.Text);
+        var size = command.Parameters.Add("@size", SqliteType.Integer);
+        var mtime = command.Parameters.Add("@mtime", SqliteType.Integer);
+
+        foreach (var file in changed)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            pathParameter.Value = file.RelativePath;
+            size.Value = file.Size;
+            mtime.Value = file.LastWriteTimeUtc.ToUnixTimeMilliseconds();
+            command.ExecuteNonQuery();
+            counters.Files++;
+        }
+    }
+
+    /// <summary>
+    /// Связывает вызовы изменённых модулей с настоящими узлами процедур: частичный разбор знает
+    /// только свои модули и на остальные цели ставит внешние заглушки. Затем заглушки на процедуры
+    /// из изменённых модулей заменяются настоящими узлами — этого ждут вызовы из других модулей.
+    /// </summary>
+    private static void RepairCalls(
+        SqliteConnection connection,
+        HashSet<string> scopeIds,
+        IReadOnlyList<string> addedRoutineNames,
+        CancellationToken cancellationToken)
+    {
+        if (scopeIds.Count == 0)
+        {
+            return;
+        }
+
+        // Имена сопоставляются в C#: встроенная функция lower() в SQLite знает только латиницу,
+        // поэтому на кириллице регистронезависимое сравнение в SQL молча не находит ничего.
+        var pending = new List<(long RowId, string Method, string Target)>();
+
+        using (var outgoing = connection.CreateCommand())
+        {
+            outgoing.CommandText =
+                $"""
+                 SELECT rowid, detail, target_id FROM edges
+                 WHERE kind = 'Calls' AND detail IS NOT NULL
+                   AND source_id IN ({Placeholders(scopeIds.Count)})
+                 """;
+            var index = 0;
+            foreach (var id in scopeIds)
+            {
+                outgoing.Parameters.AddWithValue("@" + index++.ToString(CultureInfo.InvariantCulture), id);
+            }
+
+            using var reader = outgoing.ExecuteReader();
+            while (reader.Read())
+            {
+                pending.Add((reader.GetInt64(0), MethodOf(reader.GetString(1)), reader.GetString(2)));
+            }
+        }
+
+        // Вызовы из других модулей к процедурам, которых раньше не было: их цели — внешние заглушки.
+        if (addedRoutineNames.Count > 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var newRoutines = new HashSet<string>(addedRoutineNames, StringComparer.Ordinal);
+            using var incoming = connection.CreateCommand();
+            incoming.CommandText =
+                "SELECT rowid, detail, target_id FROM edges WHERE kind = 'Calls' AND detail IS NOT NULL AND target_id LIKE 'call:%'";
+            using var reader = incoming.ExecuteReader();
+            while (reader.Read())
+            {
+                var method = MethodOf(reader.GetString(1));
+                if (newRoutines.Contains(method.ToLowerInvariant()))
+                {
+                    pending.Add((reader.GetInt64(0), method, reader.GetString(2)));
+                }
+            }
+        }
+
+        if (pending.Count == 0)
+        {
+            return;
+        }
+
+        var targets = ResolveRoutineIds(connection, [.. pending.Select(static item => item.Method).Distinct(StringComparer.Ordinal)]);
+        using var update = connection.CreateCommand();
+        update.CommandText = "UPDATE edges SET target_id = @target WHERE rowid = @row";
+        var target = update.Parameters.Add("@target", SqliteType.Text);
+        var row = update.Parameters.Add("@row", SqliteType.Integer);
+        var repaired = 0;
+        foreach (var (rowId, method, current) in pending)
+        {
+            if (!targets.TryGetValue(method.ToLowerInvariant(), out var id)
+                || string.Equals(id, current, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            target.Value = id;
+            row.Value = rowId;
+            update.ExecuteNonQuery();
+            repaired++;
+        }
+
+        if (repaired > 0)
+        {
+            using var note = connection.CreateCommand();
+            note.CommandText = "INSERT OR REPLACE INTO meta (key, value) VALUES ('repaired_calls', @value)";
+            note.Parameters.AddWithValue("@value", repaired.ToString(CultureInfo.InvariantCulture));
+            note.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Имя метода из текста вызова: у «Модуль.Метод» берётся часть после последней точки.</summary>
+    private static string MethodOf(string callee)
+    {
+        var separator = callee.LastIndexOf('.');
+        return separator < 0 ? callee : callee[(separator + 1)..];
+    }
+
+    /// <summary>Узлы процедур по именам: первое совпадение по имени, как и при полной сборке.</summary>
+    private static Dictionary<string, string> ResolveRoutineIds(SqliteConnection connection, IReadOnlyList<string> methods)
+    {
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        var lowered = methods.Select(static method => method.ToLowerInvariant()).Distinct(StringComparer.Ordinal).ToList();
+
+        foreach (var chunk in Chunk(lowered, 400))
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                $"SELECT name_lower, id FROM nodes WHERE kind = 'Routine' AND name_lower IN ({Placeholders(chunk.Count)}) ORDER BY length(id), id";
+            for (var index = 0; index < chunk.Count; index++)
+            {
+                command.Parameters.AddWithValue("@" + index.ToString(CultureInfo.InvariantCulture), chunk[index]);
+            }
+
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                result.TryAdd(reader.GetString(0), reader.GetString(1));
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>Пересчитывает счётчики в meta: частичная переиндексация меняет их неочевидно.</summary>
+    private static void RecountCounters(SqliteConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            INSERT OR REPLACE INTO meta (key, value) VALUES
+                ('cnt_nodes', (SELECT COUNT(*) FROM nodes)),
+                ('cnt_edges', (SELECT COUNT(*) FROM edges)),
+                ('cnt_symbols', (SELECT COUNT(*) FROM symbols)),
+                ('cnt_calls', (SELECT COUNT(*) FROM edges WHERE kind = 'Calls')),
+                ('cnt_metadata_objects', (SELECT COUNT(*) FROM metadata_objects)),
+                ('cnt_metadata_items', (SELECT COUNT(*) FROM metadata_items)),
+                ('cnt_metadata_refs', (SELECT COUNT(*) FROM metadata_refs)),
+                ('cnt_files', (SELECT COUNT(*) FROM files)),
+                ('nodes', (SELECT COUNT(*) FROM nodes)),
+                ('edges', (SELECT COUNT(*) FROM edges));
+            """;
+        command.ExecuteNonQuery();
+    }
+
+    private static List<string> ReadIds(SqliteConnection connection, Func<int, string> sql, IReadOnlyList<string> values)
+    {
+        var result = new List<string>();
+        foreach (var chunk in Chunk(values, 400))
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = sql(chunk.Count);
+            for (var index = 0; index < chunk.Count; index++)
+            {
+                command.Parameters.AddWithValue("@" + index.ToString(CultureInfo.InvariantCulture), chunk[index]);
+            }
+
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                result.Add(reader.GetString(0));
+            }
+        }
+
+        return result;
+    }
+
+    private static void ExecuteIds(SqliteConnection connection, Func<int, string> sql, IReadOnlyList<string> values)
+    {
+        foreach (var chunk in Chunk(values, 400))
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = sql(chunk.Count);
+            for (var index = 0; index < chunk.Count; index++)
+            {
+                command.Parameters.AddWithValue("@" + index.ToString(CultureInfo.InvariantCulture), chunk[index]);
+            }
+
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static string Placeholders(int count) =>
+        string.Join(", ", Enumerable.Range(0, count).Select(static index => "@" + index.ToString(CultureInfo.InvariantCulture)));
+
+    private static IEnumerable<List<string>> Chunk(IReadOnlyList<string> values, int size)
+    {
+        for (var offset = 0; offset < values.Count; offset += size)
+        {
+            yield return [.. values.Skip(offset).Take(size)];
+        }
     }
 
     /// <summary>
@@ -139,6 +535,14 @@ public sealed class IndexWriter
         foreach (var file in source.EnumerateFiles())
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            // Файлы самого индекса лежат в каталоге выгрузки, но её файлами не являются:
+            // иначе индекс считался бы устаревшим сразу после сборки.
+            if (DumpState.IsServicePath(file.RelativePath))
+            {
+                continue;
+            }
+
             path.Value = file.RelativePath;
             size.Value = file.Size;
             mtime.Value = file.LastWriteTimeUtc.ToUnixTimeMilliseconds();
@@ -147,7 +551,7 @@ public sealed class IndexWriter
         }
     }
 
-    private void WriteNodes(AnalysisResult result, SqliteConnection connection, Counters counters, CancellationToken cancellationToken)
+    private void WriteNodes(IReadOnlyList<GraphNode> graphNodes, SqliteConnection connection, Counters counters, CancellationToken cancellationToken)
     {
         using var nodes = connection.CreateCommand();
         nodes.CommandText =
@@ -173,7 +577,7 @@ public sealed class IndexWriter
         var ftsId = fts.Parameters.Add("@id", SqliteType.Text);
         var ftsName = fts.Parameters.Add("@name", SqliteType.Text);
 
-        foreach (var node in result.Graph.Nodes)
+        foreach (var node in graphNodes)
         {
             cancellationToken.ThrowIfCancellationRequested();
             id.Value = node.Id;
@@ -194,7 +598,7 @@ public sealed class IndexWriter
         }
     }
 
-    private void WriteEdges(AnalysisResult result, SqliteConnection connection, Counters counters, CancellationToken cancellationToken)
+    private void WriteEdges(IReadOnlyList<GraphEdge> graphEdges, SqliteConnection connection, Counters counters, CancellationToken cancellationToken)
     {
         using var edges = connection.CreateCommand();
         edges.CommandText = "INSERT INTO edges (source_id, target_id, kind, line, detail) VALUES (@source, @target, @kind, @line, @detail)";
@@ -204,7 +608,7 @@ public sealed class IndexWriter
         var line = edges.Parameters.Add("@line", SqliteType.Integer);
         var detail = edges.Parameters.Add("@detail", SqliteType.Text);
 
-        foreach (var edge in result.Graph.Edges)
+        foreach (var edge in graphEdges)
         {
             cancellationToken.ThrowIfCancellationRequested();
             source.Value = edge.SourceId;
@@ -226,7 +630,7 @@ public sealed class IndexWriter
 
     private void WriteSymbols(
         IDumpSource source,
-        AnalysisResult result,
+        IReadOnlyList<BslModuleInfo> modules,
         SqliteConnection connection,
         Counters counters,
         CancellationToken cancellationToken)
@@ -267,7 +671,7 @@ public sealed class IndexWriter
         using var lastId = connection.CreateCommand();
         lastId.CommandText = "SELECT last_insert_rowid()";
 
-        foreach (var moduleInfo in result.Modules)
+        foreach (var moduleInfo in modules)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var lines = IncludeComments ? ReadLines(source, moduleInfo.Path) : null;

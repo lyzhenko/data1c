@@ -50,6 +50,9 @@ public sealed record AnalysisRequest
 /// </summary>
 public sealed class AnalysisSession : IDisposable
 {
+    /// <summary>Доля изменённых файлов, после которой частичная переиндексация теряет смысл.</summary>
+    private const double PartialShare = 0.25;
+
     private readonly AnalysisRequest _request;
     private readonly Lock _gate = new();
     private readonly string? _sourceError;
@@ -351,38 +354,97 @@ public sealed class AnalysisSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// Настройки разбора. Частичная переиндексация использует те же самые, отличаясь только
+    /// списком модулей: иначе её результат разошёлся бы с полной сборкой.
+    /// </summary>
+    private AnalysisOptions CreateAnalysisOptions(IReadOnlyCollection<string>? onlyModules) => new()
+    {
+        IncludeBsl = _request.IncludeBsl,
+        MaxDegreeOfParallelism = _request.MaxDegreeOfParallelism > 0
+            ? _request.MaxDegreeOfParallelism
+            : Environment.ProcessorCount,
+        PlatformSource = CreatePlatformSource(),
+        Progress = onlyModules is null ? new Progress<AnalysisProgress>(Report) : null,
+        OnlyModuleFiles = onlyModules,
+        Metadata = new MetadataReadOptions
+        {
+            Sections = _request.Sections,
+            AttachModules = _request.IncludeBsl,
+        },
+        Graph = new DependencyGraphOptions
+        {
+            IncludeContainment = true,
+            IncludeMetadataReferences = true,
+            IncludeModules = _request.IncludeBsl,
+            IncludeRoutines = _request.IncludeBsl,
+            IncludeCalls = _request.IncludeBsl && _request.IncludeCalls,
+            IncludeMetadataAccess = _request.IncludeBsl,
+            IncludeExternalNodes = true,
+        },
+    };
+
+    /// <summary>
+    /// Частичная переиндексация: пересобираются только изменённые модули BSL. Если изменились
+    /// файлы метаданных, что-то удалено или затронута заметная часть выгрузки — нужна полная сборка.
+    /// </summary>
+    private bool TryPartialReindex(DumpChange change, out string message)
+    {
+        message = string.Empty;
+        var path = ResolveIndexPath();
+        if (path is null || _source is null || !_request.IncludeBsl)
+        {
+            return false;
+        }
+
+        if (change.Removed > 0 || change.ChangedPaths is not { Count: > 0 } touched)
+        {
+            return false;
+        }
+
+        if (change.Total > 0 && touched.Count > change.Total * PartialShare)
+        {
+            return false;
+        }
+
+        var modules = new List<string>(touched.Count);
+        foreach (var file in touched)
+        {
+            if (!file.EndsWith(".bsl", StringComparison.OrdinalIgnoreCase))
+            {
+                // Изменился XML: состав метаданных мог поменяться, надёжнее пересобрать целиком.
+                return false;
+            }
+
+            modules.Add(file);
+        }
+
+        _state = $"частичная переиндексация: модулей {modules.Count}";
+        var analyzed = new DumpAnalyzer().Analyze(_source, CreateAnalysisOptions(modules));
+        using (var index = SqliteIndex.Open(path))
+        {
+            new IndexWriter(index).WriteModules(_source, analyzed, new IndexScope(modules));
+        }
+
+        lock (_gate)
+        {
+            _index?.Dispose();
+            _index = null;
+            _indexGraph = null;
+        }
+
+        OpenIndex(path);
+        message = $", обновлено модулей: {modules.Count}";
+        return true;
+    }
+
     private AnalysisResult RunAnalysis()
     {
         var source = _source!;
         try
         {
             _state = "разбор";
-            var options = new AnalysisOptions
-            {
-                IncludeBsl = _request.IncludeBsl,
-                MaxDegreeOfParallelism = _request.MaxDegreeOfParallelism > 0
-                    ? _request.MaxDegreeOfParallelism
-                    : Environment.ProcessorCount,
-                PlatformSource = CreatePlatformSource(),
-                Progress = new Progress<AnalysisProgress>(Report),
-                Metadata = new MetadataReadOptions
-                {
-                    Sections = _request.Sections,
-                    AttachModules = _request.IncludeBsl,
-                },
-                Graph = new DependencyGraphOptions
-                {
-                    IncludeContainment = true,
-                    IncludeMetadataReferences = true,
-                    IncludeModules = _request.IncludeBsl,
-                    IncludeRoutines = _request.IncludeBsl,
-                    IncludeCalls = _request.IncludeBsl && _request.IncludeCalls,
-                    IncludeMetadataAccess = _request.IncludeBsl,
-                    IncludeExternalNodes = true,
-                },
-            };
-
-            var result = new DumpAnalyzer().Analyze(source, options);
+            var result = new DumpAnalyzer().Analyze(source, CreateAnalysisOptions(null));
             _completedAt = DateTimeOffset.Now;
             _state = "готов";
             return result;
@@ -544,6 +606,13 @@ public sealed class AnalysisSession : IDisposable
         {
             try
             {
+                if (TryPartialReindex(change, out var message))
+                {
+                    _lastChange = new DumpChange(0, 0, 0, change.Total);
+                    _state = "готов (индекс)" + message;
+                    return;
+                }
+
                 var result = RunAnalysis();
                 var path = ResolveIndexPath();
                 if (path is not null)

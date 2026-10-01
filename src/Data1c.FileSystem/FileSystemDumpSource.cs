@@ -62,4 +62,13 @@ public sealed class FileSystemDumpSource : IDumpSource
         var path = Path.Combine(RootPath, file.RelativePath.Replace('/', Path.DirectorySeparatorChar));
         return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
     }
+
+    /// <summary>Один файл по пути: частичная переиндексация не должна обходить всю выгрузку.</summary>
+    public DumpFile? FindFile(string relativePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(relativePath);
+        var path = Path.Combine(RootPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        var info = new FileInfo(path);
+        return info.Exists ? new DumpFile(relativePath, info.Length, info.LastWriteTimeUtc) : null;
+    }
 }
