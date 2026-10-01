@@ -69,6 +69,14 @@ public sealed class AnalysisSession : IDisposable
     private Task<AnalysisResult>? _analysis;
     private SqliteIndex? _index;
     private IGraphQuery? _indexGraph;
+
+    /// <summary>
+    /// Читатель индекса создаётся один раз вместе с индексом и переиспользуется: инструменты держат
+    /// на нём свои кэши (например разбор конвенций — карту целей по методам и рейтинг процедур),
+    /// а новый экземпляр на каждый вызов эти кэши обнулял. Читатель не IDisposable: он обёртка
+    /// над соединением, которым владеет сессия.
+    /// </summary>
+    private IndexReader? _reader;
     private string? _indexPath;
     private bool _forceRebuild;
     private PlatformHelpIndex? _platform;
@@ -179,10 +187,14 @@ public sealed class AnalysisSession : IDisposable
             if (_index is null)
             {
                 _index = SqliteIndex.OpenReadOnly(path);
-                _indexGraph = new IndexGraphQuery(new IndexReader(_index));
             }
 
-            return new IndexReader(_index);
+            // Читатель может быть уже создан другим путём (сборкой индекса) или сброшен вместе
+            // с индексом: держим ровно один экземпляр на текущий индекс, потому что инструменты
+            // кэшируют на нём свои разборы.
+            _reader ??= new IndexReader(_index);
+            _indexGraph ??= new IndexGraphQuery(_reader);
+            return _reader;
         }
     }
 
@@ -330,7 +342,8 @@ public sealed class AnalysisSession : IDisposable
 
             _index?.Dispose();
             _index = SqliteIndex.OpenReadOnly(path);
-            _indexGraph = new IndexGraphQuery(new IndexReader(_index));
+            _reader = new IndexReader(_index);
+            _indexGraph = new IndexGraphQuery(_reader);
             _indexPath = path;
             _forceRebuild = false;
             _state = "готов (индекс)";
@@ -353,6 +366,7 @@ public sealed class AnalysisSession : IDisposable
             _index?.Dispose();
             _index = null;
             _indexGraph = null;
+            _reader = null;
             _forceRebuild = true;
             _failure = null;
             _completedAt = null;
@@ -444,6 +458,7 @@ public sealed class AnalysisSession : IDisposable
             _index?.Dispose();
             _index = null;
             _indexGraph = null;
+            _reader = null;
         }
 
         OpenIndex(path);
@@ -507,6 +522,7 @@ public sealed class AnalysisSession : IDisposable
             _index?.Dispose();
             _index = null;
             _indexGraph = null;
+            _reader = null;
         }
 
         DeleteIndexFiles(path);
@@ -693,6 +709,7 @@ public sealed class AnalysisSession : IDisposable
         _index?.Dispose();
         _index = null;
         _indexGraph = null;
+        _reader = null;
     }
     /// <summary>Справка платформы запрошена ключом <c>--platform</c>.</summary>
     public bool PlatformRequested => _request.PlatformHelp;

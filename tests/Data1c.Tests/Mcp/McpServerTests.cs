@@ -742,6 +742,34 @@ public sealed class McpServerTests
         }
     }
 
+    [Fact]
+    public async Task Конвенции_повторный_запрос_даёт_тот_же_состав()
+    {
+        // Разбор конвенций кэшируется на сессию и живёт, пока открыт индекс. Тест держит это
+        // поведение: повторный запрос обязан дать ровно тот же ответ, а не пустой или обрезанный
+        // из-за устаревшего кэша после пересборки индекса.
+        var root = TestDump.Materialize();
+        try
+        {
+            using var session = new AnalysisSession(new AnalysisRequest { DumpPaths = [root] });
+            await session.QueryAsync(CancellationToken.None);
+
+            var first = await ExchangeAsync(
+                session,
+                InitializeKnown,
+                ToolCall(2, "conventions", """{"intent":"записать объект"}"""));
+            var second = await ExchangeAsync(
+                session,
+                ToolCall(3, "conventions", """{"intent":"записать объект"}"""));
+
+            Assert.Equal(ContentText(first, 2), ContentText(second, 3));
+        }
+        finally
+        {
+            TestDump.Remove(root);
+        }
+    }
+
     private static async Task<IReadOnlyList<JsonObject>> ExchangeAsync(params string[] messages) =>
         await ExchangeAsync(Session(), messages);
 

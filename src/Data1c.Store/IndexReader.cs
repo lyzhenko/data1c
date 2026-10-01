@@ -1986,28 +1986,10 @@ public sealed class IndexReader
                 }
             }
 
-            var targets = new List<string>();
-            using (var candidates = _index.CreateCommand(
-                "SELECT id, is_external FROM nodes WHERE kind <> 'Routine' AND name LIKE @suffix"))
-            {
-                candidates.Parameters.AddWithValue("@suffix", "%" + suffix);
-                using var reader = candidates.ExecuteReader();
-                while (reader.Read())
-                {
-                    var targetId = reader.GetString(0);
-                    var external = reader.GetInt32(1) != 0;
-                    var qualifier = QualifierOf(targetId);
-
-                    // Внешняя цель с квалификатором общего модуля — это вызов процедуры
-                    // конфигурации, а не метода платформы.
-                    if (external && qualifier.Length > 0 && commonModules.Contains(qualifier))
-                    {
-                        continue;
-                    }
-
-                    targets.Add(targetId);
-                }
-            }
+            // Ступень 2: цели берутся из карты «последнее слово метода → цели», построенной один раз
+            // на открытый индекс. Раньше здесь был просмотр всех узлов по суффиксу имени на каждый
+            // метод-признак приёма — это давало около половины секунды на метод.
+            var targets = TargetsByMethodName(shortName, commonModules);
 
             // Ступень 2 нужна там, где вызов записан с квалификатором: «Объект.Записать» попадает
             // в узел platform:Записать только при подключённой справке платформы. Цели ищутся
@@ -2067,8 +2049,71 @@ public sealed class IndexReader
         return separator > 0 ? callee[..separator] : string.Empty;
     }
 
+    /// <summary>
+    /// Имена общих модулей конфигурации: читаются один раз на открытый индекс. Раньше запрос
+    /// выполнялся на каждый метод-признак приёма, то есть десятки раз за ответ инструмента.
+    /// </summary>
+    private HashSet<string>? _commonModuleNames;
+
+    /// <summary>
+    /// Цели вызовов с квалификатором по последнему слову имени метода: «Объект.Записать» хранится
+    /// как <c>call:Объект.Записать</c>, поэтому искать приходится по суффиксу имени. Просмотр всех
+    /// узлов (полмиллиона) стоит около половины секунды, и он выполнялся на каждый метод-признак;
+    /// карта строится один раз на открытый индекс и переиспользуется всеми вызовами инструмента.
+    /// </summary>
+    private Dictionary<string, List<string>>? _targetsByMethodName;
+
+    /// <summary>Цели вызовов с квалификатором по последнему слову метода, без вызовов общих модулей.</summary>
+    private List<string> TargetsByMethodName(string shortName, HashSet<string> commonModules)
+    {
+        var map = _targetsByMethodName ??= BuildTargetsByMethodName(commonModules);
+        return map.TryGetValue(shortName, out var found) ? found : [];
+    }
+
+    /// <summary>Строит карту «последнее слово имени цели → цели»: один проход по узлам вместо прохода на каждый метод.</summary>
+    private Dictionary<string, List<string>> BuildTargetsByMethodName(HashSet<string> commonModules)
+    {
+        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        using var command = _index.CreateCommand("SELECT id, name, is_external FROM nodes WHERE kind <> 'Routine'");
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var name = reader.GetString(1);
+            var separator = name.LastIndexOf('.');
+            if (separator <= 0 || separator == name.Length - 1)
+            {
+                // Цели без квалификатора (call:Записать, platform:Записать) находит точный поиск по цели.
+                continue;
+            }
+
+            var targetId = reader.GetString(0);
+            if (reader.GetInt32(2) != 0)
+            {
+                var qualifier = QualifierOf(targetId);
+                if (qualifier.Length > 0 && commonModules.Contains(qualifier))
+                {
+                    // Внешняя цель с квалификатором общего модуля — вызов процедуры конфигурации.
+                    continue;
+                }
+            }
+
+            var method = name[(separator + 1)..];
+            if (!result.TryGetValue(method, out var list))
+            {
+                list = [];
+                result[method] = list;
+            }
+
+            list.Add(targetId);
+        }
+
+        return result;
+    }
+
     /// <summary>Имена общих модулей конфигурации: по ним отсеиваются вызовы процедур, а не платформы.</summary>
-    private HashSet<string> CommonModuleNames()
+    private HashSet<string> CommonModuleNames() => _commonModuleNames ??= ReadCommonModuleNames();
+
+    private HashSet<string> ReadCommonModuleNames()
     {
         using var command = _index.CreateCommand("SELECT name FROM metadata_objects WHERE kind = 'CommonModule'");
         using var reader = command.ExecuteReader();

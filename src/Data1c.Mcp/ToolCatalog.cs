@@ -23,6 +23,18 @@ public sealed class ToolCatalog
     private static readonly IReadOnlyCollection<string> DefaultGrepExtensions = [".bsl", ".xml"];
 
     private readonly Lock _sessionGate = new();
+
+    /// <summary>
+    /// Разбор конвенций держится на сессию: в нём кэшируются рейтинг процедур, совпадения по методам
+    /// платформы и обращения к метаданным. Инструмент создавал его на каждый вызов, поэтому повторный
+    /// запрос считался заново и отвечал секундами. Ключ — читатель индекса: он живёт, пока открыт
+    /// индекс, и меняется вместе с пересборкой, поэтому устаревший разбор невозможен.
+    /// </summary>
+    private readonly Lock _conventionsGate = new();
+
+    private IConventionQuery? _conventions;
+    private IndexReader? _conventionsReader;
+
     private readonly Lock _rightsGate = new();
     private readonly List<ToolSpec> _tools;
     private AnalysisSession _session;
@@ -2156,12 +2168,22 @@ public sealed class ToolCatalog
         int limit,
         CancellationToken cancellationToken)
     {
-        if (Session.GetIndexReader() is { } reader)
+        var session = Session;
+        if (session.GetIndexReader() is { } reader)
         {
-            return Conventions.Suggest(reader.ConventionQuery(), intent, platform, limit);
+            lock (_conventionsGate)
+            {
+                if (_conventions is null || !ReferenceEquals(_conventionsReader, reader))
+                {
+                    _conventions = reader.ConventionQuery();
+                    _conventionsReader = reader;
+                }
+
+                return Conventions.Suggest(_conventions, intent, platform, limit);
+            }
         }
 
-        var result = Session.Result ?? await WaitForAnalysisAsync(cancellationToken).ConfigureAwait(false);
+        var result = session.Result ?? await WaitForAnalysisAsync(cancellationToken).ConfigureAwait(false);
         return result is null
             ? throw new ToolException(
                 "Конфигурация ещё не разобрана: конвенции строятся по графу вызовов. "
