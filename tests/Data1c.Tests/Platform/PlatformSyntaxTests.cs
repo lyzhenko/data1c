@@ -90,6 +90,22 @@ public sealed class PlatformSyntaxTests
         Assert.Null(index.FindGlobalFunction(null));
     }
 
+    [Fact]
+    public void Свойства_и_события_глобального_контекста_не_считаются_функциями()
+    {
+        // В разделе «Глобальный контекст» справки лежат ещё свойства и события модулей: вызвать их
+        // нельзя, поэтому глобальными функциями они не считаются — иначе вызов несуществующей
+        // процедуры с таким именем не был бы замечен.
+        var index = CreateIndex();
+
+        Assert.Null(index.FindGlobalFunction("ОбработкаОшибок"));
+        Assert.Null(index.FindGlobalFunction("ПриНачалеРаботыСистемы"));
+        Assert.DoesNotContain("ОбработкаОшибок", index.GlobalFunctionNames);
+        Assert.DoesNotContain("ErrorProcessing", index.GlobalFunctionNames);
+        Assert.Contains("Сообщить", index.GlobalFunctionNames);
+        Assert.Contains("Message", index.GlobalFunctionNames);
+    }
+
     private static PlatformHelpIndex CreateIndex()
     {
         var source = new InMemoryPlatformSource("синтетическая справка");
@@ -103,6 +119,8 @@ public sealed class PlatformSyntaxTests
                 // имя живёт в заголовке. Именно поэтому ContainsMember по короткому имени не работает.
                 ("objects.catalog234.Array.methods.Add772.html", "<h1>Массив.Добавить (Array.Add)</h1><p>Добавляет значение в массив.</p>"),
                 ("objects.Global context.methods.catalog27.Message30.html", "<h1>Глобальный контекст.Сообщить (Global context.Message)</h1><p>Синтаксис: Сообщить() Описание: Выводит сообщение.</p>"),
+                ("objects.Global context.properties.prop5975.html", "<h1>Глобальный контекст.ОбработкаОшибок (Global context.ErrorProcessing)</h1><p>Описание: Признак обработки ошибок.</p>"),
+                ("objects.Global context.events.catalog375.OnStart377.html", "<h1>Глобальный контекст.ПриНачалеРаботыСистемы (Global context.OnStart)</h1><p>Описание: Обработчик события.</p>"),
             ]));
         return new PlatformHelpIndex(source);
     }

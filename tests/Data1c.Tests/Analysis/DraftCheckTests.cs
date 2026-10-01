@@ -1,6 +1,7 @@
 using Data1c.Core.Analysis;
 using Data1c.Core.Dump;
 using Data1c.Core.Platform;
+using Data1c.FileSystem;
 using Data1c.Store;
 using Data1c.Tests.Platform;
 using Xunit;
@@ -15,6 +16,49 @@ namespace Data1c.Tests.Analysis;
 public sealed class DraftCheckTests
 {
     private static readonly Version PlatformVersion = new(8, 3, 27, 2214);
+
+    /// <summary>
+    /// Вызовы глобальных функций платформы, на которых проверяется распознавание имён: и со справкой,
+    /// и без неё. Набор повторяет список задачи и записан так, как эти имена принимает платформа.
+    /// </summary>
+    private static readonly string[] GlobalFunctionCallList =
+    [
+        "Сообщить(\"текст\")",
+        "СтрНайти(\"строка\", \"текст\")",
+        "Формат(1, \"ЧГ=0\")",
+        "НСтр(\"ru = 'текст'\")",
+        "ЗначениеЗаполнено(1)",
+        "ТипЗнч(1)",
+        "Число(\"1\")",
+        "Строка(1)",
+        "Дата(2024, 1, 1)",
+        "Найти(\"строка\", \"текст\")",
+        "ТекущаяДата()",
+        "Мин(1, 2)",
+        "Макс(1, 2)",
+        "Тип(\"Число\")",
+        "ПустаяСтрока(\"\")",
+        "СокрЛП(\" \")",
+        "СтрШаблон(\"%1\", 1)",
+        "Новый(\"Массив\")",
+        "Новый ОписаниеТипов(\"Число\")",
+        "Справочники.Товары.НайтиПоКоду(\"00001\")",
+    ];
+
+    /// <summary>Тот же набор вызовов для теории: по одному набору данных на вызов.</summary>
+    public static TheoryData<string> GlobalFunctionCalls
+    {
+        get
+        {
+            var data = new TheoryData<string>();
+            foreach (var call in GlobalFunctionCallList)
+            {
+                data.Add(call);
+            }
+
+            return data;
+        }
+    }
 
     [Fact]
     public void Неизвестная_процедура_находит_строку_и_код()
@@ -37,24 +81,119 @@ public sealed class DraftCheckTests
     }
 
     [Fact]
-    public void Без_справки_платформы_неизвестный_вызов_становится_предупреждением()
+    public void Неизвестный_вызов_остаётся_ошибкой_и_без_справки_и_со_справкой()
     {
-        // Глобальные функции платформы («Сообщить») без справки неотличимы от опечатки,
-        // поэтому замечание понижается до предупреждения и об этом пишется в оговорках.
-        using var fixture = new Fixture(withPlatform: false);
-
-        var result = fixture.Check(
-            """
+        // Раньше без справки неизвестный вызов понижался до предупреждения: «Сообщить» неотличимо
+        // от опечатки. Теперь глобальные функции узнаются по встроенному списку, поэтому строгость
+        // одна и та же, а замечание — с тем же кодом, важностью и текстом.
+        const string Draft = """
             Процедура Тест()
-                Сообщить("текст");
+                НеизвестнаяПроцедура();
             КонецПроцедуры
-            """);
+            """;
 
-        var problem = Assert.Single(result.Problems);
-        Assert.Equal(2, problem.Line);
-        Assert.Equal(DraftProblemKind.UnknownProcedure, problem.Kind);
-        Assert.Equal(DraftProblemSeverity.Warning, problem.Severity);
-        Assert.Contains(result.Notes, static note => note.Contains("Справка платформы", StringComparison.Ordinal));
+        using var withoutHelp = new Fixture(withPlatform: false);
+        using var withHelp = new Fixture();
+
+        var noHelp = withoutHelp.Check(Draft);
+        var help = withHelp.Check(Draft);
+
+        var first = Assert.Single(noHelp.Problems);
+        var second = Assert.Single(help.Problems);
+
+        Assert.Equal(2, first.Line);
+        Assert.Equal(DraftProblemKind.UnknownProcedure, first.Kind);
+        Assert.Equal(DraftProblemSeverity.Error, first.Severity);
+        Assert.Equal(first.Kind, second.Kind);
+        Assert.Equal(first.Severity, second.Severity);
+        Assert.Equal(first.Message, second.Message);
+        Assert.Equal(first.Hint, second.Hint);
+
+        // Без справки честно сказано, что именно ограничено: число аргументов у методов платформы.
+        Assert.Contains(
+            noHelp.Notes,
+            static note => note.Contains("число аргументов у методов платформы не проверяется", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            noHelp.Notes,
+            static note => note.Contains("может оказаться глобальной функцией", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            help.Notes,
+            static note => note.Contains("Справка платформы не подключена", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [MemberData(nameof(GlobalFunctionCalls))]
+    public void Глобальные_функции_платформы_замечаний_не_дают_в_обоих_режимах(string call)
+    {
+        // Имена узнаются по встроенному списку PlatformGlobalFunctions, поэтому вердикт не зависит
+        // от того, прогрелась ли справка. Из списка задачи сюда не попали только «ОписаниеТипов»
+        // и «НайтиПоКоду»: это не глобальные функции, и записаны они так, как их принимает платформа,
+        // — «Новый ОписаниеТипов(...)» и «Справочники.Товары.НайтиПоКоду(...)».
+        var draft = "Процедура Тест()\n    " + call + ";\nКонецПроцедуры";
+
+        using var withoutHelp = new Fixture(withPlatform: false);
+        using var withHelp = new Fixture();
+
+        Assert.Empty(withoutHelp.Check(draft).Problems);
+        Assert.Empty(withHelp.Check(draft).Problems);
+    }
+
+    [Fact]
+    public void Имя_типа_без_Новый_не_считается_глобальной_функцией()
+    {
+        // «ОписаниеТипов» — тип, а не глобальная функция: в справке он вызывается только как
+        // «Новый ОписаниеТипов(...)» (есть в наборе выше), а такая запись вызовом не считается.
+        // Без «Новый» это ошибка — та же самая со справкой и без неё.
+        const string Draft = "Процедура Тест()\n    ОписаниеТипов(\"Число\");\nКонецПроцедуры";
+
+        using var withoutHelp = new Fixture(withPlatform: false);
+        using var withHelp = new Fixture();
+
+        var noHelp = Assert.Single(withoutHelp.Check(Draft).Problems);
+        var help = Assert.Single(withHelp.Check(Draft).Problems);
+
+        Assert.Equal(DraftProblemKind.UnknownProcedure, noHelp.Kind);
+        Assert.Equal(DraftProblemSeverity.Error, noHelp.Severity);
+        Assert.Equal(noHelp.Kind, help.Kind);
+        Assert.Equal(noHelp.Severity, help.Severity);
+        Assert.Equal(noHelp.Message, help.Message);
+    }
+
+    [Fact]
+    public void На_реальной_справке_вердикты_те_же_что_и_без_неё()
+    {
+        // Приёмка на установленной платформе: справка — источник подсказок и числа параметров,
+        // но не строгости. Если платформы на машине нет, проверка проходит вхолостую.
+        var source = new FileSystemPlatformSource();
+        if (!source.EnumerateInstallations().Any())
+        {
+            Console.WriteLine("Платформа 1С не найдена — проверка на реальной справке пропущена.");
+            return;
+        }
+
+        var platform = new PlatformHelpIndex(source);
+        Console.WriteLine($"платформа: {platform.Version} | тем: {platform.TopicCount}");
+        var draft = "Процедура Тест()\n"
+            + string.Join("\n", GlobalFunctionCallList.Select(static call => "    " + call + ";"))
+            + "\nКонецПроцедуры";
+
+        var withoutHelp = new DraftCheck(null, null).Check(draft);
+        var withHelp = new DraftCheck(null, platform).Check(draft);
+
+        // Ни один вызов глобальной функции платформы не даёт замечаний — ни со справкой, ни без неё:
+        // с прогретой справкой дополнительно проверяется число аргументов, и оно тоже верное.
+        Assert.Empty(withoutHelp.Problems);
+        Assert.Empty(withHelp.Problems);
+
+        // А неизвестный вызов — ошибка в обоих режимах, с одинаковым кодом и текстом.
+        const string Unknown = "Процедура Тест()\n    НеизвестнаяПроцедура();\nКонецПроцедуры";
+        var first = Assert.Single(new DraftCheck(null, null).Check(Unknown).Problems);
+        var second = Assert.Single(new DraftCheck(null, platform).Check(Unknown).Problems);
+        Assert.Equal(DraftProblemKind.UnknownProcedure, first.Kind);
+        Assert.Equal(DraftProblemSeverity.Error, first.Severity);
+        Assert.Equal(first.Kind, second.Kind);
+        Assert.Equal(first.Severity, second.Severity);
+        Assert.Equal(first.Message, second.Message);
     }
 
     [Fact]

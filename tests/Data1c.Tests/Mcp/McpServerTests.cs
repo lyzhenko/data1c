@@ -261,6 +261,12 @@ public sealed class McpServerTests
 
         var notes = payload["notes"]!.AsArray().Select(Text).ToList();
         Assert.Contains(notes, static note => note.Contains("Индекс конфигурации", StringComparison.Ordinal));
+
+        // Оговорка честная: строгость от справки не зависит, но без неё число аргументов у методов
+        // платформы не проверяется.
+        Assert.Contains(
+            notes,
+            static note => note.Contains("число аргументов у методов платформы не проверяется", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -406,8 +412,10 @@ public sealed class McpServerTests
 
             Assert.Equal("индекс", Text(payload["context"]));
             Assert.Equal(4, payload["problemsCount"]!.GetValue<int>());
-            Assert.Equal(2, payload["problemsBySeverity"]!["errors"]!.GetValue<int>());
-            Assert.Equal(2, payload["problemsBySeverity"]!["warnings"]!.GetValue<int>());
+
+            // Неизвестная процедура — ошибка и без справки платформы: сервер запущен без --platform.
+            Assert.Equal(3, payload["problemsBySeverity"]!["errors"]!.GetValue<int>());
+            Assert.Equal(1, payload["problemsBySeverity"]!["warnings"]!.GetValue<int>());
 
             var lines = payload["problems"]!.AsArray()
                 .Select(problem => (Line: problem!["line"]!.GetValue<int>(), Code: Text(problem["code"])))
