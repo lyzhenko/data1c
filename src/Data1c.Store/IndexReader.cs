@@ -206,8 +206,27 @@ public sealed class IndexReader
 
         var text = query.Trim();
         var bounded = Math.Clamp(limit, 1, 500);
+
+        // Сначала быстрый путь: точное совпадение и префикс ищутся индексом.
         var hits = SearchByPrefix(text, bounded, kinds);
-        return hits.Count > 0 ? hits : SearchBySubstring(text, bounded, kinds);
+        if (hits.Count >= bounded)
+        {
+            return hits;
+        }
+
+        // Затем подстрочный поиск: кандидаты набираются с ранним выходом и ранжируются в памяти.
+        // Сортировка в SQL заставила бы просмотреть все 570 тысяч узлов ради LIMIT.
+        var found = new List<NodeRow>(hits);
+        var seen = new HashSet<string>(hits.Select(static row => row.Id), StringComparer.Ordinal);
+        foreach (var row in SearchBySubstring(text, bounded - hits.Count, kinds))
+        {
+            if (seen.Add(row.Id))
+            {
+                found.Add(row);
+            }
+        }
+
+        return found;
     }
 
     /// <summary>Быстрый путь: префиксное совпадение по индексу FTS5 и точные совпадения.</summary>
@@ -237,30 +256,49 @@ public sealed class IndexReader
         });
     }
 
-    /// <summary>Медленный путь: поиск по подстроке в имени.</summary>
+    /// <summary>
+    /// Медленный путь: поиск по подстроке в имени. Индекса для LIKE '%…%' нет, поэтому запрос
+    /// набирает ограниченный набор кандидатов с ранним выходом, а порядок выдачи определяется
+    /// в памяти: точное совпадение, префикс, затем длина имени.
+    /// </summary>
     private IReadOnlyList<NodeRow> SearchBySubstring(string text, int limit, IReadOnlyCollection<string>? kinds)
     {
         var lower = text.ToLowerInvariant();
         return _index.WithLock(() =>
         {
+            var candidates = Math.Clamp(limit * 12, 64, 4000);
             var sql = new StringBuilder(
                 """
                 SELECT id, kind, name, source_path, metadata_kind, is_external, platform_title, platform_version
                 FROM nodes WHERE
                 """);
             AppendKindFilter(sql, kinds);
-            sql.Append(" (name_lower LIKE @like ESCAPE '\\' OR id = @raw)")
-                .Append(" ORDER BY CASE WHEN id = @raw THEN 0 WHEN name_lower = @lower THEN 1 ELSE 2 END, length(name), name LIMIT @limit");
+            sql.Append(@" (name_lower LIKE @like ESCAPE '\' OR id = @raw) LIMIT @candidates");
 
             using var command = _index.CreateCommand(sql.ToString());
             AddKindParameters(command, kinds);
             command.Parameters.AddWithValue("@raw", text);
-            command.Parameters.AddWithValue("@lower", lower);
             command.Parameters.AddWithValue("@like", "%" + EscapeLike(lower) + "%");
-            command.Parameters.AddWithValue("@limit", limit);
-            return ReadNodes(command);
+            command.Parameters.AddWithValue("@candidates", candidates);
+            return RankNodes(ReadNodes(command), text, limit);
         });
     }
+
+    /// <summary>Ранжирование найденных узлов в памяти: точное совпадение, префикс, длина имени.</summary>
+    private static List<NodeRow> RankNodes(IReadOnlyList<NodeRow> rows, string text, int limit) =>
+    [
+        .. rows
+            .OrderBy(row => RankOf(row.Id, row.Name, text))
+            .ThenBy(static row => row.Name.Length)
+            .ThenBy(static row => row.Name, StringComparer.Ordinal)
+            .Take(limit)
+    ];
+
+    private static int RankOf(string id, string name, string text) =>
+        string.Equals(id, text, StringComparison.Ordinal) ? 0
+        : string.Equals(name, text, StringComparison.OrdinalIgnoreCase) ? 1
+        : name.StartsWith(text, StringComparison.OrdinalIgnoreCase) ? 2
+        : 3;
 
     private static void AppendKindFilter(StringBuilder sql, IReadOnlyCollection<string>? kinds)
     {
@@ -455,7 +493,7 @@ public sealed class IndexReader
         hits = SearchSymbolsByTerms(text, bounded);
         return hits.Count > 0
             ? hits
-            : QuerySymbols(@"s.name_lower LIKE @like ESCAPE '\'", lower, "%" + EscapeLike(lower) + "%", bounded);
+            : QuerySymbols(@"s.name_lower LIKE @like ESCAPE '\'", lower, "%" + EscapeLike(lower) + "%", bounded, substring: true);
     }
 
     /// <summary>Поиск по смысловым термам: имя по частям, шапка комментария, имена параметров.</summary>
@@ -538,51 +576,75 @@ public sealed class IndexReader
         hits = QuerySymbols(@"s.name_lower LIKE @prefix ESCAPE '\'", lower, EscapeLike(lower) + "%", bounded);
         return hits.Count > 0
             ? hits
-            : QuerySymbols(@"s.name_lower LIKE @like ESCAPE '\'", lower, "%" + EscapeLike(lower) + "%", bounded);
+            : QuerySymbols(@"s.name_lower LIKE @like ESCAPE '\'", lower, "%" + EscapeLike(lower) + "%", bounded, substring: true);
     }
 
-    private IReadOnlyList<SymbolRow> QuerySymbols(string condition, string lower, string? pattern, int limit)
+    /// <summary>
+    /// Запрос символов по условию. Для подстроки порядок задаётся в памяти: сортировка в SQL
+    /// заставила бы просмотреть все 258 тысяч символов, тогда как агенту нужны первые совпадения.
+    /// </summary>
+    private IReadOnlyList<SymbolRow> QuerySymbols(string condition, string lower, string? pattern, int limit, bool substring = false)
     {
         return _index.WithLock(() =>
         {
+            var candidates = substring ? Math.Clamp(limit * 12, 64, 4000) : limit;
+            var order = substring ? string.Empty : "ORDER BY length(s.name), s.name ";
             var sql =
                 $"""
                  SELECT s.id, s.node_id, s.module_path, s.owner_id, s.name, s.kind, s.is_export, s.start_line,
                         s.end_line, s.region, s.parameters, s.comment_head
                  FROM symbols s
                  WHERE {condition}
-                 ORDER BY length(s.name), s.name LIMIT @limit
+                 {order}LIMIT @limit
                  """;
 
             using var command = _index.CreateCommand(sql);
             command.Parameters.AddWithValue("@lower", lower);
-            command.Parameters.AddWithValue("@limit", limit);
+            command.Parameters.AddWithValue("@limit", candidates);
             if (pattern is not null)
             {
                 command.Parameters.AddWithValue(condition.Contains("@prefix", StringComparison.Ordinal) ? "@prefix" : "@like", pattern);
             }
 
-            using var reader = command.ExecuteReader();
-            var result = new List<SymbolRow>();
-            while (reader.Read())
-            {
-                result.Add(new SymbolRow(
-                    reader.GetInt64(0),
-                    reader.GetString(1),
-                    reader.GetString(2),
-                    reader.IsDBNull(3) ? null : reader.GetString(3),
-                    reader.GetString(4),
-                    reader.GetString(5),
-                    reader.GetInt32(6) != 0,
-                    reader.GetInt32(7),
-                    reader.GetInt32(8),
-                    reader.IsDBNull(9) ? null : reader.GetString(9),
-                    reader.IsDBNull(10) ? null : reader.GetString(10),
-                    reader.IsDBNull(11) ? null : reader.GetString(11)));
-            }
-
-            return (IReadOnlyList<SymbolRow>)result;
+            var result = ReadSymbols(command);
+            return substring ? RankSymbols(result, lower, limit) : result;
         });
+    }
+
+    /// <summary>Ранжирование символов в памяти: точное имя, префикс, затем длина и алфавит.</summary>
+    private static List<SymbolRow> RankSymbols(IReadOnlyList<SymbolRow> rows, string lower, int limit) =>
+    [
+        .. rows
+            .OrderBy(row => string.Equals(row.Name, lower, StringComparison.OrdinalIgnoreCase) ? 0
+                : row.Name.StartsWith(lower, StringComparison.OrdinalIgnoreCase) ? 1
+                : 2)
+            .ThenBy(static row => row.Name.Length)
+            .ThenBy(static row => row.Name, StringComparer.Ordinal)
+            .Take(limit)
+    ];
+
+    private static List<SymbolRow> ReadSymbols(SqliteCommand command)
+    {
+        using var reader = command.ExecuteReader();
+        var result = new List<SymbolRow>();
+        while (reader.Read())
+        {
+            result.Add(new SymbolRow(
+                reader.GetInt64(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.IsDBNull(3) ? null : reader.GetString(3),
+                reader.GetString(4),
+                reader.GetString(5),
+                reader.GetInt32(6) != 0,
+                reader.GetInt32(7),
+                reader.GetInt32(8),
+                reader.IsDBNull(9) ? null : reader.GetString(9),
+                reader.IsDBNull(10) ? null : reader.GetString(10),
+                reader.IsDBNull(11) ? null : reader.GetString(11)));
+        }
+
+        return result;
     }
 
     /// <summary>Процедура, накрывающая указанную строку модуля.</summary>
@@ -1116,26 +1178,6 @@ public sealed class IndexReader
 
             return result;
         });
-    }
-
-    private static string BuildSearchSql(IReadOnlyCollection<string>? kinds)
-    {
-        var sql = new StringBuilder(
-            """
-            SELECT id, kind, name, source_path, metadata_kind, is_external, platform_title, platform_version
-            FROM nodes WHERE
-            """);
-
-        if (kinds is { Count: > 0 })
-        {
-            sql.Append(" kind IN (").Append(string.Join(", ", kinds.Select(static (_, i) => "@k" + i.ToString(CultureInfo.InvariantCulture)))).Append(") AND ");
-        }
-
-        // Поиск по подстроке идёт по name_lower: индекса для LIKE '%…%' нет, но 564 тысячи строк
-        // просматриваются за десятки миллисекунд, а триграммный FTS5 на таком объёме занимал гигабайты.
-        sql.Append(@"(name_lower LIKE @like ESCAPE '\' OR id = @raw OR name_lower = @lower");
-        sql.Append(@" ) ORDER BY CASE WHEN id = @raw THEN 0 WHEN name_lower = @lower THEN 1 WHEN name_lower LIKE @prefix ESCAPE '\' THEN 2 ELSE 3 END, length(name), name LIMIT @limit");
-        return sql.ToString();
     }
 
     /// <summary>Добавляет параметры фильтра по видам узлов (плейсхолдеры @k0, @k1, …).</summary>

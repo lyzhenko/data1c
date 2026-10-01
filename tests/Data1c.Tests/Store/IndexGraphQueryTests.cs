@@ -97,6 +97,38 @@ public sealed class IndexGraphQueryTests
         Assert.Contains("Catalog.ЕдиницыИзмерения", card.Types);
     }
 
+    [Fact]
+    public void Подстрочный_поиск_находит_середину_имени()
+    {
+        using var fixture = new QueryFixture();
+
+        // «овар» не является началом имени: работает только путь по подстроке.
+        var hits = fixture.Query.Search("овар", 10);
+
+        Assert.Contains(hits, static hit => hit.Id == "Catalog.Товары");
+    }
+
+    [Fact]
+    public void Точное_совпадение_идёт_раньше_подстрочного()
+    {
+        using var fixture = new QueryFixture();
+
+        var hits = fixture.Query.Search("Товары", 10);
+
+        Assert.NotEmpty(hits);
+        Assert.Equal("Catalog.Товары", hits[0].Id);
+    }
+
+    [Fact]
+    public void Поиск_символов_находит_середину_имени()
+    {
+        using var fixture = new QueryFixture();
+
+        var symbols = fixture.Reader.FindSymbols("агрузить", 10);
+
+        Assert.Contains(symbols, static symbol => symbol.Name == "ЗагрузитьДанные");
+    }
+
     private sealed class QueryFixture : IDisposable
     {
         private readonly SqliteIndex _index;
@@ -112,6 +144,8 @@ public sealed class IndexGraphQueryTests
         }
 
         internal IndexGraphQuery Query { get; }
+
+        internal IndexReader Reader => new(_index);
 
         internal int Nodes { get; }
 
