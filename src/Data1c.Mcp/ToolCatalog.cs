@@ -35,6 +35,7 @@ public sealed class ToolCatalog
             StatusTool(),
             OpenTool(),
             SearchTool(),
+            SimilarTool(),
             GrepTool(),
             NodeTool(),
             NeighborsTool(),
@@ -216,6 +217,188 @@ public sealed class ToolCatalog
                 nested = nestedView,
             });
         });
+
+    private ToolSpec SimilarTool() => new(
+        "similar",
+        "Поиск похожих реализаций в конфигурации: по черновику кода (text) или по уже существующей процедуре (id/path) "
+        + "находит процедуры с теми же вызовами методов платформы, обращениями к объектам метаданных (в том числе "
+        + "из текстов запросов), вызовами процедур конфигурации и близким именем. Нужен, чтобы найти готовую "
+        + "реализацию и переиспользовать её вместо написания заново: код кандидата открывается инструментом code. "
+        + "Работает по индексу выгрузки и отвечает за доли секунды.",
+        [
+            new ToolParameter("text", "string", "Черновик кода (процедура целиком), которого ещё нет в выгрузке."),
+            new ToolParameter("id", "string", "Идентификатор существующей процедуры: routine:module:…#Имя."),
+            new ToolParameter("path", "string", "Путь модуля выгрузки, если идентификатора нет."),
+            new ToolParameter("line", "integer", "Строка внутри модуля: процедура определяется по ней."),
+            new ToolParameter("limit", "integer", "Сколько кандидатов вернуть (1–50, по умолчанию 10)."),
+        ],
+        (arguments, token) => SimilarAsync(arguments, token));
+
+    /// <summary>
+    /// Похожие реализации: признаки черновика сравниваются с признаками процедур из индекса.
+    /// Индекс для этого обязателен — по нему видно, кто что вызывает и к чему обращается.
+    /// </summary>
+    private async Task<string> SimilarAsync(ToolArguments arguments, CancellationToken cancellationToken)
+    {
+        var draft = arguments.GetString("text");
+        var id = arguments.GetString("id");
+        var path = arguments.GetString("path");
+        if (draft is null && id is null && path is null)
+        {
+            throw new ToolException("Укажите text (черновик кода), id или path существующей процедуры.");
+        }
+
+        var limit = arguments.GetInt("limit", 10, 1, 50);
+        var reader = Session.GetIndexReader();
+        if (reader is null)
+        {
+            // Индекс собирается при первом запросе к графу: подождём его так же, как это делают search и check.
+            _ = await QueryAsync(cancellationToken).ConfigureAwait(false);
+            reader = Session.GetIndexReader();
+        }
+
+        if (reader is null)
+        {
+            throw new ToolException(
+                "Поиск похожего кода работает по SQLite-индексу выгрузки, а индекса пока нет: он собирается в фоне "
+                + "(готовность показывает status). Если выгрузка открыта каталогом на диске, дождитесь сборки и повторите запрос.");
+        }
+
+        var source = "text";
+        string? excludeId = null;
+        if (draft is null)
+        {
+            var (text, routineId) = ReadRoutine(reader, id, path, arguments.GetInt("line", 0, 0, int.MaxValue));
+            draft = text;
+            excludeId = routineId;
+            source = id is null ? "path" : "id";
+        }
+
+        var found = new SimilarCode(reader.SimilarCodeSource()).Find(draft, limit, excludeId);
+
+        var candidates = found.Candidates
+            .Select(static candidate => new
+            {
+                id = candidate.Id,
+                name = candidate.Name,
+                module = candidate.ModulePath,
+                owner = candidate.OwnerId,
+                lines = $"{candidate.StartLine}-{candidate.EndLine}",
+                lineCount = candidate.Lines,
+                statements = candidate.Statements,
+                score = Math.Round(candidate.Score, 3),
+                matches = candidate.Matches
+                    .GroupBy(static match => match.Signal)
+                    .Select(group => new
+                    {
+                        signal = SignalName(group.Key),
+                        values = group
+                            .Select(static match => match.Detail is null ? match.Value : $"{match.Value} [{match.Detail}]")
+                            .Take(6)
+                            .ToList(),
+                    })
+                    .ToList(),
+                why = candidate.Reason,
+            })
+            .ToList();
+
+        if (candidates.Count == 0)
+        {
+            var explanation = found.Notes.Count > 0 ? " " + string.Join(" ", found.Notes) : string.Empty;
+            return $"Похожих реализаций не найдено.{explanation} Попробуйте другую формулировку кода: "
+                + "в нём не нашлось ни редких вызовов, ни обращений к метаданным, ни близких термов имени.";
+        }
+
+        return Render.JsonOf(new
+        {
+            source,
+            draft = new
+            {
+                name = found.Draft.Name.Length > 0 ? found.Draft.Name : null,
+                lines = found.Draft.Lines,
+                statements = found.Draft.Statements,
+                // Показываются только те признаки, которые действительно есть в конфигурации:
+                // «выбрать», «заполнить» — это вызовы своего же модуля, а не методы платформы.
+                platformCalls = Recognized(found, SimilarCodeSignal.PlatformCall, found.Draft.PlatformCalls),
+                metadataReferences = Recognized(found, SimilarCodeSignal.MetadataReference, found.Draft.MetadataReferences),
+                routineCalls = Recognized(found, SimilarCodeSignal.RoutineCall, found.Draft.RoutineCalls),
+                terms = found.Draft.Terms,
+            },
+            considered = found.Considered,
+            found = candidates.Count,
+            notes = found.Notes.Count > 0 ? found.Notes : null,
+            candidates,
+            hint = "Кандидаты — это места, где та же задача уже решена. Откройте код подходящего "
+                + "инструментом code (id из ответа) и переиспользуйте его вместо написания заново.",
+        });
+    }
+
+    /// <summary>
+    /// Признаки черновика, которые нашлись в конфигурации. Если источник их не отметил
+    /// (например, поиск идёт по разбору в памяти), показываются все собранные признаки.
+    /// </summary>
+    private static IReadOnlyList<string> Recognized(
+        SimilarCodeResult found,
+        SimilarCodeSignal signal,
+        IReadOnlyList<SimilarCodeFeature> features)
+    {
+        var known = found.Recognized is { } recognized
+            && recognized.TryGetValue(signal, out var values)
+            && values.Count > 0
+                ? new HashSet<string>(values, StringComparer.OrdinalIgnoreCase)
+                : null;
+
+        return
+        [
+            .. features
+                .Where(feature => known is null || known.Contains(feature.Value))
+                .Select(static feature => feature.Detail is null ? feature.Value : $"{feature.Value} [{feature.Detail}]")
+        ];
+    }
+
+    /// <summary>Текст существующей процедуры: по идентификатору узла, по пути модуля или по строке.</summary>
+    private (string Text, string Id) ReadRoutine(IndexReader reader, string? id, string? path, int line)
+    {
+        if (path is null)
+        {
+            var node = reader.GetNode(id!) ?? throw new ToolException(
+                $"Узел «{id}» не найден. Уточните идентификатор инструментом search.");
+            path = node.SourcePath ?? throw new ToolException(
+                $"У узла «{id}» нет файла модуля: сравнить его код нельзя.");
+        }
+
+        path = DumpPath.Normalize(path);
+        SymbolRow? symbol = null;
+        if (id is not null && id.StartsWith("routine:", StringComparison.Ordinal))
+        {
+            symbol = reader
+                .FindSymbolsInModule(path)
+                .FirstOrDefault(item => string.Equals(item.NodeId, id, StringComparison.Ordinal));
+        }
+
+        if (symbol is null && line > 0)
+        {
+            symbol = reader.FindSymbolAt(path, line);
+        }
+
+        symbol ??= reader.FindSymbolsInModule(path).FirstOrDefault()
+            ?? throw new ToolException($"В модуле «{path}» не нашлось ни одной процедуры.");
+
+        var fragment = Session.Code.Read(symbol.ModulePath, symbol.StartLine, symbol.EndLine)
+            ?? throw new ToolException($"Файл «{symbol.ModulePath}» не найден в выгрузке или не является текстовым.");
+
+        return (string.Join('\n', fragment.Lines), symbol.NodeId);
+    }
+
+    /// <summary>Имя сигнала похожести для ответа агента.</summary>
+    private static string SignalName(SimilarCodeSignal signal) => signal switch
+    {
+        SimilarCodeSignal.PlatformCall => "platformCalls",
+        SimilarCodeSignal.MetadataReference => "metadataReferences",
+        SimilarCodeSignal.RoutineCall => "routineCalls",
+        SimilarCodeSignal.Terms => "terms",
+        _ => "size",
+    };
 
     private ToolSpec GrepTool() => new(
         "grep",
