@@ -1,3 +1,4 @@
+using Data1c.Core.Analysis;
 using Data1c.Core.Dump;
 using Data1c.Core.Metadata;
 
@@ -164,11 +165,39 @@ public sealed class BslModuleInfo
 
     public int LineCount { get; init; }
 
+    /// <summary>
+    /// Таблица символов модуля: переменные модуля, параметры и локальные переменные с позициями.
+    /// <see langword="null"/>, если модуль собран без текста (например, вручную в тестах).
+    /// </summary>
+    public SymbolTable? Symbols { get; init; }
+
+    /// <summary>
+    /// Результат консервативного вывода типов: словарь «имя → тип», неразрешённые места и вызовы,
+    /// ставшие методами платформы. <see langword="null"/>, если модуль собран без текста.
+    /// </summary>
+    public TypeInferenceResult? Types { get; init; }
+
     /// <summary>Устойчивый идентификатор узла графа для модуля.</summary>
     public string Id => "module:" + Path;
 
     public bool IsEmpty =>
         Routines.Count == 0 && Calls.Count == 0 && MetadataAccesses.Count == 0;
+
+    /// <summary>Копия описания модуля с добавленным выводом типов.</summary>
+    internal BslModuleInfo WithTypes(TypeInferenceResult types) => new()
+    {
+        Path = Path,
+        OwnerId = OwnerId,
+        Kind = Kind,
+        Routines = Routines,
+        Regions = Regions,
+        Calls = Calls,
+        MetadataAccesses = MetadataAccesses,
+        Diagnostics = Diagnostics,
+        LineCount = LineCount,
+        Symbols = Symbols,
+        Types = types,
+    };
 }
 
 /// <summary>Входные данные для разбора модуля.</summary>

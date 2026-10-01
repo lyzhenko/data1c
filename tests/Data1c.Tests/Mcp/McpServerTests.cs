@@ -44,7 +44,7 @@ public sealed class McpServerTests
         var responses = await ExchangeAsync(InitializeKnown, Initialized, """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""");
 
         var tools = Result(responses, 2)["tools"]!.AsArray();
-        Assert.Equal(11, tools.Count);
+        Assert.Equal(12, tools.Count);
 
         var names = tools.Select(tool => Text(tool!["name"])).ToList();
         Assert.Contains("status", names);
@@ -54,6 +54,7 @@ public sealed class McpServerTests
         Assert.Contains("code", names);
         Assert.Contains("metadata", names);
         Assert.Contains("check", names);
+        Assert.Contains("types", names);
         Assert.Contains("reload", names);
 
         foreach (var tool in tools)
@@ -138,6 +139,64 @@ public sealed class McpServerTests
         Assert.Contains("ДругаяПроцедура", routines);
         Assert.Empty(payload["diagnostics"]!.AsArray());
         Assert.Equal(3, payload["callsCount"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task Инструмент_types_показывает_объявления_типы_и_разрешённые_вызовы()
+    {
+        var responses = await ExchangeAsync(
+            TypesSession(),
+            ToolCall(2, "types", $$"""{"path":"{{TypesModulePath}}"}"""));
+
+        var payload = Json(ContentText(responses, 2));
+
+        var symbols = payload["symbols"]!.AsArray().Select(symbol => symbol!).ToList();
+        Assert.Contains(symbols, symbol =>
+            Text(symbol["name"]) == "Данные" && Text(symbol["kind"]) == "ModuleVariable" && symbol["line"]!.GetValue<int>() == 1);
+        Assert.Contains(symbols, symbol =>
+            Text(symbol["name"]) == "Таблица" && Text(symbol["scope"]) == "Routine" &&
+            symbol["line"]!.GetValue<int>() == 4 && symbol["column"]!.GetValue<int>() == 5);
+
+        var inferred = payload["inferredTypes"]!.AsArray().Select(item => item!).ToList();
+        Assert.Contains(inferred, item => Text(item["name"]) == "Таблица" && Text(item["type"]) == "ТаблицаЗначений");
+
+        Assert.Equal(1, payload["resolvedCallsCount"]!.GetValue<int>());
+        var resolved = payload["resolvedCalls"]!.AsArray()[0]!;
+        Assert.Equal("Таблица.Свернуть", Text(resolved["call"]));
+        Assert.Equal("platform:ТаблицаЗначений.Свернуть", Text(resolved["node"]));
+
+        // Переменная с неизвестным типом видна в ответе: и вызов, и место, где тип не вывелся.
+        Assert.Equal(1, payload["unresolvedCallsCount"]!.GetValue<int>());
+        var unresolvedCall = payload["unresolvedCalls"]!.AsArray()[0]!;
+        Assert.Equal("Данные.Обработать", Text(unresolvedCall["call"]));
+        Assert.Contains("не выведен", Text(unresolvedCall["reason"]), StringComparison.Ordinal);
+
+        Assert.Equal(1, payload["unresolvedTypesCount"]!.GetValue<int>());
+        Assert.Equal("Результат", Text(payload["unresolvedTypes"]!.AsArray()[0]!["name"]));
+    }
+
+    [Fact]
+    public async Task Инструмент_types_по_узлу_показывает_видимые_имена_с_типами()
+    {
+        var responses = await ExchangeAsync(
+            TypesSession(),
+            ToolCall(2, "types", $$"""{"id":"module:{{TypesModulePath}}","line":7}"""));
+
+        var payload = Json(ContentText(responses, 2));
+        var visible = payload["visibleAt"]!.AsArray().Select(item => item!).ToList();
+
+        Assert.Contains(visible, item => Text(item["name"]) == "Таблица" && Text(item["type"]) == "ТаблицаЗначений");
+        Assert.Contains(visible, item => Text(item["name"]) == "Данные" && item["type"] is null);
+        Assert.Contains(visible, item => Text(item["name"]) == "Результат" && item["type"] is null);
+    }
+
+    [Fact]
+    public async Task Инструмент_types_без_пути_и_узла_подсказывает_аргументы()
+    {
+        var responses = await ExchangeAsync(TypesSession(), ToolCall(2, "types", "{}"));
+
+        Assert.True(responses.Single(item => Text(item["id"]) == "2")["result"]!["isError"]!.GetValue<bool>());
+        Assert.Contains("id", ContentText(responses, 2), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -550,6 +609,56 @@ public sealed class McpServerTests
         """;
 
     private static AnalysisSession Session() => new(new AnalysisRequest(), SampleDump.Create());
+
+    /// <summary>Путь модуля в выгрузке с типами: используется инструментом types в проверках.</summary>
+    private const string TypesModulePath = "CommonModules/Типы/Ext/Module.bsl";
+
+    private const string TypesModuleBsl = """
+        Перем Данные;
+
+        Процедура Тест(Параметр)
+            Таблица = Новый ТаблицаЗначений;
+            Таблица.Свернуть("Колонка");
+            Результат = ПолучитьЗначение();
+            Данные.Обработать();
+        КонецПроцедуры
+        """;
+
+    /// <summary>Выгрузка с одним общим модулем: на ней проверяется инструмент types.</summary>
+    private static AnalysisSession TypesSession()
+    {
+        var source = new InMemoryDumpSource("выгрузка с типами");
+        source.AddText("Configuration.xml", TypesConfigurationXml);
+        source.AddText("CommonModules/Типы.xml", TypesCommonModuleXml);
+        source.AddText(TypesModulePath, TypesModuleBsl);
+        return new AnalysisSession(new AnalysisRequest(), source);
+    }
+
+    private const string TypesConfigurationXml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+            <Configuration uuid="0f0f0f0f-0000-0000-0000-00000000000a">
+                <Properties>
+                    <Name>КонфигурацияСТипами</Name>
+                </Properties>
+                <ChildObjects>
+                    <CommonModule>Типы</CommonModule>
+                </ChildObjects>
+            </Configuration>
+        </MetaDataObject>
+        """;
+
+    private const string TypesCommonModuleXml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+            <CommonModule uuid="66666666-6666-6666-6666-66666666666a">
+                <Properties>
+                    <Name>Типы</Name>
+                    <Server>true</Server>
+                </Properties>
+            </CommonModule>
+        </MetaDataObject>
+        """;
 
     private static string ToolCall(int id, string name, string arguments) => new JsonObject
     {

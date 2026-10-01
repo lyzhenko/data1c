@@ -393,6 +393,13 @@ public sealed class IndexWriter
                 return AddPlatform(module, call.Callee);
             }
 
+            // Тип переменной известен (Э2-4): вызов через переменную платформенного типа
+            // становится узлом platform:Тип.Метод, как и при полной сборке графа.
+            if (TypeInference.TryResolvePlatformCallee(module, call, out var inferredCallee))
+            {
+                return AddPlatform(module, inferredCallee);
+            }
+
             return AddPlaceholder($"call:{call.Callee}", call.Callee, GraphNodeKind.External);
         }
 

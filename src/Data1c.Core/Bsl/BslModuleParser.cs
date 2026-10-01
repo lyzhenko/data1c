@@ -1,3 +1,4 @@
+using Data1c.Core.Analysis;
 using Data1c.Core.Metadata;
 
 namespace Data1c.Core.Bsl;
@@ -141,8 +142,11 @@ public sealed class BslModuleParser : IBslModuleParser
             _routines.Add(finished.Frame.ToRoutine(finished.EndLine));
         }
 
+        // Символы и типы строятся по тем же токенам, что и разбор: отдельного прохода по тексту нет.
+        var symbols = SymbolTable.Build(_routines, _tokens, _lineCount);
+
         // Списки копируются: иначе следующий разбор очистил бы уже выданный результат.
-        return new BslModuleInfo
+        var module = new BslModuleInfo
         {
             Path = source.Path,
             OwnerId = source.OwnerId,
@@ -153,7 +157,10 @@ public sealed class BslModuleParser : IBslModuleParser
             MetadataAccesses = [.. _moduleMetadata],
             Diagnostics = [.. _diagnostics],
             LineCount = _lineCount,
+            Symbols = symbols,
         };
+
+        return module.WithTypes(TypeInference.Infer(module, symbols, _tokens));
     }
 
     private void Reset(string text)

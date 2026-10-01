@@ -1,3 +1,4 @@
+using Data1c.Core.Analysis;
 using Data1c.Core.Bsl;
 using Data1c.Core.Metadata;
 using Data1c.Core.Platform;
@@ -309,6 +310,13 @@ public sealed class DependencyGraphBuilder
         if (_platform?.ContainsMember(call.Callee) == true)
         {
             return AddPlatformNode(call.Callee);
+        }
+
+        // Тип переменной известен (Э2-4): «Таблица.Свернуть» при типе «ТаблицаЗначений» —
+        // это метод платформы, а не внешняя заглушка.
+        if (TypeInference.TryResolvePlatformCallee(module, call, out var inferredCallee))
+        {
+            return AddPlatformNode(inferredCallee);
         }
 
         if (_options.IncludeExternalNodes)
