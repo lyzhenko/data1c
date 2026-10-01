@@ -43,6 +43,7 @@ public sealed class ToolCatalog
             PlatformTool(),
             CheckTool(),
             TypesTool(),
+            ConventionsTool(),
             ReloadTool(),
         ];
     }
@@ -993,6 +994,120 @@ public sealed class ToolCatalog
                         type = types.TryGetType(symbol.Name, line, out var typeName) ? typeName : null,
                     }).ToList()
                     : null,
+            });
+        });
+
+    /// <summary>
+    /// Готовит разбор конвенций: на индексе — запросами к базе, без него — по разбору в памяти.
+    /// Разбор специально не запускается: инструмент должен отвечать быстро, а если разбор уже идёт,
+    /// подождём совсем немного — как это делает проверка черновика.
+    /// </summary>
+    private async Task<ConventionAnswer> FindConventionsAsync(
+        string? intent,
+        string? platform,
+        int limit,
+        CancellationToken cancellationToken)
+    {
+        if (Session.GetIndexReader() is { } reader)
+        {
+            return Conventions.Suggest(reader.ConventionQuery(), intent, platform, limit);
+        }
+
+        var result = Session.Result ?? await WaitForAnalysisAsync(cancellationToken).ConfigureAwait(false);
+        return result is null
+            ? throw new ToolException(
+                "Конфигурация ещё не разобрана: конвенции строятся по графу вызовов. "
+                + "Повторите запрос через несколько секунд (status покажет готовность разбора).")
+            : Conventions.Suggest(new AnalysisConventionQuery(result), intent, platform, limit);
+    }
+
+    private ToolSpec ConventionsTool() => new(
+        "conventions",
+        "«В конфигурации это уже делают так»: рейтинг общих модулей и процедур по числу вызовов и подбор "
+        + "типовых приёмов под намерение агента — получить реквизит объекта, записать объект, найти по "
+        + "наименованию, прочитать данные запросом, вывести сообщение пользователю, выполнить на сервере "
+        + "или в фоне. В ответе процедуры с числом использований, пример вызова (модуль и строка) и "
+        + "пояснение, почему они подходят. Вместо intent можно задать точный метод платформы — тогда "
+        + "инструмент покажет, кто его вызывает и на каких строках. Пример: intent=\"записать объект\" "
+        + "или platform=\"Записать\". Код найденных процедур открывается инструментом code по их id.",
+        [
+            new ToolParameter("intent", "string", "Намерение словами: «получить реквизит объекта», «записать объект», «найти по наименованию»."),
+            new ToolParameter("platform", "string", "Точный метод платформы: Записать, ЗначениеРеквизитаОбъекта, НайтиПоНаименованию, Сообщить."),
+            new ToolParameter("limit", "integer", "Сколько процедур и модулей вернуть (1–50, по умолчанию 8)."),
+        ],
+        async (arguments, token) =>
+        {
+            var intent = arguments.GetString("intent");
+            var platform = arguments.GetString("platform");
+            if (intent is null && platform is null)
+            {
+                throw new ToolException(
+                    "Укажите intent (намерение словами) или platform (точное имя метода платформы), например "
+                    + "intent=\"записать объект\" либо platform=\"Записать\".");
+            }
+
+            var limit = arguments.GetInt("limit", 8, 1, 50);
+            var answer = await FindConventionsAsync(intent, platform, limit, token).ConfigureAwait(false);
+
+            var modules = answer.Modules
+                .Take(limit)
+                .Select(static module => new
+                {
+                    module = module.Name,
+                    path = module.ModulePath,
+                    calls = module.Uses,
+                })
+                .ToList();
+
+            var routines = answer.Routines
+                .Take(limit)
+                .Select(static routine => new
+                {
+                    id = routine.RoutineId,
+                    name = routine.Name,
+                    module = routine.ModulePath,
+                    owner = routine.OwnerId,
+                    uses = routine.Uses,
+                    callers = routine.Callers,
+                    export = routine.Symbol is { IsExport: true } ? true : (bool?)null,
+                    lines = routine.Symbol is { } symbol ? $"{symbol.StartLine}-{symbol.EndLine}" : null,
+                    parameters = routine.Symbol?.Parameters,
+                    comment = routine.Symbol?.CommentHead,
+                    platformMethod = routine.CallMethod,
+                    example = routine.ExampleLine is { } line
+                        ? new { module = routine.ExampleModule, line, call = routine.ExampleDetail }
+                        : null,
+                    reasons = routine.Reasons,
+                })
+                .ToList();
+
+            var callSites = answer.CallSites
+                .Take(limit * 2)
+                .Select(static site => new
+                {
+                    routine = site.RoutineId,
+                    module = site.ModulePath,
+                    line = site.Line,
+                    call = site.Detail,
+                })
+                .ToList();
+
+            return Render.JsonOf(new
+            {
+                intent = answer.Intent,
+                question = answer.Question,
+                platformMethod = answer.PlatformMethod,
+                found = new
+                {
+                    modules = answer.Modules.Count,
+                    routines = answer.Routines.Count,
+                    callSites = answer.CallSites.Count,
+                },
+                modules,
+                routines,
+                callSites,
+                note = answer.Note,
+                hint = answer.Hint,
             });
         });
 

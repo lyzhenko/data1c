@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using Data1c.Core.Analysis;
 using Data1c.Core.Graph;
 using Data1c.Core.Metadata;
 using Microsoft.Data.Sqlite;
@@ -1461,6 +1462,777 @@ public sealed class IndexReader
         reader.IsDBNull(6) ? null : reader.GetString(6),
         reader.IsDBNull(7) ? null : reader.GetString(7));
 
+    /// <summary>
+    /// Разбор конвенций по индексу: рейтинг процедур по числу вызовов, кто вызывает метод платформы,
+    /// к каким объектам метаданных обращаются процедуры.
+    /// </summary>
+    /// <remarks>
+    /// Все запросы опираются на существующие индексы: связи берутся по <c>target_id</c>/<c>detail</c>,
+    /// символы — по <c>module_path</c> и <c>name_lower</c>, термы — из <c>terms_fts</c>. Ни один запрос
+    /// не просматривает таблицы целиком: на выгрузке 2,9 ГБ это условие доли секунды на ответ.
+    /// </remarks>
+    public IConventionQuery ConventionQuery() => new IndexConventionQuery(this);
+
+    /// <summary>Процедуры по убыванию числа входящих вызовов. Нужен рейтинг «кто чаще используется».</summary>
+    /// <param name="limit">Сколько строк вернуть.</param>
+    /// <remarks>
+    /// Запрос идёт от целей связей: сначала берутся процедуры с наибольшим числом связей Calls
+    /// (покрывающий индекс <c>idx_edges_target</c>), и только для них дочитывается путь модуля.
+    /// Обратный порядок — соединение всех 2,6 млн связей ради сортировки — стоил восемь секунд.
+    /// </remarks>
+    public IReadOnlyList<ConventionModuleUsage> RankRoutines(int limit = 50)
+    {
+        var bounded = Math.Clamp(limit, 1, 1000);
+        return _index.WithLock(() =>
+        {
+            using var command = _index.CreateCommand(
+                """
+                SELECT t.id, t.uses, COALESCE(s.module_path, ''), COALESCE(owner.id, '')
+                FROM (
+                    SELECT target_id AS id, COUNT(*) AS uses
+                    FROM edges INDEXED BY idx_edges_target
+                    WHERE kind = 'Calls' AND target_id LIKE 'routine:%'
+                    GROUP BY target_id
+                    ORDER BY uses DESC, target_id
+                    LIMIT @limit
+                ) t
+                LEFT JOIN symbols s ON s.node_id = t.id
+                LEFT JOIN edges dc ON dc.kind = 'Contains' AND dc.target_id = 'module:' || s.module_path
+                LEFT JOIN nodes owner ON owner.id = dc.source_id AND owner.kind = 'MetadataObject'
+                """);
+            command.Parameters.AddWithValue("@limit", bounded);
+
+            using var reader = command.ExecuteReader();
+            var result = new List<ConventionModuleUsage>();
+            while (reader.Read())
+            {
+                var routineId = reader.GetString(0);
+                result.Add(new ConventionModuleUsage(
+                    routineId,
+                    reader.IsDBNull(3) || reader.GetString(3).Length == 0 ? null : reader.GetString(3),
+                    routineId,
+                    NameOfRoutineId(routineId),
+                    reader.IsDBNull(2) ? string.Empty : reader.GetString(2),
+                    reader.GetInt32(1)));
+            }
+
+            return (IReadOnlyList<ConventionModuleUsage>)result;
+        });
+    }
+
+    /// <summary>Сведения о символах процедур: имя, строки, параметры и шапка комментария.</summary>
+    /// <remarks>
+    /// Символ ищется по узлу процедуры: <c>symbols.node_id</c> и узел графа — это одна и та же
+    /// строка вида <c>routine:module:…#Имя</c>. Запасной ключ «имя и узел модуля» нужен индексам,
+    /// где эти два значения разошлись.
+    /// </remarks>
+    public IReadOnlyList<ConventionSymbol> SymbolsOf(IReadOnlyList<string> routineIds)
+    {
+        var result = new List<ConventionSymbol>();
+        if (routineIds.Count == 0)
+        {
+            return result;
+        }
+
+        return _index.WithLock(() =>
+        {
+            foreach (var chunk in Chunk([.. routineIds], 200))
+            {
+                var fallback = chunk
+                    .Select(id => "module:" + ModuleOfRoutineId(id) + "#" + NameOfRoutineId(id))
+                    .ToList();
+                using var command = _index.CreateCommand(
+                    $"""
+                     SELECT node_id, name, module_path, kind, is_export, start_line, end_line, parameters, comment_head, COALESCE(owner_id, '')
+                     FROM symbols
+                     WHERE node_id IN ({Placeholders(chunk.Count, "@i")})
+                        OR ('module:' || module_path || '#' || name) IN ({Placeholders(fallback.Count, "@n")})
+                     """);
+                AddTextParameters(command, chunk, "@i");
+                AddTextParameters(command, fallback, "@n");
+                ReadSymbols(command, result);
+            }
+
+            return (IReadOnlyList<ConventionSymbol>)result;
+        });
+    }
+
+    /// <summary>
+    /// Кто вызывает процедуру: модуль и строка. Строка берётся из связи, а при её отсутствии —
+    /// из начала процедуры, чтобы пример вызова был всегда.
+    /// </summary>
+    public IReadOnlyList<ConventionCallSite> CallerSites(string routineId, int limit)
+    {
+        if (string.IsNullOrWhiteSpace(routineId))
+        {
+            return [];
+        }
+
+        return _index.WithLock(() =>
+        {
+            using var command = _index.CreateCommand(
+                """
+                SELECT COALESCE(s.module_path, n.source_path, e.source_id), e.line, e.detail
+                FROM edges e
+                JOIN nodes n ON n.id = e.source_id
+                LEFT JOIN symbols s ON s.node_id = e.source_id
+                WHERE e.kind = 'Calls' AND e.target_id = @id
+                ORDER BY e.line, e.source_id
+                LIMIT @limit
+                """);
+            command.Parameters.AddWithValue("@id", routineId);
+            command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 2000));
+            using var reader = command.ExecuteReader();
+            var result = new List<ConventionCallSite>();
+            while (reader.Read())
+            {
+                result.Add(new ConventionCallSite(
+                    routineId,
+                    reader.GetString(0),
+                    reader.IsDBNull(1) ? null : reader.GetInt32(1),
+                    reader.IsDBNull(2) ? null : reader.GetString(2)));
+            }
+
+            return (IReadOnlyList<ConventionCallSite>)result;
+        });
+    }
+
+    /// <summary>
+    /// Кто вызывает метод платформы и с какой строки. Совпадение ищется только по настоящим
+    /// платформенным вызовам: разрешённый вызов — это узел <c>platform:Метод</c>, а неразрешённый
+    /// (<c>call:Объект.Записать</c>, когда справка платформы не подключена) принимается лишь тогда,
+    /// когда квалификатор не совпадает с именем общего модуля конфигурации. Без этой проверки
+    /// в ответ попадали бы вызовы процедур конфигурации: «ОбщийМодуль.ЗаписатьТовар».
+    /// </summary>
+    /// <param name="platformMethod">Имя метода: «Записать», «Запрос.Выполнить».</param>
+    /// <param name="limit">Сколько процедур вернуть.</param>
+    /// <remarks>
+    /// Точная цель (<c>platform:Метод</c>, <c>call:Метод</c>) ищется индексом <c>idx_edges_target</c> —
+    /// им покрыт индекс, собранный со справкой платформы. Квалифицированный вызов («Объект.Записать»)
+    /// в цель не попадает, поэтому есть вторая ступень: цели ищутся среди узлов по имени, а вызывающие —
+    /// по индексу цели. Просмотр колонки <c>detail</c> по шаблону «%.Метод» не делается: на 2,6 млн
+    /// связей он стоит секунду и не использует индекс.
+    /// </remarks>
+    public IReadOnlyList<ConventionRoutine> PlatformMatches(string platformMethod, int limit = 50)
+    {
+        var method = platformMethod?.Trim() ?? string.Empty;
+        if (method.Length == 0)
+        {
+            return [];
+        }
+
+        var bounded = Math.Clamp(limit, 1, 1000);
+        var platformId = "platform:" + method;
+        var callId = "call:" + method;
+        var shortName = method[(method.IndexOf('.') + 1)..];
+        var suffix = "." + EscapeLike(shortName);
+
+        return _index.WithLock(() =>
+        {
+            var commonModules = CommonModuleNames();
+            var byRoutine = new Dictionary<string, string>(StringComparer.Ordinal);
+
+            // Ступень 1: точная цель вызова — самый быстрый путь: индекс idx_edges_target.
+            // Им покрыт индекс, собранный со справкой платформы: «Товар.Записать» → platform:Записать.
+            // Вызовы из кода модуля (вне процедур) пропускаются: ответ инструмента — про процедуры.
+            using (var exact = _index.CreateCommand(
+                """
+                SELECT e.source_id, e.detail
+                FROM edges e
+                WHERE e.kind = 'Calls' AND e.source_id LIKE 'routine:%' AND e.target_id IN (@platformId, @callId)
+                """))
+            {
+                exact.Parameters.AddWithValue("@platformId", platformId);
+                exact.Parameters.AddWithValue("@callId", callId);
+                using var reader = exact.ExecuteReader();
+                while (reader.Read())
+                {
+                    byRoutine.TryAdd(reader.GetString(0), reader.IsDBNull(1) ? string.Empty : reader.GetString(1));
+                }
+            }
+
+            var targets = new List<string>();
+            using (var candidates = _index.CreateCommand(
+                "SELECT id, is_external FROM nodes WHERE kind <> 'Routine' AND name LIKE @suffix"))
+            {
+                candidates.Parameters.AddWithValue("@suffix", "%" + suffix);
+                using var reader = candidates.ExecuteReader();
+                while (reader.Read())
+                {
+                    var targetId = reader.GetString(0);
+                    var external = reader.GetInt32(1) != 0;
+                    var qualifier = QualifierOf(targetId);
+
+                    // Внешняя цель с квалификатором общего модуля — это вызов процедуры
+                    // конфигурации, а не метода платформы.
+                    if (external && qualifier.Length > 0 && commonModules.Contains(qualifier))
+                    {
+                        continue;
+                    }
+
+                    targets.Add(targetId);
+                }
+            }
+
+            // Ступень 2 нужна там, где вызов записан с квалификатором: «Объект.Записать» попадает
+            // в узел platform:Записать только при подключённой справке платформы. Цели ищутся
+            // по индексированному имени узла, а не просмотром колонки detail: тот шаблон стоит
+            // секунду на 2,6 млн связей.
+            if (byRoutine.Count == 0 || !shortName.Equals(method, StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var chunk in Chunk(targets, 400))
+                {
+                    using var callers = _index.CreateCommand(
+                        $"SELECT source_id, detail FROM edges WHERE kind = 'Calls' AND source_id LIKE 'routine:%' AND target_id IN ({Placeholders(chunk.Count, "@t")})");
+                    AddTextParameters(callers, chunk, "@t");
+                    using var reader = callers.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        byRoutine.TryAdd(reader.GetString(0), reader.IsDBNull(1) ? string.Empty : reader.GetString(1));
+                    }
+                }
+            }
+
+            // Сведения читаются только для отобранных процедур: подзапрос по связям на каждую
+            // процедуру в наборе из десятков тысяч кандидатов стоил бы секунды.
+            var selected = byRoutine.Keys.OrderBy(static id => id, StringComparer.Ordinal).Take(2000).ToList();
+            var evidence = Decorate(selected, method);
+            return (IReadOnlyList<ConventionRoutine>)
+            [
+                .. evidence
+                    .Select(item => new ConventionRoutine(
+                        item.RoutineId,
+                        item.Symbol?.Name ?? NameOfRoutineId(item.RoutineId),
+                        item.Symbol?.OwnerId,
+                        item.Symbol?.ModulePath ?? ModuleOfRoutineId(item.RoutineId),
+                        item.PlatformHits,
+                        1,
+                        item.Symbol,
+                        0,
+                        method,
+                        item.ExampleModule,
+                        item.ExampleLine,
+                        item.ExampleDetail))
+                    // Порядок — по числу обращений к методу у самой процедуры: вопрос звучит как
+                    // «кто чаще всего так делает», и первым должен идти именно он.
+                    .OrderByDescending(static item => item.Uses)
+                    .ThenBy(static item => item.Name, StringComparer.Ordinal)
+                    .Take(bounded)
+            ];
+        });
+    }
+
+    /// <summary>Квалификатор текста вызова без имени метода: «ОбщийМодуль.ЗаписатьТовар» → «ОбщийМодуль».</summary>
+    private static string QualifierOf(string targetId)
+    {
+        var callee = targetId.StartsWith("call:", StringComparison.Ordinal)
+            ? targetId["call:".Length..]
+            : targetId.StartsWith("platform:", StringComparison.Ordinal) ? targetId["platform:".Length..] : targetId;
+        var separator = callee.LastIndexOf('.');
+        return separator > 0 ? callee[..separator] : string.Empty;
+    }
+
+    /// <summary>Имена общих модулей конфигурации: по ним отсеиваются вызовы процедур, а не платформы.</summary>
+    private HashSet<string> CommonModuleNames()
+    {
+        using var command = _index.CreateCommand("SELECT name FROM metadata_objects WHERE kind = 'CommonModule'");
+        using var reader = command.ExecuteReader();
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        while (reader.Read())
+        {
+            result.Add(reader.GetString(0));
+        }
+
+        return result;
+    }
+
+    /// <summary>К каким объектам метаданных обращается процедура: виды целей связей UsesMetadata.</summary>
+    public IReadOnlyList<string> MetadataKindsOf(string routineId) =>
+        AllMetadataKinds().TryGetValue(routineId, out var kinds) ? kinds : [];
+
+    /// <summary>
+    /// Виды объектов метаданных по всем процедурам: один проход по связям UsesMetadata вместо
+    /// запроса на каждую процедуру. Нужен разбору приёмов, где процедур сотни.
+    /// </summary>
+    internal Dictionary<string, IReadOnlyList<string>> AllMetadataKinds()
+    {
+        return _index.WithLock(() =>
+        {
+            using var command = _index.CreateCommand(
+                """
+                SELECT e.source_id,
+                       CASE WHEN instr(e.target_id, '.') > 0 THEN substr(e.target_id, 1, instr(e.target_id, '.') - 1) ELSE e.target_id END
+                FROM edges e
+                WHERE e.kind = 'UsesMetadata' AND e.target_id NOT LIKE 'platform:%'
+                """);
+            using var reader = command.ExecuteReader();
+            var result = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            while (reader.Read())
+            {
+                var kind = reader.GetString(1);
+                if (kind.Length == 0)
+                {
+                    continue;
+                }
+
+                if (!result.TryGetValue(reader.GetString(0), out var kinds))
+                {
+                    kinds = [];
+                    result[reader.GetString(0)] = kinds;
+                }
+
+                kinds.Add(kind);
+            }
+
+            return result.ToDictionary(
+                static pair => pair.Key,
+                static pair => (IReadOnlyList<string>)pair.Value,
+                StringComparer.Ordinal);
+        });
+    }
+
+    /// <summary>
+    /// Процедуры, имя которых начинается с указанных слов. Порядок ступеней — по возрастанию цены:
+    /// точное имя и префикс ищутся индексом <c>name_lower</c>; просмотр по подстроке не делается
+    /// вовсе, потому что на 258 тысячах символов он стоит полного скана таблицы.
+    /// </summary>
+    /// <param name="namePrefixes">Слова и их основы: «записать», «записа».</param>
+    /// <param name="limit">Предел числа процедур.</param>
+    public IReadOnlyList<string> RoutinesByNamePrefix(IReadOnlyList<string> namePrefixes, int limit = 100)
+    {
+        if (namePrefixes.Count == 0)
+        {
+            return [];
+        }
+
+        var bounded = Math.Clamp(limit, 1, 1000);
+        return _index.WithLock(() =>
+        {
+            var found = new List<string>(bounded);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var lowered = namePrefixes.Select(static value => value.ToLowerInvariant()).Distinct(StringComparer.Ordinal).ToList();
+
+            foreach (var chunk in Chunk(lowered, 200))
+            {
+                if (found.Count >= bounded)
+                {
+                    break;
+                }
+
+                using var exact = _index.CreateCommand(
+                    $"SELECT node_id FROM symbols WHERE name_lower IN ({Placeholders(chunk.Count, "@p")}) ORDER BY length(name), name LIMIT @limit");
+                AddTextParameters(exact, chunk, "@p");
+                exact.Parameters.AddWithValue("@limit", bounded);
+                Collect(exact, found, seen);
+            }
+
+            foreach (var chunk in Chunk(lowered, 200))
+            {
+                if (found.Count >= bounded)
+                {
+                    break;
+                }
+
+                var conditions = string.Join(" OR ", Enumerable.Range(0, chunk.Count).Select(static index => $"name_lower LIKE @p{index.ToString(CultureInfo.InvariantCulture)} ESCAPE '\\'"));
+                using var prefix = _index.CreateCommand(
+                    $"SELECT node_id FROM symbols WHERE ({conditions}) ORDER BY length(name), name LIMIT @limit");
+                AddPrefixParameters(prefix, chunk, "@p");
+                prefix.Parameters.AddWithValue("@limit", bounded);
+                Collect(prefix, found, seen);
+            }
+
+            return (IReadOnlyList<string>)found;
+        });
+    }
+
+    /// <summary>Процедуры, найденные по словам имени, шапки комментария и параметров (terms_fts).</summary>
+    public IReadOnlyList<string> RoutinesByTerms(IReadOnlyList<string> terms, int limit = 100)
+    {
+        if (terms.Count == 0)
+        {
+            return [];
+        }
+
+        var match = EscapeFtsPrefix(string.Join(' ', terms));
+        if (match.Length == 0)
+        {
+            return [];
+        }
+
+        return _index.WithLock(() =>
+        {
+            using var command = _index.CreateCommand(
+                """
+                SELECT s.node_id
+                FROM terms_fts t
+                JOIN symbols s ON s.id = CAST(t.symbol_id AS INTEGER)
+                WHERE terms_fts MATCH @match
+                ORDER BY bm25(terms_fts), length(s.name)
+                LIMIT @limit
+                """);
+            command.Parameters.AddWithValue("@match", match);
+            command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 1000));
+            using var reader = command.ExecuteReader();
+            var result = new List<string>();
+            while (reader.Read())
+            {
+                result.Add(reader.GetString(0));
+            }
+
+            return (IReadOnlyList<string>)result;
+        });
+    }
+
+    /// <summary>Сколько связей указанного вида указано целью процедуры: мера «как её применяют».</summary>
+    /// <param name="routineId">Узел процедуры или модуля.</param>
+    /// <param name="edge">Вид связи: Calls.</param>
+    private int CountCallsTo(string routineId, string edge)
+    {
+        using var command = _index.CreateCommand($"SELECT COUNT(*) FROM edges WHERE kind = '{edge}' AND target_id = @id");
+        command.Parameters.AddWithValue("@id", routineId);
+        return Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Сколько раз сама процедура вызывает указанный метод платформы.</summary>
+    /// <param name="routineId">Узел процедуры.</param>
+    /// <param name="platformMethod">Имя метода платформы.</param>
+    private int CountOwnPlatformCalls(string routineId, string platformMethod)
+    {
+        using var command = _index.CreateCommand(
+            """
+            SELECT COUNT(*) FROM edges
+            WHERE kind = 'Calls' AND source_id = @id AND (target_id = @platformId OR detail LIKE @detail)
+            """);
+        command.Parameters.AddWithValue("@id", routineId);
+        command.Parameters.AddWithValue("@platformId", "platform:" + platformMethod);
+        command.Parameters.AddWithValue("@detail", "%." + EscapeLike(platformMethod));
+        return Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Сведения о процедурах для разбора приёмов: символ, число входящих вызовов, пример вызывающего,
+    /// обращения к метаданным и число собственных вызовов метода платформы.
+    /// </summary>
+    /// <remarks>
+    /// Считается одним запросом на весь набор: связи вызова берутся по индексу <c>idx_edges_target</c>,
+    /// связи UsesMetadata — по индексу <c>idx_edges_source</c>. Собственные вызовы метода платформы
+    /// считаются вторым запросом по отобранным процедурам: подзапрос на каждую строку набора
+    /// из сотен кандидатов превращал ответ в десятки секунд.
+    /// </remarks>
+    /// <param name="routineIds">Процедуры-кандидаты.</param>
+    /// <param name="platformMethod">Метод платформы, вызовы которого считаются у самих процедур.</param>
+    public IReadOnlyList<ConventionEvidence> Decorate(IReadOnlyCollection<string> routineIds, string? platformMethod)
+    {
+        var result = new List<ConventionEvidence>();
+        if (routineIds.Count == 0)
+        {
+            return result;
+        }
+
+        var method = platformMethod?.Trim() ?? string.Empty;
+        return _index.WithLock(() =>
+        {
+            foreach (var chunk in Chunk([.. routineIds], 200))
+            {
+                var ids = JsonIds(chunk);
+                using var command = _index.CreateCommand(
+                    """
+                    SELECT cand.id,
+                           s.name, s.module_path, s.kind, s.is_export, s.start_line, s.end_line, s.parameters, s.comment_head, COALESCE(s.owner_id, ''),
+                           COALESCE(inc.uses, 0),
+                           COALESCE(inc.callers, 0),
+                           COALESCE(ca.module, ''),
+                           ca.line,
+                           ca.detail,
+                           COALESCE(md.kinds, '')
+                    FROM (
+                        SELECT value AS id FROM json_each(@ids)
+                    ) cand
+                    LEFT JOIN symbols s ON s.node_id = cand.id
+                    LEFT JOIN (
+                        SELECT target_id, COUNT(*) AS uses, COUNT(DISTINCT source_id) AS callers
+                        FROM edges
+                        WHERE kind = 'Calls' AND target_id IN (SELECT value FROM json_each(@ids))
+                        GROUP BY target_id
+                    ) inc ON inc.target_id = cand.id
+                    LEFT JOIN (
+                        SELECT e.target_id,
+                               COALESCE(sm.module_path, n.source_path, e.source_id) AS module,
+                               e.line,
+                               e.detail
+                        FROM edges e
+                        JOIN nodes n ON n.id = e.source_id
+                        LEFT JOIN symbols sm ON sm.node_id = e.source_id
+                        WHERE e.kind = 'Calls' AND e.target_id IN (SELECT value FROM json_each(@ids))
+                          AND e.rowid = (SELECT MIN(e2.rowid) FROM edges e2
+                                         WHERE e2.kind = 'Calls' AND e2.target_id = e.target_id)
+                    ) ca ON ca.target_id = cand.id
+                    LEFT JOIN (
+                        SELECT source_id, GROUP_CONCAT(kind, ',') AS kinds FROM (
+                            SELECT DISTINCT source_id,
+                                   CASE WHEN instr(target_id, '.') > 0 THEN substr(target_id, 1, instr(target_id, '.') - 1) ELSE target_id END AS kind
+                            FROM edges
+                            WHERE kind = 'UsesMetadata' AND target_id NOT LIKE 'platform:%' AND source_id IN (SELECT value FROM json_each(@ids))
+                        )
+                        GROUP BY source_id
+                    ) md ON md.source_id = cand.id
+                    """);
+                command.Parameters.AddWithValue("@ids", ids);
+
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    var name = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+                    var modulePath = reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
+                    var symbol = reader.IsDBNull(1)
+                        ? null
+                        : new ConventionSymbol(
+                            name,
+                            RoutineId(modulePath, name),
+                            modulePath,
+                            reader.IsDBNull(3) ? "Procedure" : reader.GetString(3),
+                            reader.IsDBNull(4) || reader.GetInt32(4) != 0,
+                            reader.IsDBNull(5) ? 0 : reader.GetInt32(5),
+                            reader.IsDBNull(6) ? 0 : reader.GetInt32(6),
+                            reader.IsDBNull(7) ? null : reader.GetString(7),
+                            reader.IsDBNull(8) ? null : reader.GetString(8),
+                            reader.IsDBNull(9) || reader.GetString(9).Length == 0 ? null : reader.GetString(9));
+
+                    var kinds = reader.IsDBNull(15) || reader.GetString(15).Length == 0
+                        ? []
+                        : reader.GetString(15).Split(',', StringSplitOptions.RemoveEmptyEntries);
+                    result.Add(new ConventionEvidence(
+                        reader.GetString(0),
+                        symbol,
+                        reader.GetInt32(10),
+                        reader.GetInt32(11),
+                        reader.IsDBNull(12) || reader.GetString(12).Length == 0 ? null : reader.GetString(12),
+                        reader.IsDBNull(13) ? null : reader.GetInt32(13),
+                        reader.IsDBNull(14) ? null : reader.GetString(14),
+                        kinds));
+                }
+            }
+
+            if (method.Length == 0)
+            {
+                return (IReadOnlyList<ConventionEvidence>)result;
+            }
+
+            // Собственные вызовы метода считаются одним проходом по индексу цели: он читает
+            // 1,3 млн связей один раз, тогда как подзапрос на каждую строку набора повторял
+            // бы этот просмотр столько раз, сколько в наборе кандидатов.
+            var hits = OwnPlatformCalls(method);
+            return
+            [
+                .. result.Select(item => hits.TryGetValue(item.RoutineId, out var own) ? item with { PlatformHits = own } : item)
+            ];
+        });
+    }
+
+    /// <summary>
+    /// Сколько раз каждая процедура вызывает метод платформы. Один проход по индексу цели:
+    /// сравнение имени метода делается в C#, потому что шаблон «%.Метод» не использует индекс.
+    /// </summary>
+    private Dictionary<string, int> OwnPlatformCalls(string method)
+    {
+        var result = new Dictionary<string, int>(StringComparer.Ordinal);
+        using var command = _index.CreateCommand(
+            """
+            SELECT e.source_id, e.detail
+            FROM edges e INDEXED BY idx_edges_target
+            WHERE e.kind = 'Calls' AND e.target_id LIKE 'platform:%'
+            """);
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var detail = reader.IsDBNull(1) ? null : reader.GetString(1);
+            if (!EndsWithMethod(detail, method))
+            {
+                continue;
+            }
+
+            var source = reader.GetString(0);
+            result[source] = result.TryGetValue(source, out var count) ? count + 1 : 1;
+        }
+
+        return result;
+    }
+
+    /// <summary>Оканчивается ли текст вызова на «.Метод» или равен «Метод».</summary>
+    private static bool EndsWithMethod(string? value, string method)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return false;
+        }
+
+        if (string.Equals(value, method, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var separator = value.LastIndexOf('.');
+        return separator >= 0 && separator < value.Length - 1 &&
+            string.Equals(value[(separator + 1)..], method, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Массив идентификаторов для <c>json_each</c>: один параметр вместо сотен плейсхолдеров.</summary>
+    private static string JsonIds(IReadOnlyList<string> values)
+    {
+        var builder = new StringBuilder(values.Count * 48);
+        builder.Append('[');
+        for (var index = 0; index < values.Count; index++)
+        {
+            if (index > 0)
+            {
+                builder.Append(',');
+            }
+
+            builder.Append(System.Text.Json.JsonSerializer.Serialize(values[index]));
+        }
+
+        builder.Append(']');
+        return builder.ToString();
+    }
+
+    /// <summary>Объекты-владельцы модулей выгрузки: связь «объект → модуль» вида Contains.</summary>
+    public IReadOnlyDictionary<string, string> ModuleOwners(IReadOnlyCollection<string> modulePaths)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (modulePaths.Count == 0)
+        {
+            return result;
+        }
+
+        return _index.WithLock(() =>
+        {
+            foreach (var chunk in Chunk([.. modulePaths], 400))
+            {
+                using var command = _index.CreateCommand(
+                    $"""
+                     SELECT n.source_path, e.source_id
+                     FROM edges e
+                     JOIN nodes n ON n.id = e.target_id AND n.kind = 'Module'
+                     WHERE e.kind = 'Contains' AND n.source_path IN ({Placeholders(chunk.Count, "@p")})
+                     """);
+                AddTextParameters(command, chunk, "@p");
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    if (!reader.IsDBNull(0))
+                    {
+                        result[reader.GetString(0)] = reader.GetString(1);
+                    }
+                }
+            }
+
+            // Запасной путь: модуль, у которого связь не записана, опознаётся по каталогу объекта.
+            using var objects = _index.CreateCommand("SELECT id, source_path FROM metadata_objects WHERE source_path IS NOT NULL AND is_top_level = 1");
+            using var objectReader = objects.ExecuteReader();
+            var directories = new List<(string Directory, string Owner)>();
+            while (objectReader.Read())
+            {
+                var path = objectReader.GetString(1);
+                var separator = path.LastIndexOf('.');
+                if (separator > 0)
+                {
+                    directories.Add((path[..separator], objectReader.GetString(0)));
+                }
+            }
+
+            foreach (var module in modulePaths)
+            {
+                if (result.ContainsKey(module))
+                {
+                    continue;
+                }
+
+                var match = directories
+                    .OrderByDescending(static entry => entry.Directory.Length)
+                    .FirstOrDefault(entry => module.StartsWith(entry.Directory + "/", StringComparison.OrdinalIgnoreCase));
+                if (match.Owner is not null)
+                {
+                    result[module] = match.Owner;
+                }
+            }
+
+            return (IReadOnlyDictionary<string, string>)result;
+        });
+    }
+
+    /// <summary>Узел процедуры по пути модуля и имени: единый формат идентификатора в индексе.</summary>
+    private static string RoutineId(string modulePath, string name) => $"routine:module:{modulePath}#{name}";
+
+    /// <summary>Имя процедуры из идентификатора узла: часть после решётки.</summary>
+    private static string NameOfRoutineId(string routineId)
+    {
+        var separator = routineId.LastIndexOf('#');
+        return separator < 0 || separator == routineId.Length - 1 ? routineId : routineId[(separator + 1)..];
+    }
+
+    /// <summary>Путь модуля из идентификатора узла процедуры: часть между «routine:module:» и решёткой.</summary>
+    private static string ModuleOfRoutineId(string routineId)
+    {
+        const string prefix = "routine:module:";
+        if (!routineId.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return string.Empty;
+        }
+
+        var text = routineId[prefix.Length..];
+        var separator = text.LastIndexOf('#');
+        return separator < 0 ? text : text[..separator];
+    }
+
+    private static void ReadSymbols(SqliteCommand command, List<ConventionSymbol> result)
+    {
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var name = reader.GetString(1);
+            var module = reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
+            result.Add(new ConventionSymbol(
+                name,
+                RoutineId(module, name),
+                module,
+                reader.GetString(3),
+                reader.GetInt32(4) != 0,
+                reader.GetInt32(5),
+                reader.GetInt32(6),
+                reader.IsDBNull(7) ? null : reader.GetString(7),
+                reader.IsDBNull(8) ? null : reader.GetString(8),
+                reader.IsDBNull(9) || reader.GetString(9).Length == 0 ? null : reader.GetString(9)));
+        }
+    }
+
+    private static void Collect(SqliteCommand command, List<string> found, HashSet<string> seen)
+    {
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            if (seen.Add(reader.GetString(0)))
+            {
+                found.Add(reader.GetString(0));
+            }
+        }
+    }
+
+    private static void AddTextParameters(SqliteCommand command, List<string> values, string prefix)
+    {
+        for (var index = 0; index < values.Count; index++)
+        {
+            command.Parameters.AddWithValue(prefix + index.ToString(CultureInfo.InvariantCulture), values[index]);
+        }
+    }
+
+    private static void AddPrefixParameters(SqliteCommand command, List<string> values, string prefix)
+    {
+        for (var index = 0; index < values.Count; index++)
+        {
+            command.Parameters.AddWithValue(prefix + index.ToString(CultureInfo.InvariantCulture), EscapeLike(values[index]) + "%");
+        }
+    }
+
     private long Count(string table) => _index.QueryScalar("SELECT COUNT(*) FROM " + table);
 
     private long Scalar(string sql) => _index.QueryScalar(sql);
@@ -1484,5 +2256,83 @@ public sealed class IndexReader
             .ToList();
 
         return tokens.Count == 0 ? "\"\"" : string.Join(' ', tokens);
+    }
+
+    /// <summary>
+    /// Источник конвенций поверх индекса: связывает разбор приёмов из ядра с запросами к базе.
+    /// Живёт рядом с <see cref="IndexReader"/>, потому что использует его запросы один в один.
+    /// </summary>
+    private sealed class IndexConventionQuery : IConventionQuery
+    {
+        private readonly IndexReader _reader;
+        private readonly Dictionary<string, IReadOnlyList<ConventionRoutine>> _platformMatches = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, IReadOnlyList<ConventionEvidence>> _evidence = new(StringComparer.Ordinal);
+        private Dictionary<string, IReadOnlyList<string>>? _metadataKinds;
+        private IReadOnlyList<ConventionModuleUsage>? _ranking;
+
+        internal IndexConventionQuery(IndexReader reader) => _reader = reader;
+
+        /// <summary>
+        /// Рейтинг читается один раз на ответ: запрос агрегирует все связи вызова, и повтор
+        /// на каждой ступени разбора приёма заметно удлинял ответ.
+        /// </summary>
+        public IReadOnlyList<ConventionModuleUsage> RankRoutines(int limit)
+        {
+            _ranking ??= _reader.RankRoutines(1000);
+            return [.. _ranking.Take(limit)];
+        }
+
+        public IReadOnlyList<ConventionSymbol> SymbolsOf(IReadOnlyCollection<string> routineIds) =>
+            _reader.Decorate([.. routineIds], null).Select(static item => item.Symbol).OfType<ConventionSymbol>().ToList();
+
+        public IReadOnlyList<ConventionCallSite> CallerSites(string routineId, int limit) =>
+            _reader.CallerSites(routineId, limit);
+
+        public IReadOnlyList<ConventionRoutine> PlatformMatches(string platformMethod, int limit)
+        {
+            if (!_platformMatches.TryGetValue(platformMethod, out var found))
+            {
+                found = _reader.PlatformMatches(platformMethod, 400);
+                _platformMatches[platformMethod] = found;
+            }
+
+            return [.. found.Take(limit)];
+        }
+
+        /// <summary>
+        /// Обращения к метаданным читаются одним запросом и запоминаются: за ответ инструмента
+        /// один и тот же набор процедур запрашивается на каждой ступени разбора приёма.
+        /// </summary>
+        public IReadOnlyList<string> MetadataKindsOf(string routineId)
+        {
+            _metadataKinds ??= _reader.AllMetadataKinds();
+            return _metadataKinds.TryGetValue(routineId, out var kinds) ? kinds : [];
+        }
+
+        public IReadOnlyList<string> RoutinesByNamePrefix(IReadOnlyCollection<string> namePrefixes, int limit) =>
+            _reader.RoutinesByNamePrefix([.. namePrefixes], limit);
+
+        public IReadOnlyList<string> RoutinesByTerms(IReadOnlyCollection<string> terms, int limit) =>
+            _reader.RoutinesByTerms([.. terms], limit);
+
+        public IReadOnlyDictionary<string, string> ModuleOwners(IReadOnlyCollection<string> modulePaths) =>
+            _reader.ModuleOwners(modulePaths);
+
+        /// <summary>
+        /// Сведения о процедурах: наборы повторяются между ступенями разбора, поэтому ответ
+        /// запоминается по составу набора и методу платформы.
+        /// </summary>
+        public IReadOnlyList<ConventionEvidence> EvidenceOf(IReadOnlyCollection<string> routineIds, string? platformMethod)
+        {
+            var key = (platformMethod ?? string.Empty) + "|" + string.Join('\u0001', routineIds.OrderBy(static id => id, StringComparer.Ordinal));
+            if (_evidence.TryGetValue(key, out var found))
+            {
+                return found;
+            }
+
+            found = _reader.Decorate([.. routineIds], platformMethod);
+            _evidence[key] = found;
+            return found;
+        }
     }
 }
