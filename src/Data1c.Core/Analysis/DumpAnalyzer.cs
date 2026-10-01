@@ -28,13 +28,6 @@ public sealed record AnalysisOptions
     public int MaxDegreeOfParallelism { get; init; } = Environment.ProcessorCount;
 
     public IProgress<AnalysisProgress>? Progress { get; init; }
-
-    /// <summary>
-    /// Разбирать только эти файлы модулей (пути внутри выгрузки). Нужно для частичной
-    /// переиндексации: после правки одного модуля пересобирать весь граф не требуется.
-    /// Пустой набор — разбирать все модули.
-    /// </summary>
-    public IReadOnlyCollection<string>? OnlyModuleFiles { get; init; }
 }
 
 public sealed record AnalysisProgress(string Stage, int Processed, int Total);
@@ -115,15 +108,8 @@ public sealed class DumpAnalyzer
         var read = _metadataReader.Read(source, metadataOptions, cancellationToken);
         warnings.AddRange(read.Warnings);
 
-        var moduleFiles = read.ModuleFiles;
-        if (options.OnlyModuleFiles is { Count: > 0 } only)
-        {
-            var allowed = new HashSet<string>(only, StringComparer.OrdinalIgnoreCase);
-            moduleFiles = [.. moduleFiles.Where(file => allowed.Contains(file.File.RelativePath))];
-        }
-
         List<BslModuleInfo> modules = options.IncludeBsl
-            ? ParseModules(source, moduleFiles, options, warnings, cancellationToken)
+            ? ParseModules(source, read.ModuleFiles, options, warnings, cancellationToken)
             : [];
 
         var platform = CreatePlatformIndex(options, warnings);
@@ -135,7 +121,7 @@ public sealed class DumpAnalyzer
             read.Model.Configuration.Children.Count,
             read.ParsedFiles,
             read.FailedFiles,
-            moduleFiles.Count,
+            read.ModuleFiles.Count,
             read.ModuleFiles.Sum(static m => m.File.Size),
             modules.Count,
             modules.Sum(static m => m.Routines.Count),

@@ -7,6 +7,7 @@ using Data1c.Core.Bsl;
 using Data1c.Core.Dump;
 using Data1c.Core.Graph;
 using Data1c.Core.Metadata;
+using Data1c.Core.Platform;
 using Microsoft.Data.Sqlite;
 
 namespace Data1c.Store;
@@ -81,24 +82,20 @@ public sealed class IndexWriter
     }
 
     /// <summary>
-    /// Частичная переиндексация: строки изменённых модулей удаляются, затем записываются заново
-    /// из разбора только этих модулей. Остальной индекс не переписывается, поэтому правка одного
-    /// модуля стоит секунды, а не минуты.
+    /// Частичная переиндексация модулей: файлы разбираются напрямую, а метаданные из XML
+    /// не перечитываются — владелец и вид модуля берутся из самого индекса. Это убирает
+    /// основную стоимость обновления (чтение десятков тысяч файлов метаданных).
     /// </summary>
-    /// <remarks>
-    /// Частичный разбор не видит процедуры других модулей, поэтому после записи вызовы связываются
-    /// по имени с настоящими узлами процедур, а вызовы к только что появившимся процедурам
-    /// перенаправляются с внешних заглушек на них.
-    /// </remarks>
-    public IndexWriteResult WriteModules(
+    /// <param name="platform">Модель платформы: по ней разрешаются вызовы методов платформы.</param>
+    /// <returns>null, если среди модулей есть неизвестные индексу: тогда нужна полная сборка.</returns>
+    public IndexWriteResult? WriteModuleFiles(
         IDumpSource source,
-        AnalysisResult result,
-        IndexScope scope,
+        IReadOnlyList<string> modulePaths,
+        PlatformHelpIndex? platform = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(source);
-        ArgumentNullException.ThrowIfNull(result);
-        ArgumentNullException.ThrowIfNull(scope);
+        ArgumentNullException.ThrowIfNull(modulePaths);
         var stopwatch = Stopwatch.StartNew();
 
         return _index.WithLock(() =>
@@ -110,38 +107,45 @@ public sealed class IndexWriter
                 var connection = transaction.Connection!;
                 var counters = new Counters();
 
-                var scopePaths = new HashSet<string>(scope.ModuleFiles, StringComparer.OrdinalIgnoreCase);
-                var scopeNodes = result.Graph.Nodes
-                    .Where(node => node.SourcePath is not null && scopePaths.Contains(node.SourcePath))
-                    .ToList();
-                var scopeIds = new HashSet<string>(scopeNodes.Select(static node => node.Id), StringComparer.Ordinal);
-                var scopeEdges = result.Graph.Edges
-                    .Where(edge => scopeIds.Contains(edge.SourceId)
-                        || (edge.Kind == GraphEdgeKind.Contains && scopeIds.Contains(edge.TargetId)))
-                    .ToList();
+                var known = ReadModuleInfo(connection, modulePaths);
+                var parser = new BslModuleParser();
+                var modules = new List<BslModuleInfo>(modulePaths.Count);
+                foreach (var path in modulePaths)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!known.TryGetValue(path, out var info))
+                    {
+                        // Модуля в индексе нет: он появился вместе с новым объектом метаданных,
+                        // и разбирать его нужно полной сборкой.
+                        transaction.Rollback();
+                        return null;
+                    }
 
-                // Цели связей, которых нет среди узлов области: внешние заглушки вызовов и методы
-                // платформы. Их нужно добавить в индекс, иначе связь будет вести в никуда.
-                var referenced = new HashSet<string>(
-                    scopeEdges.Where(edge => !scopeIds.Contains(edge.TargetId)).Select(static edge => edge.TargetId),
-                    StringComparer.Ordinal);
-                var present = referenced.Count == 0
-                    ? []
-                    : ReadIds(connection, count => $"SELECT id FROM nodes WHERE id IN ({Placeholders(count)})", [.. referenced]);
-                var presentSet = new HashSet<string>(present, StringComparer.Ordinal);
-                var extraNodes = result.Graph.Nodes
-                    .Where(node => referenced.Contains(node.Id) && !presentSet.Contains(node.Id))
-                    .ToList();
+                    var file = ResolveFile(source, path, cancellationToken);
+                    if (file is null)
+                    {
+                        continue;
+                    }
 
-                var nodesToWrite = new List<GraphNode>(scopeNodes.Count + extraNodes.Count);
-                nodesToWrite.AddRange(scopeNodes);
-                nodesToWrite.AddRange(extraNodes);
+                    string text;
+                    using (var stream = source.OpenRead(file))
+                    using (var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
+                    {
+                        text = reader.ReadToEnd();
+                    }
 
-                // Процедуры, которых в индексе ещё не было: только для них нужно искать вызовы
-                // из других модулей, а это дорогой проход по внешним вызовам.
-                var routineNames = scopeNodes
-                    .Where(static node => node.Kind == GraphNodeKind.Routine)
-                    .Select(static node => node.Name.ToLowerInvariant())
+                    modules.Add(parser.Parse(new BslModuleSource(path, text, info.OwnerId, info.Kind)));
+                }
+
+                if (modules.Count == 0)
+                {
+                    transaction.Rollback();
+                    return new IndexWriteResult(0, 0, 0, 0, 0, 0, 0, 0, stopwatch.Elapsed);
+                }
+
+                var routineNames = modules
+                    .SelectMany(static module => module.Routines)
+                    .Select(static routine => routine.Name.ToLowerInvariant())
                     .Distinct(StringComparer.Ordinal)
                     .ToList();
                 var knownNames = routineNames.Count == 0
@@ -150,17 +154,26 @@ public sealed class IndexWriter
                         connection,
                         count => $"SELECT name_lower FROM nodes WHERE kind = 'Routine' AND name_lower IN ({Placeholders(count)})",
                         routineNames);
-                var known = new HashSet<string>(knownNames, StringComparer.Ordinal);
-                var addedRoutines = routineNames.Where(name => !known.Contains(name)).ToList();
+                var existingNames = new HashSet<string>(knownNames, StringComparer.Ordinal);
 
-                DeleteScope(connection, scope, scopePaths, new HashSet<string>(nodesToWrite.Select(static node => node.Id), StringComparer.Ordinal));
-                WriteNodes(nodesToWrite, connection, counters, cancellationToken);
-                WriteEdges(scopeEdges, connection, counters, cancellationToken);
-                WriteSymbols(source, result.Modules, connection, counters, cancellationToken);
-                TouchFiles(source, connection, scope, counters, cancellationToken);
-                RepairCalls(connection, scopeIds, addedRoutines, cancellationToken);
+                var rows = BuildModuleRows(connection, modules, platform, cancellationToken);
+                var scopePaths = new HashSet<string>(modules.Select(static module => module.Path), StringComparer.OrdinalIgnoreCase);
+
+                DeleteScope(connection, new IndexScope([.. scopePaths]), scopePaths, rows.ScopeIds);
+                WriteNodes(rows.Nodes, connection, counters, cancellationToken);
+                WriteEdges(rows.Edges, connection, counters, cancellationToken);
+                WriteSymbols(source, modules, connection, counters, cancellationToken);
+                TouchFiles(source, connection, new IndexScope([.. scopePaths]), counters, cancellationToken);
+
+                // Процедуры, которых раньше не было: вызовы из других модулей шли на внешние
+                // заглушки, теперь их можно связать с настоящими узлами.
+                var added = routineNames.Where(name => !existingNames.Contains(name)).ToList();
+                if (added.Count > 0)
+                {
+                    RepairIncomingCalls(connection, added, cancellationToken);
+                }
+
                 RecountCounters(connection);
-
                 _index.SetMeta("indexed_at", DateTimeOffset.UtcNow.ToString("O"));
                 transaction.Commit();
                 stopwatch.Stop();
@@ -182,6 +195,359 @@ public sealed class IndexWriter
             }
         });
     }
+
+    /// <summary>Владелец и вид модуля по данным индекса: XML для этого читать не нужно.</summary>
+    private static Dictionary<string, ModuleIndexInfo> ReadModuleInfo(SqliteConnection connection, IReadOnlyList<string> paths)
+    {
+        var result = new Dictionary<string, ModuleIndexInfo>(StringComparer.OrdinalIgnoreCase);
+        var ids = paths.Select(static path => "module:" + path).ToList();
+
+        foreach (var chunk in Chunk(ids, 400))
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                $"""
+                 SELECT n.source_path, n.metadata_kind, COALESCE(e.source_id, '')
+                 FROM nodes n
+                 LEFT JOIN edges e ON e.target_id = n.id AND e.kind = 'Contains'
+                 WHERE n.id IN ({Placeholders(chunk.Count)})
+                 """;
+            for (var index = 0; index < chunk.Count; index++)
+            {
+                command.Parameters.AddWithValue("@" + index.ToString(CultureInfo.InvariantCulture), chunk[index]);
+            }
+
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                var kind = reader.IsDBNull(1) || !Enum.TryParse<BslModuleKind>(reader.GetString(1), out var parsed)
+                    ? BslModuleKind.Unknown
+                    : parsed;
+                var owner = reader.IsDBNull(2) || reader.GetString(2).Length == 0 ? null : reader.GetString(2);
+                result[reader.GetString(0)] = new ModuleIndexInfo(owner, kind);
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Строит узлы и связи для разобранных модулей по тем же правилам, что и полная сборка:
+    /// модуль, его процедуры, объявления, вызовы и обращения к метаданным. Цели вызовов
+    /// разрешаются по индексу, поэтому частичный разбор не теряет связи между модулями.
+    /// </summary>
+    private static ModuleRows BuildModuleRows(
+        SqliteConnection connection,
+        IReadOnlyList<BslModuleInfo> modules,
+        PlatformHelpIndex? platform,
+        CancellationToken cancellationToken)
+    {
+        var nodes = new Dictionary<string, GraphNode>(StringComparer.Ordinal);
+        var scopeIds = new HashSet<string>(StringComparer.Ordinal);
+        var edges = new List<GraphEdge>();
+        var keys = new HashSet<(string Source, string Target, GraphEdgeKind Kind, int Line, string? Detail)>();
+
+        void AddNode(GraphNode node) => nodes.TryAdd(node.Id, node);
+
+        void AddEdge(string sourceId, string targetId, GraphEdgeKind kind, int? line = null, string? detail = null)
+        {
+            if (string.Equals(sourceId, targetId, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            if (!keys.Add((sourceId, targetId, kind, line ?? -1, detail)))
+            {
+                return;
+            }
+
+            edges.Add(new GraphEdge(sourceId, targetId, kind, line, detail));
+        }
+
+        var moduleByOwner = ReadModuleByOwner(connection);
+        var localRoutines = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
+
+        foreach (var module in modules)
+        {
+            var routines = new Dictionary<string, string>(StringComparer.Ordinal);
+            var moduleNodeId = module.Id;
+            scopeIds.Add(moduleNodeId);
+            AddNode(new GraphNode(
+                moduleNodeId,
+                GraphNodeKind.Module,
+                module.Path,
+                module.Path,
+                module.Kind.ToString(),
+                Tags: new Dictionary<string, string?>(StringComparer.Ordinal)
+                {
+                    ["owner"] = module.OwnerId,
+                    ["routines"] = module.Routines.Count.ToString(CultureInfo.InvariantCulture),
+                    ["lines"] = module.LineCount.ToString(CultureInfo.InvariantCulture),
+                }));
+
+            if (module.OwnerId is { Length: > 0 } ownerId)
+            {
+                moduleByOwner.TryAdd(ownerId, moduleNodeId);
+            }
+
+            foreach (var routine in module.Routines)
+            {
+                var routineId = $"routine:{moduleNodeId}#{routine.Name}";
+                routines[routine.Name] = routineId;
+                scopeIds.Add(routineId);
+                AddNode(new GraphNode(
+                    routineId,
+                    GraphNodeKind.Routine,
+                    routine.Name,
+                    module.Path,
+                    Tags: new Dictionary<string, string?>(StringComparer.Ordinal)
+                    {
+                        ["routineKind"] = routine.Kind.ToString(),
+                        ["export"] = routine.IsExport ? "true" : "false",
+                        ["lines"] = routine.LineCount.ToString(CultureInfo.InvariantCulture),
+                        ["startLine"] = routine.StartLine.ToString(CultureInfo.InvariantCulture),
+                        ["region"] = routine.Region,
+                        ["directives"] = routine.Directives.Count == 0 ? null : string.Join(';', routine.Directives),
+                    }));
+            }
+
+            localRoutines[moduleNodeId] = routines;
+        }
+
+        // Какие цели вообще существуют: проверяем одним набором запросов, а не по одной.
+        var candidates = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var module in modules)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // Владелец модуля: связь «объект метаданных → модуль» ставится только если владелец есть.
+            if (module.OwnerId is { Length: > 0 } owner)
+            {
+                candidates.Add(owner);
+            }
+
+            foreach (var call in EnumerateCalls(module))
+            {
+                if (call.IsLocal)
+                {
+                    candidates.Add($"routine:{module.Id}#{call.Method}");
+                    continue;
+                }
+
+                var qualifier = call.Qualifier!;
+                foreach (var ownerId in new[] { "CommonModule." + qualifier, qualifier })
+                {
+                    if (moduleByOwner.TryGetValue(ownerId, out var moduleId))
+                    {
+                        candidates.Add($"routine:{moduleId}#{call.Method}");
+                    }
+                }
+            }
+
+            foreach (var access in EnumerateAccesses(module))
+            {
+                if (!access.Kind.IsUnknown)
+                {
+                    candidates.Add(MdNaming.CreateId(access.Kind, access.ObjectName));
+                }
+            }
+        }
+
+        var existing = candidates.Count == 0
+            ? []
+            : ReadIds(connection, count => $"SELECT id FROM nodes WHERE id IN ({Placeholders(count)})", [.. candidates]);
+        var known = new HashSet<string>(existing, StringComparer.Ordinal);
+
+        string? ResolveCall(BslModuleInfo module, BslCall call)
+        {
+            if (call.IsLocal)
+            {
+                if (localRoutines[module.Id].TryGetValue(call.Method, out var local) || known.Contains($"routine:{module.Id}#{call.Method}"))
+                {
+                    return local ?? $"routine:{module.Id}#{call.Method}";
+                }
+
+                if (platform?.ContainsMember(call.Method) == true)
+                {
+                    return AddPlatform(module, call.Method);
+                }
+
+                return AddPlaceholder($"call:{module.OwnerId ?? module.Path}.{call.Method}", call.Method, GraphNodeKind.External);
+            }
+
+            var qualifier = call.Qualifier!;
+            foreach (var ownerId in new[] { "CommonModule." + qualifier, qualifier })
+            {
+                if (moduleByOwner.TryGetValue(ownerId, out var moduleId))
+                {
+                    var candidate = $"routine:{moduleId}#{call.Method}";
+                    if (known.Contains(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+
+            if (platform?.ContainsMember(call.Callee) == true)
+            {
+                return AddPlatform(module, call.Callee);
+            }
+
+            return AddPlaceholder($"call:{call.Callee}", call.Callee, GraphNodeKind.External);
+        }
+
+        string AddPlatform(BslModuleInfo module, string callee)
+        {
+            var id = "platform:" + callee;
+            if (known.Contains(id))
+            {
+                return id;
+            }
+
+            var topic = platform?.Find(callee);
+            AddNode(new GraphNode(
+                id,
+                GraphNodeKind.Platform,
+                callee,
+                Tags: topic is null
+                    ? null
+                    : new Dictionary<string, string?>(StringComparer.Ordinal)
+                    {
+                        ["platformVersion"] = topic.Version.ToString(),
+                        ["platformTopic"] = topic.Name,
+                        ["platformTitle"] = topic.Title,
+                    }));
+            return id;
+        }
+
+        string AddPlaceholder(string id, string name, GraphNodeKind kind)
+        {
+            if (!known.Contains(id))
+            {
+                AddNode(new GraphNode(id, kind, name, IsExternal: true));
+            }
+
+            return id;
+        }
+
+        foreach (var module in modules)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (module.OwnerId is { Length: > 0 } owner && known.Contains(owner))
+            {
+                AddEdge(owner, module.Id, GraphEdgeKind.Contains);
+            }
+
+            foreach (var routine in module.Routines)
+            {
+                var routineId = localRoutines[module.Id][routine.Name];
+                AddEdge(module.Id, routineId, GraphEdgeKind.Defines);
+                foreach (var call in routine.Calls)
+                {
+                    AddCalls(routineId, module, call);
+                }
+
+                foreach (var access in routine.MetadataAccesses)
+                {
+                    AddAccess(routineId, access);
+                }
+            }
+
+            foreach (var call in module.Calls)
+            {
+                AddCalls(module.Id, module, call);
+            }
+
+            foreach (var access in module.MetadataAccesses)
+            {
+                AddAccess(module.Id, access);
+            }
+        }
+
+        void AddCalls(string sourceId, BslModuleInfo module, BslCall call)
+        {
+            if (ResolveCall(module, call) is { } target)
+            {
+                AddEdge(sourceId, target, GraphEdgeKind.Calls, call.Line, call.Callee);
+            }
+        }
+
+        void AddAccess(string sourceId, BslMetadataAccess access)
+        {
+            if (access.Kind.IsUnknown)
+            {
+                return;
+            }
+
+            var targetId = MdNaming.CreateId(access.Kind, access.ObjectName);
+            if (!known.Contains(targetId))
+            {
+                // Объект есть в конфигурации, но при частичной переиндексации модель метаданных
+                // не читается: узел-заглушка нужен, чтобы связь не потерялась.
+                AddPlaceholder(targetId, access.ObjectName, GraphNodeKind.External);
+            }
+
+            AddEdge(sourceId, targetId, GraphEdgeKind.UsesMetadata, access.Line, access.Text);
+        }
+
+        // Пишутся только узлы области и отсутствующие цели: существующие узлы уже в индексе,
+        // а повторная запись добавила бы дубли в поисковый индекс.
+        var toWrite = new List<GraphNode>(nodes.Count);
+        foreach (var (id, node) in nodes)
+        {
+            if (scopeIds.Contains(id) || !known.Contains(id))
+            {
+                toWrite.Add(node);
+            }
+        }
+
+        return new ModuleRows(toWrite, edges, scopeIds);
+    }
+
+    private static IEnumerable<BslCall> EnumerateCalls(BslModuleInfo module) =>
+        module.Calls.Concat(module.Routines.SelectMany(static routine => routine.Calls));
+
+    private static IEnumerable<BslMetadataAccess> EnumerateAccesses(BslModuleInfo module) =>
+        module.MetadataAccesses.Concat(module.Routines.SelectMany(static routine => routine.MetadataAccesses));
+
+    /// <summary>Карта «объект метаданных → узел модуля»: нужна для вызовов вида «Модуль.Метод».</summary>
+    private static Dictionary<string, string> ReadModuleByOwner(SqliteConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT e.source_id, n.id FROM edges e JOIN nodes n ON n.id = e.target_id WHERE e.kind = 'Contains' AND n.kind = 'Module'";
+        using var reader = command.ExecuteReader();
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        while (reader.Read())
+        {
+            result.TryAdd(reader.GetString(0), reader.GetString(1));
+        }
+
+        return result;
+    }
+
+    /// <summary>Файл выгрузки по пути: источник может отдать его напрямую, иначе перечисляем.</summary>
+    private static DumpFile? ResolveFile(IDumpSource source, string path, CancellationToken cancellationToken)
+    {
+        if (source.FindFile(path) is { } file)
+        {
+            return file;
+        }
+
+        foreach (var candidate in source.EnumerateFiles(cancellationToken))
+        {
+            if (string.Equals(candidate.RelativePath, path, StringComparison.OrdinalIgnoreCase))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private sealed record ModuleIndexInfo(string? OwnerId, BslModuleKind Kind);
+
+    private sealed record ModuleRows(IReadOnlyList<GraphNode> Nodes, IReadOnlyList<GraphEdge> Edges, HashSet<string> ScopeIds);
 
     /// <summary>
     /// Убирает из индекса всё, что относится к указанным файлам. Входящие связи удаляются только
@@ -280,61 +646,34 @@ public sealed class IndexWriter
     }
 
     /// <summary>
-    /// Связывает вызовы изменённых модулей с настоящими узлами процедур: частичный разбор знает
-    /// только свои модули и на остальные цели ставит внешние заглушки. Затем заглушки на процедуры
-    /// из изменённых модулей заменяются настоящими узлами — этого ждут вызовы из других модулей.
+    /// Связывает вызовы из других модулей с процедурами, которых раньше не было: до этого
+    /// такие вызовы указывали на внешние заглушки по имени.
     /// </summary>
-    private static void RepairCalls(
+    private static void RepairIncomingCalls(
         SqliteConnection connection,
-        HashSet<string> scopeIds,
         IReadOnlyList<string> addedRoutineNames,
         CancellationToken cancellationToken)
     {
-        if (scopeIds.Count == 0)
+        if (addedRoutineNames.Count == 0)
         {
             return;
         }
 
-        // Имена сопоставляются в C#: встроенная функция lower() в SQLite знает только латиницу,
-        // поэтому на кириллице регистронезависимое сравнение в SQL молча не находит ничего.
-        var pending = new List<(long RowId, string Method, string Target)>();
+        cancellationToken.ThrowIfCancellationRequested();
+        var newRoutines = new HashSet<string>(addedRoutineNames, StringComparer.Ordinal);
+        var pending = new List<(long RowId, string Method)>();
 
-        using (var outgoing = connection.CreateCommand())
+        using (var incoming = connection.CreateCommand())
         {
-            outgoing.CommandText =
-                $"""
-                 SELECT rowid, detail, target_id FROM edges
-                 WHERE kind = 'Calls' AND detail IS NOT NULL
-                   AND source_id IN ({Placeholders(scopeIds.Count)})
-                 """;
-            var index = 0;
-            foreach (var id in scopeIds)
-            {
-                outgoing.Parameters.AddWithValue("@" + index++.ToString(CultureInfo.InvariantCulture), id);
-            }
-
-            using var reader = outgoing.ExecuteReader();
-            while (reader.Read())
-            {
-                pending.Add((reader.GetInt64(0), MethodOf(reader.GetString(1)), reader.GetString(2)));
-            }
-        }
-
-        // Вызовы из других модулей к процедурам, которых раньше не было: их цели — внешние заглушки.
-        if (addedRoutineNames.Count > 0)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var newRoutines = new HashSet<string>(addedRoutineNames, StringComparer.Ordinal);
-            using var incoming = connection.CreateCommand();
             incoming.CommandText =
-                "SELECT rowid, detail, target_id FROM edges WHERE kind = 'Calls' AND detail IS NOT NULL AND target_id LIKE 'call:%'";
+                "SELECT rowid, detail FROM edges WHERE kind = 'Calls' AND detail IS NOT NULL AND target_id LIKE 'call:%'";
             using var reader = incoming.ExecuteReader();
             while (reader.Read())
             {
                 var method = MethodOf(reader.GetString(1));
                 if (newRoutines.Contains(method.ToLowerInvariant()))
                 {
-                    pending.Add((reader.GetInt64(0), method, reader.GetString(2)));
+                    pending.Add((reader.GetInt64(0), method));
                 }
             }
         }
@@ -350,10 +689,9 @@ public sealed class IndexWriter
         var target = update.Parameters.Add("@target", SqliteType.Text);
         var row = update.Parameters.Add("@row", SqliteType.Integer);
         var repaired = 0;
-        foreach (var (rowId, method, current) in pending)
+        foreach (var (rowId, method) in pending)
         {
-            if (!targets.TryGetValue(method.ToLowerInvariant(), out var id)
-                || string.Equals(id, current, StringComparison.Ordinal))
+            if (!targets.TryGetValue(method.ToLowerInvariant(), out var id))
             {
                 continue;
             }

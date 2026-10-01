@@ -354,19 +354,15 @@ public sealed class AnalysisSession : IDisposable
         }
     }
 
-    /// <summary>
-    /// Настройки разбора. Частичная переиндексация использует те же самые, отличаясь только
-    /// списком модулей: иначе её результат разошёлся бы с полной сборкой.
-    /// </summary>
-    private AnalysisOptions CreateAnalysisOptions(IReadOnlyCollection<string>? onlyModules) => new()
+    /// <summary>Настройки полного разбора выгрузки.</summary>
+    private AnalysisOptions CreateAnalysisOptions() => new()
     {
         IncludeBsl = _request.IncludeBsl,
         MaxDegreeOfParallelism = _request.MaxDegreeOfParallelism > 0
             ? _request.MaxDegreeOfParallelism
             : Environment.ProcessorCount,
         PlatformSource = CreatePlatformSource(),
-        Progress = onlyModules is null ? new Progress<AnalysisProgress>(Report) : null,
-        OnlyModuleFiles = onlyModules,
+        Progress = new Progress<AnalysisProgress>(Report),
         Metadata = new MetadataReadOptions
         {
             Sections = _request.Sections,
@@ -420,10 +416,20 @@ public sealed class AnalysisSession : IDisposable
         }
 
         _state = $"частичная переиндексация: модулей {modules.Count}";
-        var analyzed = new DumpAnalyzer().Analyze(_source, CreateAnalysisOptions(modules));
+
+        // Метаданные из XML не перечитываются: владелец и вид модуля берутся из индекса,
+        // поэтому обновление стоит секунды, а не минуты.
+        IndexWriteResult? written;
         using (var index = SqliteIndex.Open(path))
         {
-            new IndexWriter(index).WriteModules(_source, analyzed, new IndexScope(modules));
+            written = new IndexWriter(index).WriteModuleFiles(_source, modules, Platform);
+        }
+
+        if (written is null)
+        {
+            // Среди модулей есть неизвестный индексу: он появился вместе с новым объектом
+            // метаданных, и разбирать его нужно полной сборкой.
+            return false;
         }
 
         lock (_gate)
@@ -444,7 +450,7 @@ public sealed class AnalysisSession : IDisposable
         try
         {
             _state = "разбор";
-            var result = new DumpAnalyzer().Analyze(source, CreateAnalysisOptions(null));
+            var result = new DumpAnalyzer().Analyze(source, CreateAnalysisOptions());
             _completedAt = DateTimeOffset.Now;
             _state = "готов";
             return result;
