@@ -57,6 +57,7 @@ public sealed class IndexWriter
                 _index.SetMeta("nodes", counters.Nodes.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 _index.SetMeta("edges", counters.Edges.ToString(System.Globalization.CultureInfo.InvariantCulture));
 
+                WriteCounters(connection, counters, cancellationToken);
                 transaction.Commit();
                 stopwatch.Stop();
 
@@ -76,6 +77,36 @@ public sealed class IndexWriter
                 _index.Execute("PRAGMA synchronous=NORMAL");
             }
         });
+    }
+
+    /// <summary>
+    /// Счётчики пишутся в meta при сборке: инструмент status иначе считает миллионы строк живьём,
+    /// а это полсекунды на каждый вызов.
+    /// </summary>
+    private static void WriteCounters(SqliteConnection connection, Counters counters, CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "INSERT OR REPLACE INTO meta (key, value) VALUES (@key, @value)";
+        var key = command.Parameters.Add("@key", SqliteType.Text);
+        var value = command.Parameters.Add("@value", SqliteType.Text);
+
+        foreach (var (name, count) in new (string Key, int Count)[]
+        {
+            ("cnt_nodes", counters.Nodes),
+            ("cnt_edges", counters.Edges),
+            ("cnt_symbols", counters.Symbols),
+            ("cnt_calls", counters.Calls),
+            ("cnt_metadata_objects", counters.MetadataObjects),
+            ("cnt_metadata_items", counters.MetadataItems),
+            ("cnt_metadata_refs", counters.MetadataRefs),
+            ("cnt_files", counters.Files),
+        })
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            key.Value = name;
+            value.Value = count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            command.ExecuteNonQuery();
+        }
     }
 
     private static void Clear(SqliteConnection connection)

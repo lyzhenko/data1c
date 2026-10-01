@@ -75,6 +75,13 @@ internal static class Program
             StartPlatformWarmup(session, stderr);
         }
 
+        // Наблюдение за выгрузкой: новая выгрузка подхватывается сама, без ручного шага.
+        if (options.WatchSeconds > 0 && options.UseIndex)
+        {
+            session.StartWatching(TimeSpan.FromSeconds(options.WatchSeconds));
+            stderr.WriteLine($"data1c-mcp: наблюдение за выгрузкой каждые {options.WatchSeconds} с");
+        }
+
         var server = new McpServer(new ToolCatalog(session), stdin, stdout, stderr);
         try
         {

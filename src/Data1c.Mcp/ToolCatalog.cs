@@ -941,6 +941,10 @@ public sealed class ToolCatalog
             indexMode = Session.IsIndexMode,
             indexReady = Session.IsIndexReady,
             indexPath = Session.IndexPath,
+            watching = Session.IsWatching,
+            rebuilding = Session.IsRebuilding,
+            dumpChange = DumpChangeView(),
+            lastCheckedAt = Session.LastCheckedAt,
             indexStatistics = Session.GetIndexStatistics() is { } index
                 ? new
                 {
@@ -974,6 +978,31 @@ public sealed class ToolCatalog
             error = Session.Failure?.Message,
             hint = Session.IsOpen ? null : "Выгрузка не открыта: вызовите open с путём к каталогу выгрузки 1С.",
         });
+    }
+
+    /// <summary>
+    /// Свежесть индекса: сравнение файлов выгрузки с индексом. Сравнение стоит обхода каталога,
+    /// поэтому результат переиспользуется минуту — чаще состояние выгрузки не меняется.
+    /// </summary>
+    private object? DumpChangeView()
+    {
+        var change = Session.DumpChange;
+        var stale = Session.LastCheckedAt is not { } checkedAt || DateTimeOffset.Now - checkedAt > TimeSpan.FromMinutes(1);
+        if (change is null || stale)
+        {
+            change = Session.CheckDumpChange() ?? change;
+        }
+
+        return change is null
+            ? null
+            : new
+            {
+                added = change.Added,
+                changed = change.Changed,
+                removed = change.Removed,
+                total = change.Total,
+                fresh = change.IsEmpty,
+            };
     }
 
     private Task<IGraphQuery> QueryAsync(CancellationToken cancellationToken) =>

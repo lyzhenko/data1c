@@ -157,18 +157,40 @@ public sealed class IndexReader
             : null;
 
         return new IndexStatistics(
-            Count("nodes"),
-            Count("edges"),
-            Count("symbols"),
-            Scalar("SELECT COUNT(*) FROM edges WHERE kind = 'Calls'"),
-            Count("metadata_objects"),
-            Count("metadata_items"),
-            Count("metadata_refs"),
-            Count("files"),
+            Counter("cnt_nodes", "nodes"),
+            Counter("cnt_edges", "edges"),
+            Counter("cnt_symbols", "symbols"),
+            Counter("cnt_calls", "SELECT COUNT(*) FROM edges WHERE kind = 'Calls'"),
+            Counter("cnt_metadata_objects", "metadata_objects"),
+            Counter("cnt_metadata_items", "metadata_items"),
+            Counter("cnt_metadata_refs", "metadata_refs"),
+            Counter("cnt_files", "files"),
             Scalar("SELECT COUNT(*) FROM nodes WHERE kind = 'Platform'"),
             Scalar("SELECT COUNT(*) FROM nodes WHERE is_external = 1"),
             dumpPath,
             indexedAt);
+    });
+
+    /// <summary>Счётчик из meta: считается при сборке индекса. Для старых индексов — подсчёт строк.</summary>
+    private long Counter(string key, string tableOrQuery) =>
+        long.TryParse(_index.GetMeta(key), CultureInfo.InvariantCulture, out var value)
+            ? value
+            : Scalar(tableOrQuery.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
+                ? tableOrQuery
+                : $"SELECT COUNT(*) FROM {tableOrQuery}");
+
+    /// <summary>Состояние файлов из индекса: сравнение с текущей выгрузкой показывает, что изменилось.</summary>
+    public IReadOnlyDictionary<string, (long Size, long Mtime)> ReadFileStates() => _index.WithLock(() =>
+    {
+        using var command = _index.CreateCommand("SELECT path, size, mtime FROM files");
+        using var reader = command.ExecuteReader();
+        var result = new Dictionary<string, (long, long)>(StringComparer.OrdinalIgnoreCase);
+        while (reader.Read())
+        {
+            result[reader.GetString(0)] = (reader.GetInt64(1), reader.GetInt64(2));
+        }
+
+        return (IReadOnlyDictionary<string, (long Size, long Mtime)>)result;
     });
 
     /// <summary>

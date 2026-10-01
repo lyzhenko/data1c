@@ -51,6 +51,9 @@ public sealed record ServerOptions
     /// <summary>Отвечать из индекса. Выключено — работает разбор в память на каждый запуск.</summary>
     public bool UseIndex { get; init; } = true;
 
+    /// <summary>Период наблюдения за выгрузкой в секундах; 0 — не наблюдать.</summary>
+    public int WatchSeconds { get; init; }
+
     public const string Usage = """
         Data1c.Mcp — MCP-сервер над библиотекой Data1c.Core (stdio, JSON-RPC 2.0).
 
@@ -65,6 +68,8 @@ public sealed record ServerOptions
           --index <путь>         путь к файлу индекса (по умолчанию <выгрузка>/.data1c/index.db);
                                  если индекса нет, сервер соберёт его один раз
           --no-index             не использовать индекс: разбирать выгрузку в память при каждом запуске
+          --watch <секунды>      следить за выгрузкой: при изменениях файлов индекс пересобирается сам
+                                 (по умолчанию выключено)
           --platform             подключить справку установленной платформы 1С (.hbk)
           --locale <код>         язык справочных файлов платформы (по умолчанию ru)
           --platform-root <путь> каталог установленных платформ (можно повторять)
@@ -94,6 +99,7 @@ public sealed record ServerOptions
         var lazy = false;
         string? indexPath = null;
         var useIndex = true;
+        var watchSeconds = 0;
 
         for (var index = 0; index < args.Length; index++)
         {
@@ -139,6 +145,20 @@ public sealed record ServerOptions
 
                 case "--no-index":
                     useIndex = false;
+                    break;
+
+                case "--watch":
+                    if (!TryValue(args, ref index, inline, name, out var watchValue, out var watchError))
+                    {
+                        return new ServerOptionsParse(null, false, watchError);
+                    }
+
+                    if (!int.TryParse(watchValue, out var seconds) || seconds <= 0 || seconds > 86_400)
+                    {
+                        return new ServerOptionsParse(null, false, "Ключ --watch ждёт число секунд от 1 до 86400.");
+                    }
+
+                    watchSeconds = seconds;
                     break;
 
                 case "--locale":
@@ -205,6 +225,7 @@ public sealed record ServerOptions
                 Lazy = lazy,
                 IndexPath = indexPath,
                 UseIndex = useIndex,
+                WatchSeconds = watchSeconds,
             },
             false,
             null);

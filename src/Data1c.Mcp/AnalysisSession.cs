@@ -66,6 +66,10 @@ public sealed class AnalysisSession : IDisposable
     private Task? _platformWarmup;
     private Exception? _platformError;
     private DateTimeOffset _platformStarted;
+    private Timer? _watchTimer;
+    private DumpChange? _lastChange;
+    private DateTimeOffset? _lastCheckedAt;
+    private volatile bool _rebuilding;
     private volatile string _state = "ожидание";
     private Exception? _failure;
     private DateTimeOffset? _completedAt;
@@ -271,6 +275,17 @@ public sealed class AnalysisSession : IDisposable
             return OpenIndex(path);
         }
 
+        // Идёт переиндексация: не запускаем вторую сборку, ждём готовый файл (не дольше минуты).
+        for (var attempt = 0; attempt < 300 && _rebuilding; attempt++)
+        {
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (!_forceRebuild && IsUsableIndex(path))
+        {
+            return OpenIndex(path);
+        }
+
         var result = await GetAsync(cancellationToken).ConfigureAwait(false);
         _state = "индексация";
         await Task.Run(() => BuildIndex(path, result), cancellationToken).ConfigureAwait(false);
@@ -293,33 +308,6 @@ public sealed class AnalysisSession : IDisposable
     }
 
     private static bool IsUsableIndex(string path) => File.Exists(path) && SqliteIndex.LooksLikeIndex(path);
-
-    private void BuildIndex(string path, AnalysisResult result)
-    {
-        var directory = Path.GetDirectoryName(path);
-        if (!string.IsNullOrEmpty(directory))
-        {
-            Directory.CreateDirectory(directory);
-        }
-
-        if (File.Exists(path) && !SqliteIndex.LooksLikeIndex(path))
-        {
-            // Схема индекса другой версии — пересобираем с нуля.
-            foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
-            {
-                var file = path + suffix;
-                if (File.Exists(file))
-                {
-                    File.Delete(file);
-                }
-            }
-        }
-
-        using var index = SqliteIndex.Open(path);
-        new IndexWriter(index).Write(_source!, result);
-        _indexPath = path;
-        _state = "индекс собран";
-    }
 
     private IGraphQuery OpenIndex(string path)
     {
@@ -419,9 +407,169 @@ public sealed class AnalysisSession : IDisposable
         _state = progress.Total > 0 ? $"{stage} {progress.Processed} из {progress.Total}" : stage;
     }
 
-    /// <summary>Освобождает соединение с индексом.</summary>
+    /// <summary>
+    /// Собирает индекс в стороне и подменяет готовым файлом: во время сборки (десятки секунд)
+    /// сервер продолжает отвечать из прежнего индекса, а не из наполовину записанного.
+    /// </summary>
+    private void BuildIndex(string path, AnalysisResult result)
+    {
+        var directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        var temporary = path + ".building";
+        DeleteIndexFiles(temporary);
+
+        using (var index = SqliteIndex.Open(temporary))
+        {
+            new IndexWriter(index).Write(_source!, result);
+        }
+
+        lock (_gate)
+        {
+            _index?.Dispose();
+            _index = null;
+            _indexGraph = null;
+        }
+
+        DeleteIndexFiles(path);
+        File.Move(temporary, path);
+        _indexPath = path;
+        _state = "индекс собран";
+    }
+
+    /// <summary>Удаляет файл индекса вместе с журналом: SQLite держит рядом -wal и -shm.</summary>
+    private static void DeleteIndexFiles(string path)
+    {
+        foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+        {
+            var file = path + suffix;
+            if (File.Exists(file))
+            {
+                File.Delete(file);
+            }
+        }
+    }
+
+    /// <summary>Изменения выгрузки относительно индекса: null — сравнить нельзя.</summary>
+    public DumpChange? DumpChange => _lastChange;
+
+    /// <summary>Когда состояние выгрузки сравнивалось с индексом в последний раз.</summary>
+    public DateTimeOffset? LastCheckedAt => _lastCheckedAt;
+
+    /// <summary>Идёт переиндексация выгрузки.</summary>
+    public bool IsRebuilding => _rebuilding;
+
+    /// <summary>Сервер наблюдает за выгрузкой и пересобирает индекс сам.</summary>
+    public bool IsWatching => _watchTimer is not null;
+
+    /// <summary>
+    /// Сравнивает состояние файлов выгрузки с индексом. Возвращает null, если сравнивать не с чем
+    /// (нет выгрузки, индекс не используется или ещё не собран).
+    /// </summary>
+    public DumpChange? CheckDumpChange(CancellationToken cancellationToken = default)
+    {
+        if (_source is null || !_request.UseIndex)
+        {
+            return null;
+        }
+
+        var reader = GetIndexReader();
+        if (reader is null)
+        {
+            return null;
+        }
+
+        var change = DumpState.Compare(reader, _source, cancellationToken);
+        _lastChange = change;
+        _lastCheckedAt = DateTimeOffset.Now;
+        return change;
+    }
+
+    /// <summary>
+    /// Наблюдение за выгрузкой: раз в <paramref name="interval"/> состояние файлов сравнивается
+    /// с индексом, и при изменениях индекс пересобирается в фоне. Так новая выгрузка подхватывается
+    /// без ручного шага.
+    /// </summary>
+    public void StartWatching(TimeSpan interval)
+    {
+        if (_source is null || !_request.UseIndex || _watchTimer is not null)
+        {
+            return;
+        }
+
+        _watchTimer = new Timer(_ => WatchTick(), null, TimeSpan.Zero, interval);
+    }
+
+    private void WatchTick()
+    {
+        if (_rebuilding)
+        {
+            return;
+        }
+
+        try
+        {
+            var change = CheckDumpChange();
+            if (change is null || change.IsEmpty)
+            {
+                return;
+            }
+
+            RebuildInBackground(change);
+        }
+        catch (Exception exception)
+        {
+            _failure = exception;
+        }
+    }
+
+    /// <summary>Пересборка индекса в фоне: разбор выгрузки заново и запись нового индекса.</summary>
+    private void RebuildInBackground(DumpChange change)
+    {
+        lock (_gate)
+        {
+            if (_rebuilding)
+            {
+                return;
+            }
+
+            _rebuilding = true;
+        }
+
+        _state = "переиндексация: " + change;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                var result = RunAnalysis();
+                var path = ResolveIndexPath();
+                if (path is not null)
+                {
+                    BuildIndex(path, result);
+                    OpenIndex(path);
+                    _lastChange = new DumpChange(0, 0, 0, change.Total);
+                }
+            }
+            catch (Exception exception)
+            {
+                _failure = exception;
+                _state = "ошибка переиндексации";
+            }
+            finally
+            {
+                _rebuilding = false;
+            }
+        });
+    }
+
+    /// <summary>Освобождает соединение с индексом и останавливает наблюдение за выгрузкой.</summary>
     public void Dispose()
     {
+        _watchTimer?.Dispose();
+        _watchTimer = null;
         _index?.Dispose();
         _index = null;
         _indexGraph = null;
