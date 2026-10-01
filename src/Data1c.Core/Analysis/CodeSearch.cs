@@ -251,8 +251,9 @@ public sealed class CodeSearchService
     private static string[] ReadLines(IDumpSource source, DumpFile file)
     {
         using var stream = source.OpenRead(file);
-        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-        return reader.ReadToEnd().Split('\n');
+
+        // Кодировка определяется по содержимому: UTF-8 или запасная CP1251.
+        return DumpTextReader.ReadLines(stream);
     }
 
     private static IReadOnlyList<string> BuildContext(string[] lines, int index, int contextLines)

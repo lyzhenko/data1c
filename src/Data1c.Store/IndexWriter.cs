@@ -129,9 +129,9 @@ public sealed class IndexWriter
 
                     string text;
                     using (var stream = source.OpenRead(file))
-                    using (var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
                     {
-                        text = reader.ReadToEnd();
+                        // Кодировка определяется по содержимому: UTF-8 или запасная CP1251.
+                        text = DumpTextReader.ReadAllText(stream);
                     }
 
                     modules.Add(parser.Parse(new BslModuleSource(path, text, info.OwnerId, info.Kind)));
@@ -1243,9 +1243,9 @@ public sealed class IndexWriter
         try
         {
             using var stream = source.OpenRead(new DumpFile(path, 0, default));
-            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-            var text = reader.ReadToEnd();
-            return text.Split('\n');
+
+            // Кодировка определяется по содержимому: UTF-8 или запасная CP1251.
+            return DumpTextReader.ReadLines(stream);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or KeyNotFoundException)
         {

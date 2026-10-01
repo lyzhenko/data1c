@@ -6,4 +6,16 @@
         <Description>Библиотека разбора выгрузки конфигурации 1С (XML + BSL) и построения графа зависимостей.</Description>
     </PropertyGroup>
 
+    <!--
+        Ссылка на System.Text.Encoding.CodePages не нужна: в .NET 10 сборка входит в общую
+        платформу, а явный PackageReference даёт NU1510 («пакет доступен автоматически»),
+        что при «предупреждения = ошибки» ломает сборку. Провайдер кодовых страниц
+        регистрируется в коде (Data1c.Core.Dump.DumpTextReader).
+    -->
+
+    <ItemGroup>
+        <!-- Тесты проверяют внутреннюю строгую проверку UTF-8 (DumpTextReader.IsValidUtf8). -->
+        <InternalsVisibleTo Include="Data1c.Tests" />
+    </ItemGroup>
+
 </Project>
