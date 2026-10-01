@@ -73,7 +73,8 @@ public sealed record RightsReadResult(RoleRights Rights, IReadOnlyList<string> W
 /// <summary>
 /// Сжатая запись прав для строки <c>metadata_refs</c>: «Read=true;Insert=false», а признак
 /// ограничения доступа к данным — метка <see cref="RlsMark"/> в конце. Сам текст условия RLS
-/// в индекс не попадает: он бывает длинным и читается из файла роли по требованию.
+/// метку не заменяет: он пишется в отдельную колонку <c>metadata_refs.condition</c> (схема v9),
+/// поэтому признак ограничения по <c>detail</c> виден и там, где текста нет.
 /// </summary>
 public static class RightsDetail
 {
@@ -89,6 +90,41 @@ public static class RightsDetail
         var text = string.Join(';', rights.Select(static right => $"{right.Name}={(right.Value ? "true" : "false")}"));
         return hasRestriction ? text.Length == 0 ? RlsMark : text + ";" + RlsMark : text;
     }
+
+    /// <summary>
+    /// Разбирает <c>detail</c> строки прав обратно в записи: «Read=true;Insert=false;RLS» →
+    /// «Read» = true, «Insert» = false. Метка <see cref="RlsMark"/> без «=» пропускается: признак
+    /// ограничения инструмент читает из <c>detail</c>, а текст условия — из <c>metadata_refs.condition</c>.
+    /// </summary>
+    /// <param name="detail">Сжатая запись прав из строки индекса.</param>
+    public static IReadOnlyList<RoleRightEntry> Parse(string detail)
+    {
+        var entries = new List<RoleRightEntry>();
+        if (string.IsNullOrWhiteSpace(detail))
+        {
+            return entries;
+        }
+
+        foreach (var part in detail.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var separator = part.IndexOf('=');
+            if (separator <= 0)
+            {
+                continue;
+            }
+
+            var name = part[..separator].Trim();
+            if (name.Length == 0)
+            {
+                continue;
+            }
+
+            var value = part[(separator + 1)..].Trim();
+            entries.Add(new RoleRightEntry(name, string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)));
+        }
+
+        return entries;
+    }
 }
 
 /// <summary>
@@ -102,9 +138,10 @@ public static class RightsDetail
 /// без загрузки документа в память: в реальной выгрузке права занимают до 337 КБ и содержат тысячи объектов,
 /// а всего таких файлов больше тысячи.
 /// <para>
-/// Текст условия RLS не попадает в сводку прав (он бывает длинным): при <c>includeConditions = false</c>
-/// отмечается только признак <see cref="RoleRightsObject.HasRestriction"/>, а сам текст читается из того же
-/// файла по требованию — когда инструмент спрашивает про ограничение конкретной роли.
+/// При <c>includeConditions = false</c> отмечается только признак <see cref="RoleRightsObject.HasRestriction"/>;
+/// так собираются сводки, которым текст не нужен. С <c>includeConditions = true</c> текст попадает в
+/// <see cref="RoleRightsObject.Condition"/>: так его пишут в индекс (схема v9) и читают из файла роли
+/// как запасной путь, когда в индексе условия нет.
 /// </para>
 /// </remarks>
 public sealed class RightsDumpReader

@@ -227,7 +227,7 @@ public sealed class RightsToolTests
             Assert.True(metadata["found"]!.GetValue<bool>());
             Assert.Equal(2, metadata["rolesWithRights"]!.GetValue<int>());
 
-            // Условие RLS прочитано из файла роли: в индексе лежит только признак.
+            // Условие RLS взято из индекса (metadata_refs.condition).
             var manager = metadata["roles"]!.AsArray()[0]!;
             Assert.Equal("Role.Менеджер", Text(manager["role"]));
             Assert.Contains("Организация", Text(manager["condition"]));
@@ -240,6 +240,158 @@ public sealed class RightsToolTests
             }
 
             foreach (var file in Directory.EnumerateFiles(Path.GetDirectoryName(indexPath)!, Path.GetFileName(indexPath) + "*"))
+            {
+                File.Delete(file);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Условие_берётся_из_индекса_а_без_индекса_из_файла_роли()
+    {
+        using var dump = new IndexDump();
+
+        // Файл роли после сборки индекса переписан: условие в индексе и в файле теперь разное.
+        File.WriteAllText(
+            Path.Combine(dump.Root, RlsConditionDump.RightsPath.Replace('/', Path.DirectorySeparatorChar)),
+            RlsConditionDump.ManagerRightsXml
+                .Replace(RlsConditionDump.GoodsCondition, "ГДЕ Контрагент = &Контрагент", StringComparison.Ordinal)
+                .Replace("Организация", "Контрагент", StringComparison.Ordinal));
+
+        using var session = new AnalysisSession(
+            new AnalysisRequest { UseIndex = true, IndexPath = dump.IndexPath },
+            dump.Source);
+        await session.QueryAsync(CancellationToken.None);
+        Assert.True(session.IsIndexReady);
+
+        var catalog = new ToolCatalog(session);
+        var byObject = await CallAsync(catalog, new JsonObject { ["metadata"] = "Catalog.Товары" });
+        var stored = Text(byObject["metadata"]!["roles"]!.AsArray()[0]!["condition"]);
+        Assert.Contains("Организация", stored);
+        Assert.DoesNotContain("Контрагент", stored);
+
+        // Ответ о роли берёт условия из индекса, а длинный текст обрезается до предела ответа.
+        var byRole = await CallAsync(catalog, new JsonObject { ["role"] = "Менеджер" });
+        var objects = byRole["role"]!["objects"]!.AsArray();
+        var goods = Assert.Single(objects, static item => Text(item!["object"]) == "Catalog.Товары");
+        Assert.Contains("Организация", Text(goods!["condition"]));
+
+        var warehouses = Assert.Single(objects, static item => Text(item!["object"]) == "Catalog.Склады");
+        var longCondition = Text(warehouses!["condition"]);
+        Assert.Contains("Организация", longCondition);
+        Assert.Contains("условие обрезано", longCondition);
+
+        // Без индекса тот же вопрос читает условие из файла роли — и видит уже новый текст.
+        using var withoutIndex = new AnalysisSession(
+            new AnalysisRequest { UseIndex = false },
+            new FileSystemDumpSource(dump.Root));
+        var fallback = await CallAsync(
+            new ToolCatalog(withoutIndex),
+            new JsonObject { ["metadata"] = "Catalog.Товары" });
+        var fromFile = Text(fallback["metadata"]!["roles"]!.AsArray()[0]!["condition"]);
+        Assert.Contains("Контрагент", fromFile);
+    }
+
+    [Fact]
+    public async Task Поиск_по_тексту_условия_находит_роли_и_объекты()
+    {
+        using var dump = new IndexDump();
+        using var session = new AnalysisSession(
+            new AnalysisRequest { UseIndex = true, IndexPath = dump.IndexPath },
+            dump.Source);
+        await session.QueryAsync(CancellationToken.None);
+        Assert.True(session.IsIndexReady);
+
+        var catalog = new ToolCatalog(session);
+        var response = await CallAsync(catalog, new JsonObject { ["conditionContains"] = "организация" });
+        var conditions = response["conditions"]!;
+
+        Assert.Equal("организация", Text(conditions["contains"]));
+        Assert.Equal("index", Text(conditions["source"]));
+        Assert.Equal(2, conditions["matchesTotal"]!.GetValue<int>());
+        Assert.Equal(1, conditions["rolesTotal"]!.GetValue<int>());
+        Assert.Equal(2, conditions["objectsTotal"]!.GetValue<int>());
+        Assert.Equal(2, conditions["shown"]!.GetValue<int>());
+
+        var matches = conditions["matches"]!.AsArray();
+        var goods = Assert.Single(matches, static item => Text(item!["object"]) == "Catalog.Товары");
+        Assert.Equal("Role.Менеджер", Text(goods!["role"]));
+        Assert.Equal("Менеджер", Text(goods!["name"]));
+        Assert.Equal("Catalog", Text(goods!["kind"]));
+        Assert.True(goods!["rls"]!.GetValue<bool>());
+        Assert.True(goods!["rights"]!["Read"]!.GetValue<bool>());
+        Assert.False(goods!["rights"]!["Delete"]!.GetValue<bool>());
+        Assert.Contains(RlsConditionDump.GoodsCondition, Text(goods!["condition"]));
+
+        // Второе условие роли длинное: в ответе оно обрезано, а счётчик всё равно полный.
+        var warehouses = Assert.Single(matches, static item => Text(item!["object"]) == "Catalog.Склады");
+        Assert.Contains("условие обрезано", Text(warehouses!["condition"]));
+
+        // Лимит обрезает строки, но не счётчики.
+        var page = await CallAsync(catalog, new JsonObject { ["conditionContains"] = "Организация", ["limit"] = 1 });
+        Assert.Equal(1, page["conditions"]!["shown"]!.GetValue<int>());
+        Assert.Equal(2, page["conditions"]!["matchesTotal"]!.GetValue<int>());
+        Assert.Single(page["conditions"]!["matches"]!.AsArray());
+
+        // Условие другой роли находит другую пару «роль — объект».
+        var observer = await CallAsync(catalog, new JsonObject { ["conditionContains"] = "ТекущийПользователь" });
+        Assert.Equal(1, observer["conditions"]!["matchesTotal"]!.GetValue<int>());
+        var order = Assert.Single(observer["conditions"]!["matches"]!.AsArray());
+        Assert.Equal("Role.Наблюдатель", Text(order!["role"]));
+        Assert.Equal("Document.Заказ", Text(order!["object"]));
+
+        // Ничего не найдено — нулевые счётчики и объяснение.
+        var empty = await CallAsync(catalog, new JsonObject { ["conditionContains"] = "НетТакогоУсловия" });
+        Assert.Equal(0, empty["conditions"]!["matchesTotal"]!.GetValue<int>());
+        Assert.Empty(empty["conditions"]!["matches"]!.AsArray());
+        Assert.Contains("НетТакогоУсловия", Text(empty["conditions"]!["note"]));
+    }
+
+    [Fact]
+    public async Task Поиск_по_тексту_условия_работает_без_индекса()
+    {
+        using var session = new AnalysisSession(new AnalysisRequest { UseIndex = false }, RlsConditionDump.Create());
+        var catalog = new ToolCatalog(session);
+
+        var response = await CallAsync(catalog, new JsonObject { ["conditionContains"] = "организация" });
+        var conditions = response["conditions"]!;
+
+        Assert.Equal("files", Text(conditions["source"]));
+        Assert.Equal(2, conditions["matchesTotal"]!.GetValue<int>());
+        Assert.Equal(1, conditions["rolesTotal"]!.GetValue<int>());
+        Assert.Equal(2, conditions["objectsTotal"]!.GetValue<int>());
+        Assert.Contains(
+            conditions["matches"]!.AsArray(),
+            static item => Text(item!["object"]) == "Catalog.Склады");
+    }
+
+    /// <summary>Выгрузка с условиями RLS, выложенная на диск, и собранный по ней индекс.</summary>
+    private sealed class IndexDump : IDisposable
+    {
+        public IndexDump()
+        {
+            Root = Path.Combine(Path.GetTempPath(), "data1c-rls-dump-" + Guid.NewGuid().ToString("N"));
+            IndexPath = Path.Combine(Path.GetTempPath(), "data1c-rls-index-" + Guid.NewGuid().ToString("N") + ".db");
+            Materialize(RlsConditionDump.Create(), Root);
+            Source = new FileSystemDumpSource(Root);
+            using var index = SqliteIndex.Open(IndexPath);
+            new IndexWriter(index) { IncludeComments = false }.Write(Source, new DumpAnalyzer().Analyze(Source));
+        }
+
+        public string Root { get; }
+
+        public string IndexPath { get; }
+
+        public FileSystemDumpSource Source { get; }
+
+        public void Dispose()
+        {
+            if (Directory.Exists(Root))
+            {
+                Directory.Delete(Root, recursive: true);
+            }
+
+            foreach (var file in Directory.EnumerateFiles(Path.GetDirectoryName(IndexPath)!, Path.GetFileName(IndexPath) + "*"))
             {
                 File.Delete(file);
             }

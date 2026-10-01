@@ -1574,45 +1574,69 @@ public sealed class ToolCatalog
         "rights",
         "Права ролей конфигурации 1С: какие роли и какие права имеют на объект метаданных и что может конкретная роль. "
         + "Источник — файлы Roles/<Имя>/Ext/Rights.xml: аргумент metadata отвечает «роль × права» на объект, "
-        + "включая ограничение доступа к данным (RLS) с текстом условия из файла роли, аргумент role — "
-        + "что может роль: её объекты с правами. В выгрузке видны только сами роли: назначение ролей пользователям "
+        + "включая ограничение доступа к данным (RLS) с текстом условия, аргумент role — "
+        + "что может роль: её объекты с правами. Текст условия RLS хранится в индексе (metadata_refs.condition) "
+        + "и читается из файла роли только как запасной путь; аргумент conditionContains ищет по тексту условия — "
+        + "например имя реквизита или константы — и возвращает роли и объекты с полными счётчиками. "
+        + "В выгрузке видны только сами роли: назначение ролей пользователям "
         + "(какие пользователи входят в роль) в файлы конфигурации не входит. "
-        + "Примеры: rights metadata=\"Catalog.Товары\"; rights role=\"Менеджер\".",
+        + "Примеры: rights metadata=\"Catalog.Товары\"; rights role=\"Менеджер\"; rights conditionContains=\"Организация\".",
         [
             new ToolParameter("metadata", "string", "Идентификатор объекта метаданных: Catalog.Товары, Document.Заказ, Configuration."),
             new ToolParameter("role", "string", "Роль: Менеджер, Role.Менеджер или Roles/Менеджер/Ext/Rights.xml."),
-            new ToolParameter("limit", "integer", "Сколько строк показать — ролей или объектов (1–500, по умолчанию 50); счётчики всегда полные."),
+            new ToolParameter(
+                "conditionContains",
+                "string",
+                "Подстрока текста условия RLS: найти роли и объекты, в условии которых она встречается "
+                + "(регистр не важен; пустая подстрока совпадений не даёт). Найденный текст показывается "
+                + "до 1000 символов, полный виден в ответе об объекте или роли."),
+            new ToolParameter("limit", "integer", "Сколько строк показать — ролей, объектов или найденных условий (1–500, по умолчанию 50); счётчики всегда полные."),
         ],
         (arguments, token) => RightsToolAsync(arguments, token));
 
-    /// <summary>Предел длины условия RLS в ответе: полный текст всегда лежит в файле роли.</summary>
+    /// <summary>Предел длины условия RLS в ответе: полный текст лежит в индексе и в файле роли.</summary>
     private const int RightsConditionLimit = 4000;
 
     /// <summary>
-    /// Права ролей: ответ об объекте, о роли или о том и другом сразу, если заданы оба аргумента.
+    /// Предел длины условия в строке поиска по тексту: таких строк в ответе до пятисот, и полный
+    /// текст каждой превратил бы ответ в мегабайты. Полное условие видно в ответе об объекте или роли.
+    /// </summary>
+    private const int RightsMatchConditionLimit = 1000;
+
+    /// <summary>
+    /// Права ролей: ответ об объекте, о роли, о найденных по тексту условия строках — или сразу
+    /// о нескольких, если задано несколько аргументов.
     /// </summary>
     private async Task<string> RightsToolAsync(ToolArguments arguments, CancellationToken cancellationToken)
     {
         var metadata = arguments.GetString("metadata");
         var role = arguments.GetString("role");
-        if (metadata is null && role is null)
+        var conditionContains = arguments.GetString("conditionContains");
+        if (metadata is null && role is null && conditionContains is null)
         {
             throw new ToolException(
-                "Укажите metadata (объект метаданных) или role (роль): например rights metadata=\"Catalog.Товары\" "
-                + "или rights role=\"Менеджер\".");
+                "Укажите metadata (объект метаданных), role (роль) или conditionContains (подстрока условия RLS): "
+                + "например rights metadata=\"Catalog.Товары\", rights role=\"Менеджер\" "
+                + "или rights conditionContains=\"Организация\".");
         }
 
         var limit = arguments.GetInt("limit", 50, 1, 500);
         var catalog = await RightsCatalogAsync(cancellationToken).ConfigureAwait(false);
+        var reader = Session.GetIndexReader();
         var response = new JsonObject();
         if (metadata is not null)
         {
-            response["metadata"] = ObjectRightsView(catalog, metadata, limit);
+            response["metadata"] = ObjectRightsView(catalog, reader, metadata, limit);
         }
 
         if (role is not null)
         {
-            response["role"] = RoleRightsView(catalog, role, limit);
+            response["role"] = RoleRightsView(catalog, reader, role, limit);
+        }
+
+        if (conditionContains is not null)
+        {
+            response["conditions"] = ConditionSearchView(catalog, reader, conditionContains, limit);
         }
 
         if (catalog.Warnings.Count > 0)
@@ -1627,12 +1651,12 @@ public sealed class ToolCatalog
             response["warningsCount"] = catalog.Warnings.Count;
         }
 
-        response["note"] = RightsNote(catalog);
+        response["note"] = RightsNote(catalog, reader is not null);
         return Render.JsonOf(response);
     }
 
     /// <summary>Что за права есть на объект: роли × права, признаки RLS и тексты условий.</summary>
-    private JsonObject ObjectRightsView(RoleRightsCatalog catalog, string metadata, int limit)
+    private JsonObject ObjectRightsView(RoleRightsCatalog catalog, IndexReader? reader, string metadata, int limit)
     {
         var objectId = RightsTargetResolver.TryResolve(metadata, out var resolved, out var kind)
             ? resolved
@@ -1644,6 +1668,8 @@ public sealed class ToolCatalog
             .ToList();
         var found = SessionObjectExists(objectId);
 
+        // Условия RLS берутся из индекса (схема v9): файл роли читается только там, где условия в индексе нет.
+        var conditions = reader?.RightsConditionsOnObject(objectId);
         var view = new JsonObject
         {
             ["object"] = objectId,
@@ -1677,8 +1703,7 @@ public sealed class ToolCatalog
 
             if (row.HasRestriction)
             {
-                // Текст условия читается из файла роли: в сводке прав его нет.
-                item["condition"] = ConditionText(catalog.Condition(row.RoleName, objectId));
+                item["condition"] = ConditionText(StoredCondition(conditions, row.RoleId) ?? catalog.Condition(row.RoleName, objectId));
             }
 
             roles.Add(item);
@@ -1694,14 +1719,15 @@ public sealed class ToolCatalog
     }
 
     /// <summary>Что может роль: признаки роли, объекты с правами и условия RLS показанных объектов.</summary>
-    private JsonObject RoleRightsView(RoleRightsCatalog catalog, string role, int limit)
+    private JsonObject RoleRightsView(RoleRightsCatalog catalog, IndexReader? reader, string role, int limit)
     {
-        if (!catalog.TryGetRole(role, out var summary))
+        if (!catalog.TryGetRole(role, out var detailed))
         {
             throw new ToolException(MissingRoleText(catalog, role));
         }
 
-        var detailed = catalog.RoleWithConditions(summary.Role) ?? summary;
+        // Условия RLS роли берутся из индекса (схема v9), а файл роли — запасной путь.
+        var conditions = reader?.RightsConditionsOfRole(detailed.RoleId);
         var objects = detailed.Objects
             .OrderByDescending(static obj => obj.GrantedCount)
             .ThenBy(static obj => obj.Name, StringComparer.Ordinal)
@@ -1739,7 +1765,8 @@ public sealed class ToolCatalog
 
             if (obj.HasRestriction)
             {
-                item["condition"] = ConditionText(obj.Condition);
+                item["condition"] = ConditionText(
+                    StoredCondition(conditions, obj.ObjectId) ?? catalog.Condition(detailed.Role, obj.ObjectId));
             }
 
             items.Add(item);
@@ -1748,6 +1775,155 @@ public sealed class ToolCatalog
         view["objects"] = items;
         return view;
     }
+
+    /// <summary>
+    /// Поиск по тексту условий RLS: роли и объекты, у которых условие содержит подстроку
+    /// (например имя реквизита или константы). Счётчики полные, строки обрезаются лимитом.
+    /// </summary>
+    /// <remarks>
+    /// При готовом индексе поиск идёт по строкам прав <c>metadata_refs</c>; без индекса (или когда
+    /// права в индекс не писались) — по разобранным с условиями файлам ролей. Регистр не учитывается:
+    /// SQLite сам кириллицу не сворачивает, поэтому подстрока сравнивается в памяти.
+    /// </remarks>
+    private JsonObject ConditionSearchView(RoleRightsCatalog catalog, IndexReader? reader, string substring, int limit)
+    {
+        var needle = substring.Trim();
+        if (needle.Length == 0)
+        {
+            throw new ToolException("Аргумент «conditionContains» должен быть непустой подстрокой текста условия RLS.");
+        }
+
+        var conditionsInIndex = reader?.CountRightsConditions() ?? 0;
+        return conditionsInIndex > 0 && reader is not null
+            ? ConditionSearchInIndex(reader, catalog, needle, limit)
+            : ConditionSearchInFiles(catalog, needle, limit);
+    }
+
+    /// <summary>Поиск по строкам прав индекса: условия уже лежат в <c>metadata_refs.condition</c>.</summary>
+    private static JsonObject ConditionSearchInIndex(IndexReader reader, RoleRightsCatalog catalog, string needle, int limit)
+    {
+        var search = reader.FindRightsByCondition(needle, limit);
+        var matches = new JsonArray();
+        foreach (var row in search.Rows)
+        {
+            matches.Add(ConditionMatch(
+                row.SourceId,
+                row.TargetId,
+                RightsTargetResolver.TryResolve(row.TargetId, out _, out var kind) ? kind : MdKind.Unknown,
+                RightsDetail.Parse(row.Detail ?? string.Empty),
+                row.Condition));
+        }
+
+        var view = new JsonObject
+        {
+            ["contains"] = needle,
+            ["source"] = "index",
+            ["matchesTotal"] = search.Matches,
+            ["rolesTotal"] = search.Roles,
+            ["objectsTotal"] = search.Objects,
+            ["shown"] = matches.Count,
+            ["matches"] = matches,
+        };
+
+        if (search.Matches == 0)
+        {
+            view["note"] = $"Ни одна роль не ограничивает доступ условием, содержащим «{needle}»: "
+                + $"в индексе {catalog.RoleCount} ролей, прав с условием — {reader.CountRightsConditions()}.";
+        }
+
+        return view;
+    }
+
+    /// <summary>Поиск без индекса: файлы ролей читаются с условиями, найденное кэшируется сводкой.</summary>
+    private static JsonObject ConditionSearchInFiles(RoleRightsCatalog catalog, string needle, int limit)
+    {
+        var found = new List<(RoleRights Role, RoleRightsObject Object, string Condition)>();
+        foreach (var roleName in catalog.RoleNames)
+        {
+            if (catalog.RoleWithConditions(roleName) is not { } role)
+            {
+                continue;
+            }
+
+            foreach (var obj in role.Objects)
+            {
+                if (obj.HasRestriction
+                    && obj.Condition is { Length: > 0 } text
+                    && text.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                {
+                    found.Add((role, obj, text));
+                }
+            }
+        }
+
+        var matches = new JsonArray();
+        foreach (var (role, obj, condition) in found.Take(limit))
+        {
+            matches.Add(ConditionMatch(role.RoleId, obj.ObjectId, obj.Kind, obj.Rights, condition, obj.Name));
+        }
+
+        var view = new JsonObject
+        {
+            ["contains"] = needle,
+            ["source"] = "files",
+            ["matchesTotal"] = found.Count,
+            ["rolesTotal"] = found.Select(static item => item.Role.Role).Distinct(StringComparer.Ordinal).Count(),
+            ["objectsTotal"] = found
+                .Select(static item => item.Object.IsResolved ? item.Object.ObjectId : item.Object.Name)
+                .Distinct(StringComparer.Ordinal)
+                .Count(),
+            ["shown"] = matches.Count,
+            ["matches"] = matches,
+        };
+
+        if (found.Count == 0)
+        {
+            view["note"] = $"Ни одна из {catalog.RoleCount} ролей выгрузки не ограничивает доступ условием, содержащим «{needle}».";
+        }
+
+        return view;
+    }
+
+    /// <summary>Одна найденная пара «роль — объект» с текстом условия.</summary>
+    /// <param name="roleId">Идентификатор роли: «Role.Менеджер».</param>
+    /// <param name="objectId">Идентификатор объекта; пусто, если имя из файла прав не разрешилось.</param>
+    /// <param name="kind">Вид объекта метаданных.</param>
+    /// <param name="rights">Права роли на объект.</param>
+    /// <param name="condition">Текст условия RLS, в котором нашлась подстрока.</param>
+    /// <param name="unresolvedName">Имя объекта из файла прав, если идентификатор не разрешился.</param>
+    private static JsonObject ConditionMatch(
+        string roleId,
+        string objectId,
+        MdKind kind,
+        IReadOnlyList<RoleRightEntry> rights,
+        string? condition,
+        string? unresolvedName = null)
+    {
+        var item = new JsonObject
+        {
+            ["role"] = roleId,
+            ["name"] = RoleRightsCatalog.NormalizeRoleName(roleId),
+            ["object"] = objectId.Length > 0 ? objectId : unresolvedName ?? string.Empty,
+            ["kind"] = kind.IsUnknown ? null : JsonValue.Create(kind.Name),
+            ["granted"] = rights.Count(static right => right.Value),
+            ["denied"] = rights.Count(static right => !right.Value),
+            ["rights"] = RightsJson(rights),
+            ["rls"] = true,
+        };
+
+        if (condition is not null)
+        {
+            item["condition"] = ConditionText(condition, RightsMatchConditionLimit);
+        }
+
+        return item;
+    }
+
+    /// <summary>Условие RLS, сохранённое в индексе: null — в индексе его нет и нужен файл роли.</summary>
+    private static string? StoredCondition(IReadOnlyDictionary<string, string>? conditions, string key) =>
+        conditions is not null && conditions.TryGetValue(key, out var text) && !string.IsNullOrWhiteSpace(text)
+            ? text
+            : null;
 
     /// <summary>
     /// Сводка прав ролей собирается один раз на сессию: файлы прав читаются с диска, а после
@@ -1793,18 +1969,18 @@ public sealed class ToolCatalog
         return result;
     }
 
-    /// <summary>Условие RLS для ответа: длинный текст обрезается, полный лежит в файле роли.</summary>
-    private static string? ConditionText(string? condition)
+    /// <summary>Условие RLS для ответа: длинный текст обрезается, в индексе и файле роли он лежит целиком.</summary>
+    private static string? ConditionText(string? condition, int limit = RightsConditionLimit)
     {
         if (string.IsNullOrEmpty(condition))
         {
             return null;
         }
 
-        return condition.Length <= RightsConditionLimit
+        return condition.Length <= limit
             ? condition
-            : condition[..RightsConditionLimit]
-                + $"\n… условие обрезано до {RightsConditionLimit} символов: полный текст лежит в файле роли.";
+            : condition[..limit]
+                + $"\n… условие обрезано до {limit} символов: полный текст лежит в индексе или в файле роли.";
     }
 
     /// <summary>
@@ -1849,12 +2025,15 @@ public sealed class ToolCatalog
     }
 
     /// <summary>Оговорка о том, чего в выгрузке конфигурации нет: назначения ролей пользователям.</summary>
-    private static string RightsNote(RoleRightsCatalog catalog)
+    private static string RightsNote(RoleRightsCatalog catalog, bool indexReady)
     {
         var note = "Права собраны из файлов Roles/<Имя>/Ext/Rights.xml: видны только сами роли и их права. "
             + "Назначение ролей пользователям (какие пользователи входят в роль) в выгрузку конфигурации не входит — "
             + "это данные информационной базы, а не файлов конфигурации. RLS — ограничение доступа к данным "
-            + "на уровне записей: в ответе приведён текст условия, прочитанный из файла роли.";
+            + "на уровне записей: в ответе приведён текст условия ограничения, "
+            + (indexReady
+                ? "взятого из индекса (metadata_refs.condition); файл роли читается только там, где условия в индексе нет."
+                : "прочитанного из файла роли (индекс не готов).");
         if (catalog.RoleCount == 0)
         {
             note += " Файлов прав ролей в выгрузке не найдено.";
@@ -2273,6 +2452,7 @@ public sealed class ToolCatalog
                     metadataRefsCode = index.MetadataRefsCode,
                     metadataRefsQuery = index.MetadataRefsQuery,
                     metadataRefsByContext = index.MetadataRefsByContext,
+                    rightsConditions = index.RightsConditions,
                     forms = index.Forms,
                     platformNodes = index.PlatformNodes,
                     externalNodes = index.ExternalNodes,

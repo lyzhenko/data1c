@@ -182,7 +182,8 @@ public sealed class IndexReader
             Counter("cnt_forms", "form_models"),
             refsByContext.GetValueOrDefault(MetadataRefContexts.Code),
             refsByContext.GetValueOrDefault(MetadataRefContexts.Query),
-            refsByContext);
+            refsByContext,
+            Counter("cnt_rights_conditions", "SELECT COUNT(*) FROM metadata_refs WHERE context = 'right' AND condition IS NOT NULL"));
     });
 
     /// <summary>
@@ -449,8 +450,8 @@ public sealed class IndexReader
     {
         using var command = _index.CreateCommand(
             context is null
-                ? "SELECT source_id, target_id, context, line, detail FROM metadata_refs WHERE target_id = @id ORDER BY context, source_id LIMIT @limit"
-                : "SELECT source_id, target_id, context, line, detail FROM metadata_refs WHERE target_id = @id AND context = @context ORDER BY source_id LIMIT @limit");
+                ? "SELECT source_id, target_id, context, line, detail, condition FROM metadata_refs WHERE target_id = @id ORDER BY context, source_id LIMIT @limit"
+                : "SELECT source_id, target_id, context, line, detail, condition FROM metadata_refs WHERE target_id = @id AND context = @context ORDER BY source_id LIMIT @limit");
         command.Parameters.AddWithValue("@id", targetId);
         command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 1000));
         if (context is not null)
@@ -462,12 +463,7 @@ public sealed class IndexReader
         var result = new List<MetadataRefRow>();
         while (reader.Read())
         {
-            result.Add(new MetadataRefRow(
-                reader.GetString(0),
-                reader.GetString(1),
-                reader.GetString(2),
-                reader.IsDBNull(3) ? null : reader.GetInt32(3),
-                reader.IsDBNull(4) ? null : reader.GetString(4)));
+            result.Add(RefRow(reader));
         }
 
         return result;
@@ -517,23 +513,134 @@ public sealed class IndexReader
     public IReadOnlyList<MetadataRefRow> ReferencesOf(string sourceId, int limit = 200) => _index.WithLock(() =>
     {
         using var command = _index.CreateCommand(
-            "SELECT source_id, target_id, context, line, detail FROM metadata_refs WHERE source_id = @id ORDER BY target_id LIMIT @limit");
+            "SELECT source_id, target_id, context, line, detail, condition FROM metadata_refs WHERE source_id = @id ORDER BY target_id LIMIT @limit");
         command.Parameters.AddWithValue("@id", sourceId);
         command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 1000));
         using var reader = command.ExecuteReader();
         var result = new List<MetadataRefRow>();
         while (reader.Read())
         {
-            result.Add(new MetadataRefRow(
-                reader.GetString(0),
-                reader.GetString(1),
-                reader.GetString(2),
-                reader.IsDBNull(3) ? null : reader.GetInt32(3),
-                reader.IsDBNull(4) ? null : reader.GetString(4)));
+            result.Add(RefRow(reader));
         }
 
         return result;
     });
+
+    /// <summary>
+    /// Сколько строк прав несут текст условия RLS (схема v9): счётчик берётся из <c>meta</c>,
+    /// а на индексе без него — подсчётом строк. Нужно, чтобы отличить «условий с такой подстрокой нет»
+    /// от «права в индекс не писались».
+    /// </summary>
+    public long CountRightsConditions() => _index.WithLock(
+        () => Counter("cnt_rights_conditions", "SELECT COUNT(*) FROM metadata_refs WHERE context = 'right' AND condition IS NOT NULL"));
+
+    /// <summary>
+    /// Условия RLS роли по объектам: только строки прав, у которых текст условия сохранён в индексе.
+    /// Нужно инструменту <c>rights</c>: при готовом индексе условие берётся отсюда, без чтения файла роли.
+    /// </summary>
+    /// <param name="roleId">Идентификатор роли: «Role.Менеджер».</param>
+    public IReadOnlyDictionary<string, string> RightsConditionsOfRole(string roleId) => _index.WithLock(() =>
+    {
+        using var command = _index.CreateCommand(
+            "SELECT target_id, condition FROM metadata_refs "
+            + "WHERE source_id = @id AND context = @context AND condition IS NOT NULL");
+        command.Parameters.AddWithValue("@id", roleId);
+        command.Parameters.AddWithValue("@context", MetadataRefContexts.Right);
+        using var reader = command.ExecuteReader();
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        while (reader.Read())
+        {
+            result[reader.GetString(0)] = reader.GetString(1);
+        }
+
+        return (IReadOnlyDictionary<string, string>)result;
+    });
+
+    /// <summary>
+    /// Условия RLS ролей на объект: ключ — идентификатор роли, значение — текст условия.
+    /// Строки без сохранённого условия в словарь не попадают: их инструмент добирает из файла роли.
+    /// </summary>
+    /// <param name="objectId">Идентификатор объекта метаданных: «Catalog.Товары».</param>
+    public IReadOnlyDictionary<string, string> RightsConditionsOnObject(string objectId) => _index.WithLock(() =>
+    {
+        using var command = _index.CreateCommand(
+            "SELECT source_id, condition FROM metadata_refs "
+            + "WHERE target_id = @id AND context = @context AND condition IS NOT NULL");
+        command.Parameters.AddWithValue("@id", objectId);
+        command.Parameters.AddWithValue("@context", MetadataRefContexts.Right);
+        using var reader = command.ExecuteReader();
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        while (reader.Read())
+        {
+            result[reader.GetString(0)] = reader.GetString(1);
+        }
+
+        return (IReadOnlyDictionary<string, string>)result;
+    });
+
+    /// <summary>
+    /// Ищет строки прав, текст условия которых содержит подстроку: например имя реквизита или
+    /// константы. Счётчики считаются по всем совпадениям, а строки обрезаются лимитом.
+    /// </summary>
+    /// <param name="substring">Искомая подстрока; пустая строка совпадений не даёт.</param>
+    /// <param name="limit">Сколько строк показать (1–500).</param>
+    /// <remarks>
+    /// Подстрока ищется в памяти, а не в SQL: SQLite без ICU не сворачивает регистр кириллицы
+    /// (<c>lower()</c> и <c>LIKE</c> работают только с латиницей), а условие обычно набирают
+    /// в другом регистре, чем в файле роли. Просматриваются только строки прав с условием —
+    /// их тысячи, а не миллионы, поэтому полный просмотр дешевле отдельной колонки с приведённым текстом.
+    /// </remarks>
+    public RightsConditionSearch FindRightsByCondition(string substring, int limit = 50)
+    {
+        ArgumentNullException.ThrowIfNull(substring);
+        var needle = substring.Trim();
+        if (needle.Length == 0)
+        {
+            return new RightsConditionSearch(0, 0, 0, []);
+        }
+
+        var page = Math.Clamp(limit, 1, 500);
+
+        return _index.WithLock(() =>
+        {
+            using var command = _index.CreateCommand(
+                "SELECT source_id, target_id, context, line, detail, condition FROM metadata_refs "
+                + "WHERE context = @context AND condition IS NOT NULL ORDER BY source_id, target_id");
+            command.Parameters.AddWithValue("@context", MetadataRefContexts.Right);
+            using var reader = command.ExecuteReader();
+            var matches = 0;
+            var rows = new List<MetadataRefRow>();
+            var roles = new HashSet<string>(StringComparer.Ordinal);
+            var objects = new HashSet<string>(StringComparer.Ordinal);
+            while (reader.Read())
+            {
+                var condition = reader.GetString(5);
+                if (!condition.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                matches++;
+                roles.Add(reader.GetString(0));
+                objects.Add(reader.GetString(1));
+                if (rows.Count < page)
+                {
+                    rows.Add(RefRow(reader));
+                }
+            }
+
+            return new RightsConditionSearch(matches, roles.Count, objects.Count, rows);
+        });
+    }
+
+    /// <summary>Строка <c>metadata_refs</c> из читателя: колонки идут в порядке выборки.</summary>
+    private static MetadataRefRow RefRow(SqliteDataReader reader) => new(
+        reader.GetString(0),
+        reader.GetString(1),
+        reader.GetString(2),
+        reader.IsDBNull(3) ? null : reader.GetInt32(3),
+        reader.IsDBNull(4) ? null : reader.GetString(4),
+        reader.IsDBNull(5) ? null : reader.GetString(5));
 
     /// <summary>
     /// «Умный» поиск символа: точное имя, затем префикс, затем смысловые термы (BM25), и только

@@ -114,12 +114,35 @@ internal static class FormItemKinds
 }
 
 /// <summary>Обращение к объекту метаданных: из кода, из текста запроса, тип реквизита, право роли.</summary>
+/// <param name="SourceId">Кто обращается: узел кода, объект метаданных или роль.</param>
+/// <param name="TargetId">К чему обращаются: идентификатор объекта метаданных.</param>
+/// <param name="Context">Контекст обращения: «code», «query», «right» и прочие.</param>
+/// <param name="Line">Строка в файле модуля, если обращение из кода.</param>
+/// <param name="Detail">Уточнение: у прав роли — сжатый перечень прав и метка «RLS».</param>
+/// <param name="Condition">
+/// Текст условия ограничения доступа к данным (RLS) у строки прав роли; null — условия нет
+/// или строка не является правами. Схема v9 хранит условие в <c>metadata_refs.condition</c>.
+/// </param>
 public sealed record MetadataRefRow(
     string SourceId,
     string TargetId,
     string Context,
     int? Line = null,
-    string? Detail = null);
+    string? Detail = null,
+    string? Condition = null);
+
+/// <summary>
+/// Результат поиска строк прав по тексту условия RLS: полное число совпадений и показанная страница.
+/// </summary>
+/// <param name="Matches">Сколько всего пар «роль — объект» с подходящим условием.</param>
+/// <param name="Roles">Сколько разных ролей среди найденных пар.</param>
+/// <param name="Objects">Сколько разных объектов среди найденных пар.</param>
+/// <param name="Rows">Показанные строки в порядке роли и объекта.</param>
+public sealed record RightsConditionSearch(
+    int Matches,
+    int Roles,
+    int Objects,
+    IReadOnlyList<MetadataRefRow> Rows);
 
 /// <summary>Результат обхода связей в базе.</summary>
 public sealed record ReachRow(string Id, int Depth);
@@ -128,6 +151,7 @@ public sealed record ReachRow(string Id, int Depth);
 /// <param name="MetadataRefsCode">Сколько обращений к метаданным собрано из кода BSL.</param>
 /// <param name="MetadataRefsQuery">Сколько обращений собрано из текстов запросов.</param>
 /// <param name="MetadataRefsByContext">Все обращения по контекстам: код, запросы, типы, состав, формы и прочее.</param>
+/// <param name="RightsConditions">Сколько строк прав несут текст условия RLS (схема v9).</param>
 public sealed record IndexStatistics(
     long Nodes,
     long Edges,
@@ -144,7 +168,8 @@ public sealed record IndexStatistics(
     long Forms = 0,
     long MetadataRefsCode = 0,
     long MetadataRefsQuery = 0,
-    IReadOnlyDictionary<string, int>? MetadataRefsByContext = null)
+    IReadOnlyDictionary<string, int>? MetadataRefsByContext = null,
+    long RightsConditions = 0)
 {
     public override string ToString() =>
         $"узлов {Nodes:N0}, связей {Edges:N0}, символов {Symbols:N0}, вызовов {Calls:N0}, " +
