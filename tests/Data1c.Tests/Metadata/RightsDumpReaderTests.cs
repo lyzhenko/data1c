@@ -190,6 +190,24 @@ public sealed class RightsDumpReaderTests
         Assert.Equal(RightsSampleDump.Condition, goods.Condition);
     }
 
+    [Fact]
+    public void Сжатая_запись_прав_разбирается_обратно_в_значения()
+    {
+        var rights = new[] { new RoleRightEntry("Read", true), new RoleRightEntry("Insert", false) };
+        var detail = RightsDetail.Format(rights, hasRestriction: true);
+        Assert.Equal("Read=true;Insert=false;RLS", detail);
+
+        var parsed = RightsDetail.Parse(detail);
+        Assert.Equal(new[] { "Read", "Insert" }, parsed.Select(static right => right.Name));
+        Assert.True(parsed[0].Value);
+        Assert.False(parsed[1].Value);
+
+        // Без ограничения метки в detail нет, а пустая запись разбирается в пустой список.
+        Assert.Equal("Read=true", RightsDetail.Format([new RoleRightEntry("Read", true)], hasRestriction: false));
+        Assert.Empty(RightsDetail.Parse("RLS"));
+        Assert.Empty(RightsDetail.Parse(string.Empty));
+    }
+
     private static RightsReadResult Read(string xml, string path, bool includeConditions = false)
     {
         using var stream = new MemoryStream(Encoding.UTF8.GetBytes(xml));

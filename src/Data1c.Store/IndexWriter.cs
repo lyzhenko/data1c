@@ -832,6 +832,7 @@ public sealed class IndexWriter
                 ('cnt_metadata_objects', (SELECT COUNT(*) FROM metadata_objects)),
                 ('cnt_metadata_items', (SELECT COUNT(*) FROM metadata_items)),
                 ('cnt_metadata_refs', (SELECT COUNT(*) FROM metadata_refs)),
+                ('cnt_rights_conditions', (SELECT COUNT(*) FROM metadata_refs WHERE context = 'right' AND condition IS NOT NULL)),
                 ('cnt_forms', (SELECT COUNT(*) FROM form_models)),
                 ('cnt_files', (SELECT COUNT(*) FROM files)),
                 ('nodes', (SELECT COUNT(*) FROM nodes)),
@@ -908,6 +909,7 @@ public sealed class IndexWriter
             ("cnt_metadata_objects", counters.MetadataObjects),
             ("cnt_metadata_items", counters.MetadataItems),
             ("cnt_metadata_refs", counters.MetadataRefs),
+            ("cnt_rights_conditions", counters.RightsConditions),
             ("cnt_forms", counters.Forms),
             ("cnt_files", counters.Files),
         })
@@ -1267,12 +1269,14 @@ public sealed class IndexWriter
 
     /// <summary>
     /// Пишет права ролей в <c>metadata_refs</c>: по строке на пару «роль — объект» с контекстом
-    /// <see cref="MetadataRefContexts.Right"/>, источником — роль, целью — объект, а в <c>detail</c> —
-    /// сжатый перечень прав («Read=true;Insert=false») и метка «RLS».
+    /// <see cref="MetadataRefContexts.Right"/>, источником — роль, целью — объект, в <c>detail</c> —
+    /// сжатый перечень прав («Read=true;Insert=false») и метка «RLS», а в <c>condition</c> — текст
+    /// условия ограничения доступа к данным (NULL, если ограничения нет).
     /// </summary>
     /// <remarks>
-    /// Текст условия RLS в индекс не попадает: условия бывают длинными, а нужны они только когда
-    /// инструмент спрашивает про ограничение конкретной роли, — тогда они читаются из файла роли.
+    /// Текст условия пишется целиком: в выгрузке встречаются условия в тысячи символов, а SQLite
+    /// длину <c>TEXT</c> не ограничивает. Раньше условие в индекс не попадало, и инструмент читал
+    /// его из файла роли при каждом запросе — теперь файл нужен только как запасной путь.
     /// Файлы прав разбираются параллельно и потоково, а вставка идёт одной подготовленной командой.
     /// </remarks>
     private static void WriteRights(
@@ -1296,7 +1300,9 @@ public sealed class IndexWriter
         }
 
         var reader = new RightsDumpReader();
-        var rows = new ConcurrentBag<(string RoleId, string TargetId, string Detail)>();
+
+        // Условия читаются вместе с правами: строка индекса собирается за один проход по файлу роли.
+        var rows = new ConcurrentBag<(string RoleId, string TargetId, string Detail, string? Condition)>();
         Parallel.ForEach(
             paths,
             new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount, CancellationToken = cancellationToken },
@@ -1305,7 +1311,7 @@ public sealed class IndexWriter
                 try
                 {
                     using var stream = source.OpenRead(new DumpFile(path, 0, DateTimeOffset.UnixEpoch));
-                    var result = reader.Read(stream, path, includeConditions: false);
+                    var result = reader.Read(stream, path, includeConditions: true);
                     foreach (var obj in result.Rights.Objects)
                     {
                         if (!obj.IsResolved)
@@ -1316,7 +1322,7 @@ public sealed class IndexWriter
                         var detail = RightsDetail.Format(obj.Rights, obj.HasRestriction);
                         if (detail.Length > 0)
                         {
-                            rows.Add((result.Rights.RoleId, obj.ObjectId, detail));
+                            rows.Add((result.Rights.RoleId, obj.ObjectId, detail, obj.Condition));
                         }
                     }
                 }
@@ -1328,12 +1334,13 @@ public sealed class IndexWriter
 
         using var command = connection.CreateCommand();
         command.CommandText =
-            "INSERT INTO metadata_refs (source_id, target_id, context, line, detail) "
-            + "VALUES (@source, @target, @context, NULL, @detail)";
+            "INSERT INTO metadata_refs (source_id, target_id, context, line, detail, condition) "
+            + "VALUES (@source, @target, @context, NULL, @detail, @condition)";
         var sourceParam = command.Parameters.Add("@source", SqliteType.Text);
         var targetParam = command.Parameters.Add("@target", SqliteType.Text);
         var contextParam = command.Parameters.Add("@context", SqliteType.Text);
         var detailParam = command.Parameters.Add("@detail", SqliteType.Text);
+        var conditionParam = command.Parameters.Add("@condition", SqliteType.Text);
         contextParam.Value = MetadataRefContexts.Right;
 
         foreach (var row in rows)
@@ -1342,8 +1349,14 @@ public sealed class IndexWriter
             sourceParam.Value = row.RoleId;
             targetParam.Value = row.TargetId;
             detailParam.Value = row.Detail;
+            var condition = string.IsNullOrWhiteSpace(row.Condition) ? null : row.Condition;
+            conditionParam.Value = (object?)condition ?? DBNull.Value;
             command.ExecuteNonQuery();
             counters.MetadataRefs++;
+            if (condition is not null)
+            {
+                counters.RightsConditions++;
+            }
         }
     }
 
@@ -1656,6 +1669,7 @@ public sealed class IndexWriter
         internal int MetadataObjects;
         internal int MetadataItems;
         internal int MetadataRefs;
+        internal int RightsConditions;
         internal int Forms;
         internal int Files;
     }
