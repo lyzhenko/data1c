@@ -40,6 +40,13 @@ Console.WriteLine($"файлов {files.Count.ToString("N0", CultureInfo.Invaria
     $"объём {files.Sum(static file => file.Size) / 1024.0 / 1024.0 / 1024.0:F2} ГБ");
 Console.WriteLine();
 
+if (!build && !File.Exists(indexPath))
+{
+    Console.WriteLine($"индекса нет: {indexPath}");
+    Console.WriteLine("запустите с ключом --build, чтобы собрать его (на выгрузке 2,9 ГБ это около двух минут)");
+    return 2;
+}
+
 if (build)
 {
     if (File.Exists(indexPath))

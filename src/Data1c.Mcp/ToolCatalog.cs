@@ -1002,17 +1002,13 @@ public sealed class ToolCatalog
     }
 
     /// <summary>
-    /// Свежесть индекса: сравнение файлов выгрузки с индексом. Сравнение стоит обхода каталога,
-    /// поэтому результат переиспользуется минуту — чаще состояние выгрузки не меняется.
+    /// Свежесть индекса. Проверка идёт в фоне: она обходит десятки тысяч файлов выгрузки,
+    /// и инструмент status не должен её ждать. В режиме наблюдения состояние держит наблюдатель.
     /// </summary>
     private object? DumpChangeView()
     {
+        Session.StartDumpCheck();
         var change = Session.DumpChange;
-        var stale = Session.LastCheckedAt is not { } checkedAt || DateTimeOffset.Now - checkedAt > TimeSpan.FromMinutes(1);
-        if (change is null || stale)
-        {
-            change = Session.CheckDumpChange() ?? change;
-        }
 
         return change is null
             ? null

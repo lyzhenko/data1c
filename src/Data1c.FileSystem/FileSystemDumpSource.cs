@@ -36,10 +36,16 @@ public sealed class FileSystemDumpSource : IDumpSource
         // stat на каждый из десятков тысяч файлов выгрузки стоил несколько секунд на ровном месте.
         var files = new FileSystemEnumerable<DumpFile>(
             root,
-            (ref FileSystemEntry entry) => new DumpFile(
-                Path.GetRelativePath(root, entry.ToFullPath()).Replace('\\', '/'),
-                entry.Length,
-                entry.LastWriteTimeUtc),
+            (ref FileSystemEntry entry) =>
+            {
+                // Путь собирается отсечением корня: GetRelativePath на 65 тысячах файлов
+                // занимает секунды, а здесь нужен только хвост полного пути.
+                var full = entry.ToFullPath();
+                var relative = full.Length > root.Length && full.StartsWith(root, StringComparison.OrdinalIgnoreCase)
+                    ? full[(root.Length + 1)..]
+                    : Path.GetRelativePath(root, full);
+                return new DumpFile(relative.Replace('\\', '/'), entry.Length, entry.LastWriteTimeUtc);
+            },
             Enumeration)
         {
             ShouldIncludePredicate = static (ref FileSystemEntry entry) => !entry.IsDirectory,

@@ -79,6 +79,7 @@ public sealed class AnalysisSession : IDisposable
     private DumpChange? _lastChange;
     private DateTimeOffset? _lastCheckedAt;
     private volatile bool _rebuilding;
+    private Task? _dumpCheck;
     private volatile string _state = "ожидание";
     private Exception? _failure;
     private DateTimeOffset? _completedAt;
@@ -563,6 +564,44 @@ public sealed class AnalysisSession : IDisposable
     }
 
     /// <summary>
+    /// Запускает проверку свежести индекса в фоне, если её давно не делали. Обход каталога
+    /// выгрузки стоит секунды (десятки тысяч файлов), поэтому инструмент не должен его ждать.
+    /// В режиме наблюдения проверку делает сам наблюдатель.
+    /// </summary>
+    public void StartDumpCheck()
+    {
+        if (_source is null || !_request.UseIndex || IsWatching)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_dumpCheck is { IsCompleted: false })
+            {
+                return;
+            }
+
+            if (_lastCheckedAt is { } checkedAt && DateTimeOffset.Now - checkedAt < TimeSpan.FromMinutes(1))
+            {
+                return;
+            }
+
+            _dumpCheck = Task.Run(() =>
+            {
+                try
+                {
+                    CheckDumpChange();
+                }
+                catch (Exception exception)
+                {
+                    _failure = exception;
+                }
+            });
+        }
+    }
+
+    /// <summary>
     /// Наблюдение за выгрузкой: раз в <paramref name="interval"/> состояние файлов сравнивается
     /// с индексом, и при изменениях индекс пересобирается в фоне. Так новая выгрузка подхватывается
     /// без ручного шага.
@@ -655,7 +694,6 @@ public sealed class AnalysisSession : IDisposable
         _index = null;
         _indexGraph = null;
     }
-
     /// <summary>Справка платформы запрошена ключом <c>--platform</c>.</summary>
     public bool PlatformRequested => _request.PlatformHelp;
 
