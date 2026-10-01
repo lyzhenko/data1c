@@ -73,6 +73,7 @@ public static class GraphJsonWriter
             }
 
             WriteOptional(writer, "detail", edge.Detail);
+            WriteOptional(writer, "context", edge.Context);
             writer.WriteEndObject();
         }
 

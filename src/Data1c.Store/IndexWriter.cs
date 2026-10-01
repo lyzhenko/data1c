@@ -162,6 +162,10 @@ public sealed class IndexWriter
                 DeleteScope(connection, new IndexScope([.. scopePaths]), scopePaths, rows.ScopeIds);
                 WriteNodes(rows.Nodes, connection, counters, cancellationToken);
                 WriteEdges(rows.Edges, connection, counters, cancellationToken);
+
+                // Область перезаписи удаляется вместе со своими обращениями к метаданным: их нужно
+                // записать заново, иначе после частичной переиндексации обращения пропадут.
+                WriteMetadataRefs(rows.Edges, connection, counters);
                 WriteSymbols(source, modules, connection, counters, cancellationToken);
                 TouchFiles(source, connection, new IndexScope([.. scopePaths]), counters, cancellationToken);
 
@@ -185,7 +189,7 @@ public sealed class IndexWriter
                     counters.Calls,
                     0,
                     0,
-                    0,
+                    counters.MetadataRefs,
                     counters.Files,
                     stopwatch.Elapsed);
             }
@@ -245,23 +249,29 @@ public sealed class IndexWriter
         var nodes = new Dictionary<string, GraphNode>(StringComparer.Ordinal);
         var scopeIds = new HashSet<string>(StringComparer.Ordinal);
         var edges = new List<GraphEdge>();
-        var keys = new HashSet<(string Source, string Target, GraphEdgeKind Kind, int Line, string? Detail)>();
+        var keys = new HashSet<(string Source, string Target, GraphEdgeKind Kind, int Line, string? Detail, string? Context)>();
 
         void AddNode(GraphNode node) => nodes.TryAdd(node.Id, node);
 
-        void AddEdge(string sourceId, string targetId, GraphEdgeKind kind, int? line = null, string? detail = null)
+        void AddEdge(
+            string sourceId,
+            string targetId,
+            GraphEdgeKind kind,
+            int? line = null,
+            string? detail = null,
+            string? context = null)
         {
             if (string.Equals(sourceId, targetId, StringComparison.Ordinal))
             {
                 return;
             }
 
-            if (!keys.Add((sourceId, targetId, kind, line ?? -1, detail)))
+            if (!keys.Add((sourceId, targetId, kind, line ?? -1, detail, context)))
             {
                 return;
             }
 
-            edges.Add(new GraphEdge(sourceId, targetId, kind, line, detail));
+            edges.Add(new GraphEdge(sourceId, targetId, kind, line, detail, context));
         }
 
         var moduleByOwner = ReadModuleByOwner(connection);
@@ -349,6 +359,14 @@ public sealed class IndexWriter
                 if (!access.Kind.IsUnknown)
                 {
                     candidates.Add(MdNaming.CreateId(access.Kind, access.ObjectName));
+                }
+            }
+
+            foreach (var reference in EnumerateQueries(module))
+            {
+                if (!reference.Kind.IsUnknown)
+                {
+                    candidates.Add(MdNaming.CreateId(reference.Kind, reference.ObjectName));
                 }
             }
         }
@@ -451,6 +469,11 @@ public sealed class IndexWriter
                 {
                     AddAccess(routineId, access);
                 }
+
+                foreach (var reference in routine.QueryReferences)
+                {
+                    AddQuery(routineId, reference);
+                }
             }
 
             foreach (var call in module.Calls)
@@ -461,6 +484,11 @@ public sealed class IndexWriter
             foreach (var access in module.MetadataAccesses)
             {
                 AddAccess(module.Id, access);
+            }
+
+            foreach (var reference in module.QueryReferences)
+            {
+                AddQuery(module.Id, reference);
             }
         }
 
@@ -487,7 +515,23 @@ public sealed class IndexWriter
                 AddPlaceholder(targetId, access.ObjectName, GraphNodeKind.External);
             }
 
-            AddEdge(sourceId, targetId, GraphEdgeKind.UsesMetadata, access.Line, access.Text);
+            AddEdge(sourceId, targetId, GraphEdgeKind.UsesMetadata, access.Line, access.Text, MetadataRefContexts.Code);
+        }
+
+        void AddQuery(string sourceId, BslQueryReference reference)
+        {
+            if (reference.Kind.IsUnknown)
+            {
+                return;
+            }
+
+            var targetId = MdNaming.CreateId(reference.Kind, reference.ObjectName);
+            if (!known.Contains(targetId))
+            {
+                AddPlaceholder(targetId, reference.ObjectName, GraphNodeKind.External);
+            }
+
+            AddEdge(sourceId, targetId, GraphEdgeKind.UsesMetadata, reference.Line, reference.Text, MetadataRefContexts.Query);
         }
 
         // Пишутся только узлы области и отсутствующие цели: существующие узлы уже в индексе,
@@ -509,6 +553,9 @@ public sealed class IndexWriter
 
     private static IEnumerable<BslMetadataAccess> EnumerateAccesses(BslModuleInfo module) =>
         module.MetadataAccesses.Concat(module.Routines.SelectMany(static routine => routine.MetadataAccesses));
+
+    private static IEnumerable<BslQueryReference> EnumerateQueries(BslModuleInfo module) =>
+        module.QueryReferences.Concat(module.Routines.SelectMany(static routine => routine.QueryReferences));
 
     /// <summary>Карта «объект метаданных → узел модуля»: нужна для вызовов вида «Модуль.Метод».</summary>
     private static Dictionary<string, string> ReadModuleByOwner(SqliteConnection connection)
@@ -1148,27 +1195,43 @@ public sealed class IndexWriter
             }
         }
 
-        // Обращения к метаданным из кода: отдельный контекст, чтобы отличать их от типов и прав.
-        using var codeRefs = connection.CreateCommand();
-        codeRefs.CommandText =
-            "INSERT INTO metadata_refs (source_id, target_id, context, line, detail) VALUES (@source, @target, 'code', @line, @detail)";
-        var codeSource = codeRefs.Parameters.Add("@source", SqliteType.Text);
-        var codeTarget = codeRefs.Parameters.Add("@target", SqliteType.Text);
-        var codeLine = codeRefs.Parameters.Add("@line", SqliteType.Integer);
-        var codeDetail = codeRefs.Parameters.Add("@detail", SqliteType.Text);
+        // Обращения к метаданным из кода и из текстов запросов: отдельный контекст, чтобы отличать
+        // их друг от друга и от типов и прав.
+        WriteMetadataRefs(result.Graph.Edges, connection, counters);
+    }
 
-        foreach (var edge in result.Graph.Edges)
+    /// <summary>
+    /// Пишет обращения к метаданным в <c>metadata_refs</c> из связей <see cref="GraphEdgeKind.UsesMetadata"/>:
+    /// контекст берётся из связи, а если он не задан — считается обращением из кода.
+    /// </summary>
+    private static void WriteMetadataRefs(
+        IEnumerable<GraphEdge> graphEdges,
+        SqliteConnection connection,
+        Counters counters)
+    {
+        using var refs = connection.CreateCommand();
+        refs.CommandText =
+            "INSERT INTO metadata_refs (source_id, target_id, context, line, detail) "
+            + "VALUES (@source, @target, @context, @line, @detail)";
+        var source = refs.Parameters.Add("@source", SqliteType.Text);
+        var target = refs.Parameters.Add("@target", SqliteType.Text);
+        var context = refs.Parameters.Add("@context", SqliteType.Text);
+        var line = refs.Parameters.Add("@line", SqliteType.Integer);
+        var detail = refs.Parameters.Add("@detail", SqliteType.Text);
+
+        foreach (var edge in graphEdges)
         {
             if (edge.Kind != GraphEdgeKind.UsesMetadata)
             {
                 continue;
             }
 
-            codeSource.Value = edge.SourceId;
-            codeTarget.Value = edge.TargetId;
-            codeLine.Value = (object?)edge.Line ?? DBNull.Value;
-            codeDetail.Value = (object?)edge.Detail ?? DBNull.Value;
-            codeRefs.ExecuteNonQuery();
+            source.Value = edge.SourceId;
+            target.Value = edge.TargetId;
+            context.Value = string.IsNullOrEmpty(edge.Context) ? MetadataRefContexts.Code : edge.Context;
+            line.Value = (object?)edge.Line ?? DBNull.Value;
+            detail.Value = (object?)edge.Detail ?? DBNull.Value;
+            refs.ExecuteNonQuery();
             counters.MetadataRefs++;
         }
     }

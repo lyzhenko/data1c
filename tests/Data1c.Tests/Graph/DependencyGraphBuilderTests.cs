@@ -93,6 +93,86 @@ public sealed class DependencyGraphBuilderTests
     }
 
     [Fact]
+    public void Связывает_таблицы_из_запросов_с_объектами_метаданных()
+    {
+        var metadata = new MetadataDumpReader().Read(SampleDump.Create()).Model;
+        var module = new BslModuleParser().Parse(new BslModuleSource(
+            FirstModulePath,
+            """
+            Процедура Запрос()
+                Ссылка = Справочники.Товары.НайтиПоНаименованию("x");
+                Текст = "ВЫБРАТЬ * ИЗ Справочник.Товары КАК Т
+                        |ЛЕВОЕ СОЕДИНЕНИЕ Документ.ЗаказКлиента КАК З ПО Т.Ссылка = З.Товар";
+            КонецПроцедуры
+            """,
+            "CommonModule.ОбщегоНазначения",
+            BslModuleKind.CommonModule));
+
+        var graph = new DependencyGraphBuilder().Build(metadata, [module]);
+        var routineId = "routine:module:" + FirstModulePath + "#Запрос";
+
+        var queryEdge = graph.Edges.First(static e => e is
+        {
+            Kind: GraphEdgeKind.UsesMetadata,
+            Context: MetadataRefContexts.Query,
+            TargetId: "Catalog.Товары",
+        });
+
+        Assert.Equal(routineId, queryEdge.SourceId);
+        Assert.Equal(3, queryEdge.Line);
+        Assert.Equal("ИЗ Справочник.Товары КАК Т", queryEdge.Detail);
+
+        // Обращение из кода остаётся в своём контексте: он не смешивается с текстом запроса.
+        var codeEdge = graph.Edges.First(static e => e is
+        {
+            Kind: GraphEdgeKind.UsesMetadata,
+            Context: MetadataRefContexts.Code,
+            TargetId: "Catalog.Товары",
+        });
+        Assert.Equal(2, codeEdge.Line);
+
+        // Таблица соединения не попала в выгрузку: ей соответствует внешний узел.
+        var joinEdge = graph.Edges.First(static e => e is
+        {
+            Kind: GraphEdgeKind.UsesMetadata,
+            Context: MetadataRefContexts.Query,
+            TargetId: "Document.ЗаказКлиента",
+        });
+        Assert.Equal(4, joinEdge.Line);
+        Assert.Equal("ЛЕВОЕ СОЕДИНЕНИЕ Документ.ЗаказКлиента КАК З", joinEdge.Detail);
+        Assert.True(graph.TryGetNode("Document.ЗаказКлиента", out var external));
+        Assert.True(external.IsExternal);
+    }
+
+    [Fact]
+    public void Запрос_в_коде_модуля_связывается_с_модулем_и_отключается_настройкой()
+    {
+        var metadata = new MetadataDumpReader().Read(SampleDump.Create()).Model;
+        var module = new BslModuleParser().Parse(new BslModuleSource(
+            FirstModulePath,
+            "Запрос = Новый Запрос(\"ВЫБРАТЬ * ИЗ Справочник.Товары КАК Т\");",
+            "CommonModule.ОбщегоНазначения",
+            BslModuleKind.CommonModule));
+
+        var graph = new DependencyGraphBuilder().Build(metadata, [module]);
+        Assert.Contains(graph.Edges, static e => e is
+        {
+            Kind: GraphEdgeKind.UsesMetadata,
+            Context: MetadataRefContexts.Query,
+            SourceId: "module:" + FirstModulePath,
+            TargetId: "Catalog.Товары",
+            Line: 1,
+        });
+
+        var withoutQueries = new DependencyGraphBuilder().Build(
+            metadata,
+            [module],
+            new DependencyGraphOptions { IncludeQueryReferences = false });
+
+        Assert.DoesNotContain(withoutQueries.Edges, static e => e.Context == MetadataRefContexts.Query);
+    }
+
+    [Fact]
     public void Учитывает_настройки_построения()
     {
         var metadata = new MetadataDumpReader().Read(SampleDump.Create()).Model;
