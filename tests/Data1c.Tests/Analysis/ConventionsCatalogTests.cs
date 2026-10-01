@@ -52,7 +52,10 @@ public sealed class ConventionsCatalogTests
 
         Assert.Equal("записать набор записей регистра", Recognition(answer).IntentId);
         Assert.Contains("регистр", Recognition(answer).Keywords, StringComparer.OrdinalIgnoreCase);
-        Assert.Contains(answer.Routines, static routine => routine.Name == "ЗаписатьОстаткиТоваров");
+
+        // Вид метаданных — регистр накопления — тоже признак приёма.
+        var found = Assert.Single(answer.Routines, static routine => routine.Name == "ЗаписатьОстаткиТоваров");
+        Assert.Contains(found.Reasons ?? [], static reason => reason.Contains("AccumulationRegister", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -121,7 +124,10 @@ public sealed class ConventionsCatalogTests
 
         Assert.Equal("получить константу или настройку", Recognition(answer).IntentId);
         Assert.Contains("настройка", Recognition(answer).Keywords, StringComparer.OrdinalIgnoreCase);
-        Assert.Contains(answer.Routines, static routine => routine.Name == "ПолучитьНастройкуПрограммы");
+
+        // Вид метаданных тоже работает признаком: процедура обращается к константе.
+        var found = Assert.Single(answer.Routines, static routine => routine.Name == "ПолучитьНастройкуПрограммы");
+        Assert.Contains(found.Reasons ?? [], static reason => reason.Contains("Constant", StringComparison.Ordinal));
     }
 
     [Fact]
