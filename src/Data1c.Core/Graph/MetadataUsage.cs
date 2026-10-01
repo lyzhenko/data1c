@@ -51,13 +51,18 @@ public sealed record MetadataUsageCount(string Name, int Count);
 /// <param name="Readers">Топ модулей-читателей с числом обращений и первым местом.</param>
 /// <param name="Items">Конкретные обращения: читатель, строка, контекст, фрагмент.</param>
 /// <param name="Shown">Сколько обращений попало в <paramref name="Items"/>.</param>
+/// <param name="Context">
+/// Контекст, по которому отобрана сводка (аргумент <c>usageContext</c>), либо <see langword="null"/>,
+/// если показаны все контексты. При фильтре счётчики, читатели и примеры описывают только его.
+/// </param>
 public sealed record MetadataUsageSummary(
     int Total,
     IReadOnlyList<MetadataUsageCount> ByContext,
     IReadOnlyList<MetadataUsageCount> ByKind,
     IReadOnlyList<MetadataUsageReader> Readers,
     IReadOnlyList<MetadataUsage> Items,
-    int Shown)
+    int Shown,
+    string? Context = null)
 {
     /// <summary>Сколько модулей-читателей показывает карточка объекта.</summary>
     public const int ReaderLimit = 10;
@@ -67,18 +72,37 @@ public sealed record MetadataUsageSummary(
 
     /// <summary>
     /// Собирает сводку из полного списка обращений: счётчики считаются по всему списку,
-    /// а читатели и примеры обрезаются лимитом.
+    /// а читатели и примеры обрезаются лимитом. Если задан <paramref name="context"/>, в расчёт
+    /// попадают только обращения этого контекста — тогда и <see cref="ByKind"/> содержит один
+    /// относящийся вид связи: <c>UsesMetadata</c> для кода и запросов, <c>References</c> для остальных.
     /// </summary>
     /// <param name="usages">Все обращения к объекту.</param>
     /// <param name="limit">Предел числа примеров обращений в <see cref="Items"/>.</param>
-    public static MetadataUsageSummary From(IReadOnlyList<MetadataUsage> usages, int limit)
+    /// <param name="context">Контекст для фильтра из <see cref="MetadataRefContexts.All"/> или <see langword="null"/>.</param>
+    public static MetadataUsageSummary From(IReadOnlyList<MetadataUsage> usages, int limit, string? context = null)
     {
-        if (usages.Count == 0)
+        var visible = usages;
+        if (context is not null)
         {
-            return Empty;
+            var matching = new List<MetadataUsage>(usages.Count);
+            foreach (var usage in usages)
+            {
+                if (string.Equals(usage.Context, context, StringComparison.Ordinal))
+                {
+                    matching.Add(usage);
+                }
+            }
+
+            visible = matching;
         }
 
-        var byContext = usages
+        if (visible.Count == 0)
+        {
+            // Пустой ответ на фильтр всё равно помечается: агент видит, что контекст учтён, а не потерян.
+            return context is null ? Empty : Empty with { Context = context };
+        }
+
+        var byContext = visible
             .GroupBy(static usage => usage.Context, StringComparer.Ordinal)
             .Select(static group => new MetadataUsageCount(group.Key, group.Count()))
             .OrderByDescending(static group => group.Count)
@@ -94,7 +118,7 @@ public sealed record MetadataUsageSummary(
             .ThenBy(static group => group.Name, StringComparer.Ordinal)
             .ToList();
 
-        var readers = usages
+        var readers = visible
             .GroupBy(static usage => usage.SourceId, StringComparer.Ordinal)
             .Select(static group => (Id: group.Key, Count: group.Count(), First: group.OrderBy(static usage => usage.Line ?? int.MaxValue).First()))
             .OrderByDescending(static reader => reader.Count)
@@ -110,13 +134,13 @@ public sealed record MetadataUsageSummary(
                 reader.First.Detail))
             .ToList();
 
-        var items = usages
+        var items = visible
             .OrderBy(static usage => usage.Context, StringComparer.Ordinal)
             .ThenBy(static usage => usage.SourceId, StringComparer.Ordinal)
             .ThenBy(static usage => usage.Line ?? 0)
             .Take(Math.Clamp(limit, 1, 500))
             .ToList();
 
-        return new MetadataUsageSummary(usages.Count, byContext, byKind, readers, items, items.Count);
+        return new MetadataUsageSummary(visible.Count, byContext, byKind, readers, items, items.Count, context);
     }
 }

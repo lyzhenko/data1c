@@ -115,6 +115,57 @@ public static class MetadataRefContexts
     public static string KindOf(string context) =>
         context is Code or Query ? nameof(GraphEdgeKind.UsesMetadata) : nameof(GraphEdgeKind.References);
 
+    /// <summary>
+    /// Все контексты, которые встречаются в <c>metadata_refs</c>: полный набор значений аргумента
+    /// <c>usageContext</c> инструментов <c>metadata</c> и <c>node</c>. Порядок — от самых частых
+    /// контекстов к редким, в этом же порядке они перечисляются в подсказке об ошибке.
+    /// </summary>
+    public static IReadOnlyList<string> All { get; } =
+    [
+        Code,
+        Query,
+        "type",
+        "content",
+        "field",
+        "form",
+        "template",
+        "command",
+        "event",
+        Right,
+        "other",
+    ];
+
+    /// <summary>Контекст относится к обращениям из кода или текстов запросов (вид связи <c>UsesMetadata</c>).</summary>
+    /// <param name="context">Контекст обращения из <c>metadata_refs</c>.</param>
+    public static bool IsCodeOrQuery(string context) => context is Code or Query;
+
+    /// <summary>
+    /// Разбирает значение фильтра обращений: известный контекст в нижнем регистре. Регистр и лишние
+    /// пробелы не важны, неизвестное значение отвергается — полный список лежит в <see cref="All"/>.
+    /// </summary>
+    /// <param name="value">Значение из аргумента инструмента.</param>
+    /// <param name="context">Распознанный контекст из <see cref="All"/>.</param>
+    public static bool TryParse(string? value, out string context)
+    {
+        context = string.Empty;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+        foreach (var known in All)
+        {
+            if (string.Equals(known, normalized, StringComparison.Ordinal))
+            {
+                context = known;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>Подпись контекста для ответа агенту: «в коде», «в запросах», «в типах» и так далее.</summary>
     /// <param name="context">Контекст обращения из <c>metadata_refs</c>.</param>
     public static string Label(string context) => context switch

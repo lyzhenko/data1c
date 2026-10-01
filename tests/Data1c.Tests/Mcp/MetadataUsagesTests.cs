@@ -141,6 +141,163 @@ public sealed class MetadataUsagesTests
     }
 
     [Fact]
+    public async Task Фильтр_по_контексту_оставляет_только_обращения_из_запросов()
+    {
+        using var session = new AnalysisSession(new AnalysisRequest(), CreateDump());
+
+        var usages = (await CallAsync(
+            session,
+            "metadata",
+            """{"id":"Catalog.Номенклатура","usageContext":"query"}"""))["usages"]!.AsObject();
+
+        // Счётчики пересчитаны по фильтру: одно обращение, один контекст и один вид связи.
+        Assert.Equal(1, Count(usages["total"]));
+        Assert.Equal(new Dictionary<string, int> { ["query"] = 1 }, Contexts(usages));
+        var kinds = usages["byKind"]!.AsArray()
+            .ToDictionary(item => Text(item!["kind"]), item => Count(item!["count"]));
+        Assert.Equal(new Dictionary<string, int> { ["UsesMetadata"] = 1 }, kinds);
+
+        // Фильтр помечен в ответе: агент видит, что счётчики описывают только запросы.
+        var filter = usages["filter"]!.AsObject();
+        Assert.Equal("query", Text(filter["context"]));
+        Assert.Equal("в запросах", Text(filter["label"]));
+        Assert.Equal("UsesMetadata", Text(filter["kind"]));
+
+        // Читатели и примеры — только из запросов: у процедуры одно обращение вместо двух.
+        var reader = usages["readers"]!.AsArray().Single(item => Text(item!["source"]) == RoutineId)!;
+        Assert.Equal(1, Count(reader["count"]));
+        Assert.Equal("query", Text(reader["context"]));
+        Assert.Equal(3, Count(reader["line"]));
+
+        var item = Assert.Single(usages["items"]!.AsArray())!;
+        Assert.Equal("query", Text(item["context"]));
+        Assert.Equal("ИЗ Справочник.Номенклатура КАК Т", Text(item["detail"]));
+
+        // Другой контекст того же объекта даёт другую строку того же читателя.
+        var fromCode = (await CallAsync(
+            session,
+            "metadata",
+            """{"id":"Catalog.Номенклатура","usageContext":"code"}"""))["usages"]!.AsObject();
+        Assert.Equal(1, Count(fromCode["total"]));
+        Assert.Equal(2, Count(fromCode["readers"]!.AsArray().Single(item => Text(item!["source"]) == RoutineId)!["line"]));
+        Assert.StartsWith("Справочники.Номенклатура", Text(Assert.Single(fromCode["items"]!.AsArray())!["detail"]), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Фильтр_по_контексту_ссылок_оставляет_только_типы()
+    {
+        using var session = new AnalysisSession(new AnalysisRequest(), CreateDump());
+
+        var usages = (await CallAsync(
+            session,
+            "metadata",
+            """{"id":"Catalog.Номенклатура","usageContext":"type"}"""))["usages"]!.AsObject();
+
+        Assert.Equal(1, Count(usages["total"]));
+        Assert.Equal(new Dictionary<string, int> { ["type"] = 1 }, Contexts(usages));
+
+        // Ссылка на тип — это References, и в отфильтрованном ответе остаётся только этот вид.
+        var kinds = usages["byKind"]!.AsArray()
+            .ToDictionary(item => Text(item!["kind"]), item => Count(item!["count"]));
+        Assert.Equal(new Dictionary<string, int> { ["References"] = 1 }, kinds);
+
+        var reader = Assert.Single(usages["readers"]!.AsArray())!;
+        Assert.Equal("type", Text(reader["context"]));
+        Assert.Equal(1, Count(reader["count"]));
+        Assert.NotEqual(RoutineId, Text(reader["source"]));
+    }
+
+    [Fact]
+    public async Task Фильтр_без_обращений_помечает_пустой_раздел()
+    {
+        using var session = new AnalysisSession(new AnalysisRequest(), CreateDump());
+
+        var usages = (await CallAsync(
+            session,
+            "metadata",
+            """{"id":"Catalog.Номенклатура","usageContext":"content"}"""))["usages"]!.AsObject();
+
+        Assert.Equal(0, Count(usages["total"]));
+        Assert.Equal(0, Count(usages["shown"]));
+        Assert.Null(usages["byContext"]);
+        Assert.Null(usages["readers"]);
+        Assert.Null(usages["items"]);
+
+        // Даже пустой ответ говорит, какой контекст искали: фильтр не теряется.
+        Assert.Equal("content", Text(usages["filter"]!["context"]));
+        Assert.Equal("в составе объекта", Text(usages["filter"]!["label"]));
+    }
+
+    [Fact]
+    public async Task Неизвестный_контекст_даёт_ошибку_со_списком_допустимых()
+    {
+        using var session = new AnalysisSession(new AnalysisRequest(), CreateDump());
+
+        var error = await Assert.ThrowsAsync<ToolException>(() => CallAsync(
+            session,
+            "metadata",
+            """{"id":"Catalog.Номенклатура","usageContext":"queries"}"""));
+
+        Assert.Contains("usageContext", error.Message, StringComparison.Ordinal);
+        Assert.Contains("«queries»", error.Message, StringComparison.Ordinal);
+        Assert.Contains("code (в коде)", error.Message, StringComparison.Ordinal);
+        Assert.Contains("query (в запросах)", error.Message, StringComparison.Ordinal);
+        Assert.Contains("type (в типах)", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task У_узла_тоже_работает_фильтр_по_контексту()
+    {
+        using var session = new AnalysisSession(new AnalysisRequest(), CreateDump());
+
+        var usages = (await CallAsync(
+            session,
+            "node",
+            """{"id":"Catalog.Номенклатура","usageContext":"query"}"""))["usages"]!.AsObject();
+
+        Assert.Equal(1, Count(usages["total"]));
+        Assert.Equal(new Dictionary<string, int> { ["query"] = 1 }, Contexts(usages));
+        Assert.Equal("query", Text(usages["filter"]!["context"]));
+        Assert.Contains("usageContext=\"query\"", Text(usages["hint"]), StringComparison.Ordinal);
+
+        // Списки читателей и примеров остаются за metadata.
+        Assert.Null(usages["readers"]);
+        Assert.Null(usages["items"]);
+
+        // Без фильтра сводка прежняя: три обращения в трёх контекстах.
+        var all = (await CallAsync(session, "node", """{"id":"Catalog.Номенклатура"}"""))["usages"]!.AsObject();
+        Assert.Equal(3, Count(all["total"]));
+        Assert.Equal(3, all["byContext"]!.AsArray().Count);
+        Assert.Null(all["filter"]);
+    }
+
+    [Fact]
+    public async Task Фильтр_по_контексту_работает_и_по_индексу()
+    {
+        using var fixture = new IndexFixture();
+
+        var usages = (await CallAsync(
+            fixture.Session,
+            "metadata",
+            """{"id":"Catalog.Номенклатура","usageContext":"query"}"""))["usages"]!.AsObject();
+
+        // Индекс отвечает тем же, что разбор в памяти: счётчики и примеры сходятся.
+        Assert.Equal(1, Count(usages["total"]));
+        Assert.Equal(new Dictionary<string, int> { ["query"] = 1 }, Contexts(usages));
+        Assert.Equal("query", Text(usages["filter"]!["context"]));
+        Assert.Equal("в запросах", Text(usages["filter"]!["label"]));
+
+        var reader = usages["readers"]!.AsArray().Single(item => Text(item!["source"]) == RoutineId)!;
+        Assert.Equal(1, Count(reader["count"]));
+        Assert.Equal("query", Text(reader["context"]));
+        Assert.Equal(ModulePath, Text(reader["file"]));
+
+        var item = Assert.Single(usages["items"]!.AsArray())!;
+        Assert.Equal("query", Text(item["context"]));
+        Assert.Equal("ИЗ Справочник.Номенклатура КАК Т", Text(item["detail"]));
+    }
+
+    [Fact]
     public async Task Состояние_показывает_собранные_обращения_по_контекстам()
     {
         using var fixture = new IndexFixture();

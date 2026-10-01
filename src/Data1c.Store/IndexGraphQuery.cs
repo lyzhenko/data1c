@@ -157,9 +157,11 @@ public sealed class IndexGraphQuery : IGraphQuery
         return row is null ? null : Card(row, Math.Clamp(depth, 1, 4), Math.Clamp(maxChildren, 1, 500));
     }
 
-    /// <summary>Обращения к объекту метаданных из таблицы <c>metadata_refs</c>.</summary>
-    public MetadataUsageSummary GetMetadataUsages(string? id, int limit = 20) =>
-        string.IsNullOrWhiteSpace(id) ? MetadataUsageSummary.Empty : _reader.GetMetadataUsages(id.Trim(), limit);
+    /// <summary>Обращения к объекту метаданных из таблицы <c>metadata_refs</c>, при необходимости — одного контекста.</summary>
+    public MetadataUsageSummary GetMetadataUsages(string? id, int limit = 20, string? context = null) =>
+        string.IsNullOrWhiteSpace(id)
+            ? MetadataUsageSummary.Empty
+            : _reader.GetMetadataUsages(id.Trim(), limit, context);
 
     private MetadataCard Card(MetadataObjectRow row, int depth, int maxChildren)
     {
