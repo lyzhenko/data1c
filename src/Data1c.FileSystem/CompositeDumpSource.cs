@@ -103,6 +103,11 @@ public sealed class CompositeDumpSource : IDumpSource, IVersionedDumpSource
     public IDumpSource? SourceOf(string relativePath) =>
         _index.Value.TryGetValue(DumpPath.Normalize(relativePath), out var entry) ? _sources[entry.Winner.SourceIndex] : null;
 
+    /// <summary>
+    /// Открывает файл на чтение. Путь у базы и расширения один и тот же, поэтому составной источник
+    /// отдаёт **действующую** версию: чтобы прочитать конкретную, берите её источник из
+    /// <see cref="EnumerateVersions"/> (или <see cref="EnumerateAll"/>) и открывайте файл им.
+    /// </summary>
     public Stream OpenRead(DumpFile file)
     {
         ArgumentNullException.ThrowIfNull(file);
