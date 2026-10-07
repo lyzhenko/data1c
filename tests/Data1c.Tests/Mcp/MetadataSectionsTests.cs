@@ -11,19 +11,25 @@ namespace Data1c.Tests.Mcp;
 
 /// <summary>
 /// Проверки способов сузить ответ инструмента <c>metadata</c>: виды разделов, счётчики состава,
-/// смещение по детям и признак обрезки по пределу длины. Своя выгрузка в памяти — общие
-/// <see cref="SampleDump"/> и <see cref="FormSampleDump"/> не меняются.
+/// смещение по детям, страницы с курсором продолжения и признак обрезки по пределу длины.
+/// Своя выгрузка в памяти — общие <see cref="SampleDump"/> и <see cref="FormSampleDump"/> не меняются.
 /// </summary>
 public sealed class MetadataSectionsTests
 {
     /// <summary>Сколько реквизитов у крупного документа: ответ не помещается в предел длины.</summary>
-    private const int BigAttributeCount = 120;
+    private const int BigAttributeCount = 200;
 
     /// <summary>Сколько табличных частей у крупного документа.</summary>
     private const int BigTabularCount = 10;
 
     /// <summary>Сколько реквизитов внутри каждой табличной части.</summary>
     private const int BigTabularAttributeCount = 5;
+
+    /// <summary>
+    /// Сколько объектов ссылаются на крупный документ в выгрузке для проверки неполной страницы:
+    /// раздел usages растёт от числа обращений и в предел длины не помещается даже с одним ребёнком.
+    /// </summary>
+    private const int ReferencingCatalogCount = 200;
 
     private const string InitializeKnown =
         """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"тест","version":"1"}}}""";
@@ -129,22 +135,106 @@ public sealed class MetadataSectionsTests
     }
 
     [Fact]
-    public async Task Крупный_объект_помечается_обрезкой_и_подсказкой_о_своих_аргументах()
+    public async Task Крупный_объект_отдаётся_страницей_с_курсором()
     {
-        var responses = await ExchangeAsync(
-            BigSession(),
-            InitializeKnown,
-            ToolCall(2, "metadata", """{"id":"Document.Большой"}"""));
+        // T-8: раньше крупный объект приходил обрезком по знакам, и добрать хвост было нечем —
+        // теперь metadata сама уменьшает предел детей, чтобы страница поместилась, и отдаёт курсор.
+        var text = ContentText(
+            await ExchangeAsync(BigSession(), InitializeKnown, ToolCall(2, "metadata", """{"id":"Document.Большой"}""")),
+            2);
 
-        var text = ContentText(responses, 2);
+        Assert.True(text.Length <= Render.MaxChars, $"страница не поместилась: {text.Length} знаков");
+
+        var payload = Json(text);
+        Assert.True(payload["truncated"]!.GetValue<bool>());
+
+        // Курсор равен числу показанных детей: следующая страница начинается сразу за ними,
+        // а не за запрошенным пределом (иначе часть детей пропускалась бы молча).
+        var shown = payload["children"]!.AsArray().Count;
+        Assert.Equal(shown, payload["nextOffset"]!.GetValue<int>());
+        Assert.True(payload["childrenTruncated"]!.GetValue<int>() > 0);
+        Assert.Contains($"offset={shown}", Text(payload["message"]), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Страницы_добирают_состав_без_пропусков_и_повторов()
+    {
+        var names = new List<string>();
+        var offset = 0;
+        var pages = 0;
+
+        while (true)
+        {
+            pages++;
+            Assert.True(pages < 12, "страницы не кончаются: курсор не двигается вперёд");
+
+            var text = ContentText(
+                await ExchangeAsync(
+                    BigSession(),
+                    InitializeKnown,
+                    ToolCall(2, "metadata", $$"""{"id":"Document.Большой","sections":["Attribute"],"offset":{{offset}}}""")),
+                2);
+
+            Assert.True(text.Length <= Render.MaxChars, $"страница {pages} не поместилась: {text.Length} знаков");
+
+            var payload = Json(text);
+            var children = payload["children"]!.AsArray();
+            Assert.NotEmpty(children);
+            names.AddRange(children.Select(child => Text(child!["name"])));
+
+            if (payload["nextOffset"] is null)
+            {
+                // Последняя страница: обрезки больше нет, добора тоже.
+                Assert.Null(payload["truncated"]);
+                break;
+            }
+
+            var next = payload["nextOffset"]!.GetValue<int>();
+            Assert.Equal(offset + children.Count, next);
+            offset = next;
+        }
+
+        Assert.True(pages > 1, "крупный объект обязан прийти несколькими страницами");
+        Assert.Equal(BigAttributeCount, names.Count);
+        Assert.Equal(names.Count, names.Distinct(StringComparer.Ordinal).Count());
+        Assert.Equal(
+            Enumerable.Range(1, BigAttributeCount).Select(index => "РеквизитБольшогоОбъекта" + Number(index)),
+            names);
+    }
+
+    [Fact]
+    public async Task Смещение_без_остатка_продолжения_не_обещает()
+    {
+        // Смещение пропускает детей, и они тоже попадают в счётчик скрытых, но за страницей
+        // ничего не осталось: курсор здесь был бы приглашением ходить по кругу.
+        var payload = await CallAsync(SmallSession(), """{"id":"Document.Заказ","sections":["Attribute"],"offset":2}""");
+
+        Assert.Null(payload["nextOffset"]);
+        Assert.Null(payload["truncated"]);
+        Assert.Equal(2, payload["childrenTruncated"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task Страница_которая_не_помещается_совсем_отдаёт_подсказку_о_своих_аргументах()
+    {
+        // Раздутый раздел usages (сотни обращений) от предела детей не зависит: не помещается даже
+        // один ребёнок. Курсор здесь был бы выдумкой — сколько детей попало в обрезанный ответ,
+        // из него не видно, — поэтому остаётся обрезка с подсказкой, называющей аргументы metadata.
+        var text = ContentText(
+            await ExchangeAsync(
+                HeavyUsagesSession(),
+                InitializeKnown,
+                ToolCall(2, "metadata", """{"id":"Document.Большой","usages":500}""")),
+            2);
+
         Assert.True(text.Length > Render.MaxChars);
 
         var payload = Json(text);
         Assert.True(payload["truncated"]!.GetValue<bool>());
         Assert.Equal(Render.MaxChars, payload["limit"]!.GetValue<int>());
+        Assert.Null(payload["nextOffset"]);
         Assert.False(string.IsNullOrWhiteSpace(Text(payload["head"])));
 
-        // Подсказка называет аргументы metadata, а не limit с диапазоном строк.
         var message = Text(payload["message"]);
         foreach (var argument in new[] { "sections", "summary", "depth", "maxChildren", "offset", "usages" })
         {
@@ -220,6 +310,76 @@ public sealed class MetadataSectionsTests
         source.AddText("Documents/Большой.xml", BigDocumentXml());
         return new AnalysisSession(new AnalysisRequest(), source);
     }
+
+    /// <summary>
+    /// Выгрузка с крупным документом и сотнями ссылок на него: раздел usages такого размера
+    /// не помещается в предел длины даже когда в дереве остаётся один ребёнок.
+    /// </summary>
+    private static AnalysisSession HeavyUsagesSession()
+    {
+        var source = new InMemoryDumpSource("выгрузка с крупными обращениями");
+        source.AddText("Configuration.xml", HeavyConfigurationXml());
+        source.AddText("Documents/Большой.xml", BigDocumentXml());
+        for (var index = 1; index <= ReferencingCatalogCount; index++)
+        {
+            source.AddText("Catalogs/" + CatalogName(index) + ".xml", ReferencingCatalogXml(index));
+        }
+
+        return new AnalysisSession(new AnalysisRequest(), source);
+    }
+
+    private static string CatalogName(int index) => "Ссылающийся" + Number(index);
+
+    private static string HeavyConfigurationXml()
+    {
+        var text = new StringBuilder();
+        text.Append(
+            """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+                <Configuration uuid="0f0f0f0f-0000-0000-0000-000000000005">
+                    <Properties>
+                        <Name>КонфигурацияСКрупнымиОбращениями</Name>
+                    </Properties>
+                    <ChildObjects>
+                        <Document>Большой</Document>
+            """);
+
+        for (var index = 1; index <= ReferencingCatalogCount; index++)
+        {
+            text.Append(CultureInfo.InvariantCulture, $"            <Catalog>{CatalogName(index)}</Catalog>\n");
+        }
+
+        text.Append(
+            """
+                    </ChildObjects>
+                </Configuration>
+            </MetaDataObject>
+            """);
+        return text.ToString();
+    }
+
+    /// <summary>Справочник с реквизитом типа «ссылка на крупный документ»: это обращение к нему.</summary>
+    private static string ReferencingCatalogXml(int index) => $$"""
+        <?xml version="1.0" encoding="UTF-8"?>
+        <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" version="2.20">
+            <Catalog uuid="aaaaaaaa-0000-0000-0000-{{index:D12}}">
+                <Properties>
+                    <Name>{{CatalogName(index)}}</Name>
+                </Properties>
+                <ChildObjects>
+                    <Attribute uuid="bbbbbbbb-0000-0000-0000-{{index:D12}}">
+                        <Properties>
+                            <Name>Документ</Name>
+                            <Type>
+                                <v8:Type>cfg:DocumentRef.Большой</v8:Type>
+                            </Type>
+                        </Properties>
+                    </Attribute>
+                </ChildObjects>
+            </Catalog>
+        </MetaDataObject>
+        """;
 
     private static string BigDocumentXml()
     {

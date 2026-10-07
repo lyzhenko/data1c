@@ -695,7 +695,11 @@ public sealed class ToolCatalog
         + "Аргумент sections оставляет в дереве только запрошенные виды разделов, offset пропускает первые "
         + "дети раздела вместе с maxChildren, а summary отвечает одними счётчиками состава — так крупный "
         + "объект (сотни реквизитов и десятки табличных частей) читается без обрезки ответа по длине. "
-        + "Нужен, чтобы писать код по реальной структуре объекта. Пример: id=\"Catalog.Товары\".",
+        + "У крупного объекта ответ приходит страницей: поле truncated говорит, что показана часть состава, "
+        + "nextOffset — каким offset запросить продолжение (предел детей при этом уменьшается сам, чтобы "
+        + "страница поместилась целиком; если детей на странице мало, уменьшите usages — раздел обращений "
+        + "занимает до половины ответа). Нужен, чтобы писать код по реальной структуре объекта. "
+        + "Пример: id=\"Catalog.Товары\".",
         [
             new ToolParameter("id", "string", "Идентификатор: Catalog.Товары, Document.Заказ, Document.Заказ/TabularSection.Строки.", Required: true),
             new ToolParameter("depth", "integer", "Глубина дерева состава (1–4, по умолчанию 3)."),
@@ -717,7 +721,7 @@ public sealed class ToolCatalog
                 "offset",
                 "integer",
                 "Сколько первых детей пропустить в каждом узле дерева (0–500, по умолчанию 0): вместе с maxChildren "
-                + "добирает хвост раздела."),
+                + "добирает хвост раздела. Продолжение страницы берётся из поля nextOffset предыдущего ответа."),
             new ToolParameter("usages", "integer", "Сколько обращений показать в разделе usages (1–500, по умолчанию 20); счётчики всегда полные."),
             new ToolParameter(
                 "usageContext",
@@ -764,49 +768,7 @@ public sealed class ToolCatalog
                 return Render.JsonOf(MetadataSummaryView(card, usageView), MetadataTruncationHint);
             }
 
-            var root = MetadataNode(card, usageView);
-            root["uuid"] = card.Uuid;
-            root["file"] = card.SourcePath;
-            root["isTopLevel"] = card.IsTopLevel;
-            root["parent"] = card.ParentId;
-
-            var properties = new JsonObject();
-            foreach (var property in card.Properties)
-            {
-                properties[property.Key] = property.Value;
-            }
-
-            root["properties"] = properties.Count > 0 ? properties : null;
-
-            var references = new JsonArray();
-            foreach (var reference in card.References)
-            {
-                references.Add(new JsonObject
-                {
-                    ["kind"] = reference.Kind,
-                    ["target"] = reference.Target,
-                    ["detail"] = reference.Detail,
-                });
-            }
-
-            root["references"] = references.Count > 0 ? references : null;
-
-            var modules = new JsonArray();
-            foreach (var path in card.ModulePaths)
-            {
-                modules.Add(new JsonObject { ["path"] = path });
-            }
-
-            root["modules"] = modules.Count > 0 ? modules : null;
-
-            // Описание формы (Ext/Form.xml) добавляется только форме: у остальных объектов его нет,
-            // а существующие поля ответа не меняются.
-            if (card.Form is { } form)
-            {
-                root["form"] = FormView(form, maxChildren);
-            }
-
-            return Render.JsonOf(root, MetadataTruncationHint);
+            return MetadataTreeResponse(query, card, depth, maxChildren, offset, sections, usageView);
         });
 
     /// <summary>
@@ -826,6 +788,231 @@ public sealed class ToolCatalog
         "сузьте запрос: summary=true — счётчики состава по видам разделов, sections — только нужные виды "
         + "(Attribute, TabularSection, Form и так далее), depth и maxChildren — глубина и размер ветки, "
         + "offset — добор хвоста раздела, usages — сколько примеров обращений показать.";
+
+    /// <summary>
+    /// Запас длины на поля страницы (<c>truncated</c>, <c>nextOffset</c>, <c>message</c>) и разделители:
+    /// они появляются уже после того, как предел детей измерен, и не должны вывести ответ за предел.
+    /// </summary>
+    private const int MetadataPageReserve = 400;
+
+    /// <summary>
+    /// Ответ <c>metadata</c> деревом состава, который помещается в предел длины. Страница
+    /// самодостаточна: предел детей уменьшается до значения, при котором ответ влезает, а хвост состава
+    /// агент добирает повторным вызовом с <c>nextOffset</c>. Считать хвост как <c>offset + maxChildren</c>
+    /// нельзя: обрезка идёт по знакам, а не по числу детей, и такой курсор пропустил бы детей, о которых
+    /// агент даже не узнал. Общая обрезка по знакам (обёртка <c>{truncated, head}</c>) остаётся на случай,
+    /// когда не помещается даже один ребёнок — например, раздутый раздел usages: курсор там был бы
+    /// выдумкой, потому что сколько детей попало в обрезанный ответ, из него не видно.
+    /// </summary>
+    /// <param name="card">Карточка, прочитанная с запрошенным пределом детей: первая проба страницы.</param>
+    private static string MetadataTreeResponse(
+        IGraphQuery query,
+        MetadataCard card,
+        int depth,
+        int requestedChildren,
+        int offset,
+        IReadOnlyCollection<string>? sections,
+        JsonObject usageView)
+    {
+        var page = MetadataPageView(card, offset, requestedChildren, requestedChildren, usageView);
+        var text = Render.JsonOf(page, MetadataTruncationHint);
+        if (text.Length <= Render.MaxChars)
+        {
+            return text;
+        }
+
+        var limit = MetadataChildrenLimit(page, requestedChildren, offset);
+        if (limit >= 1)
+        {
+            var fitted = query.GetMetadata(card.Id, depth, limit, sections, offset);
+            if (fitted is not null)
+            {
+                text = Render.JsonOf(MetadataPageView(fitted, offset, requestedChildren, limit, usageView), MetadataTruncationHint);
+                if (text.Length <= Render.MaxChars)
+                {
+                    return text;
+                }
+
+                // Оценка не сошлась (вложенные списки дали длину больше расчётной): ищем предел делением.
+                return MetadataFittedPage(query, card, depth, requestedChildren, offset, sections, usageView, limit - 1);
+            }
+        }
+
+        // Не помещается даже один ребёнок: отдаём обрезку с подсказкой, называющей аргументы metadata.
+        return Render.JsonOf(MetadataTreeView(card, requestedChildren, usageView.DeepClone().AsObject()), MetadataTruncationHint);
+    }
+
+    /// <summary>
+    /// Предел детей при заданном ответе: самый большой предел, при котором страница ещё помещается.
+    /// Вызывается только когда предел уже не сошёлся, поэтому шагов немного — деление отрезка.
+    /// </summary>
+    private static string MetadataFittedPage(
+        IGraphQuery query,
+        MetadataCard card,
+        int depth,
+        int requestedChildren,
+        int offset,
+        IReadOnlyCollection<string>? sections,
+        JsonObject usageView,
+        int high)
+    {
+        var best = string.Empty;
+        for (var low = 1; low <= high;)
+        {
+            var middle = low + ((high - low) / 2);
+            var candidate = query.GetMetadata(card.Id, depth, middle, sections, offset);
+            if (candidate is null)
+            {
+                break;
+            }
+
+            var text = Render.JsonOf(MetadataPageView(candidate, offset, requestedChildren, middle, usageView), MetadataTruncationHint);
+            if (text.Length <= Render.MaxChars)
+            {
+                best = text;
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle - 1;
+            }
+        }
+
+        return best.Length > 0
+            ? best
+            : Render.JsonOf(MetadataTreeView(card, requestedChildren, usageView.DeepClone().AsObject()), MetadataTruncationHint);
+    }
+
+    /// <summary>
+    /// Сколько детей поместится в предел длины. Ответ уже построен, поэтому длины детей просто
+    /// складываются — лишних запросов в индекс не нужно. Оценка сверху: при меньшем пределе вложенные
+    /// списки только короче, значит настоящая страница не длиннее оценки.
+    /// </summary>
+    private static int MetadataChildrenLimit(JsonObject page, int requestedChildren, int offset)
+    {
+        if (page["children"] is not JsonArray children || children.Count == 0)
+        {
+            return 0;
+        }
+
+        // Длина всего, кроме детей: постоянная часть ответа от предела детей не зависит.
+        page.Remove("children");
+        var used = page.ToJsonString(Render.Json).Length;
+        page["children"] = children;
+
+        var budget = Render.MaxChars - used - MetadataPageReserve;
+        var limit = 0;
+        foreach (var child in children)
+        {
+            var size = child!.ToJsonString(Render.Json).Length + 2;
+            if (size > budget)
+            {
+                break;
+            }
+
+            budget -= size;
+            limit++;
+        }
+
+        // Предел не может быть запрошенным: страница с ним уже не поместилась.
+        return Math.Clamp(limit, 0, Math.Max(0, requestedChildren - 1));
+    }
+
+    /// <summary>
+    /// Страница ответа <c>metadata</c>: дерево состава плюс поля добора. Они появляются, только когда
+    /// ответ неполон, — у небольшого объекта ответ не меняется.
+    /// </summary>
+    /// <param name="offset">Смещение, с которого начата страница: курсор продолжения считается от него.</param>
+    /// <param name="requestedChildren">Предел детей, который запросил агент.</param>
+    /// <param name="childrenLimit">Предел детей, при котором страница поместилась.</param>
+    private static JsonObject MetadataPageView(
+        MetadataCard card,
+        int offset,
+        int requestedChildren,
+        int childrenLimit,
+        JsonObject usageView)
+    {
+        var root = MetadataTreeView(card, childrenLimit, usageView.DeepClone().AsObject());
+
+        // ChildrenNotShown считает и детей, пропущенных смещением, поэтому «дальше ещё есть» —
+        // это остаток сверх уже пропущенного.
+        var rest = Math.Max(0, card.ChildrenNotShown - offset);
+        var shown = card.Children.Count;
+        if (shown > 0 && rest > 0)
+        {
+            root["truncated"] = true;
+            root["nextOffset"] = offset + shown;
+            root["message"] = childrenLimit < requestedChildren
+                ? $"Показана часть состава: детей {shown}, дальше ещё {rest}; предел детей уменьшен "
+                    + $"с {requestedChildren} до {childrenLimit}, чтобы ответ поместился в {Render.MaxChars} знаков. "
+                    + $"Продолжение — тем же вызовом с offset={offset + shown}."
+                : $"Показана часть состава: детей {shown}, дальше ещё {rest}. "
+                    + $"Продолжение — тем же вызовом с offset={offset + shown}.";
+        }
+        else if (childrenLimit < requestedChildren)
+        {
+            root["truncated"] = true;
+            root["message"] = $"Предел детей уменьшен с {requestedChildren} до {childrenLimit}, чтобы ответ поместился "
+                + $"в {Render.MaxChars} знаков: у вложенных узлов часть детей не показана (childrenTruncated), "
+                + "остальное читается запросом metadata по идентификатору вложенного узла.";
+        }
+
+        return root;
+    }
+
+    /// <summary>
+    /// Дерево состава объекта: сам объект, свойства, ссылки, модули и описание формы. Поля добора
+    /// страницы (<c>truncated</c>, <c>nextOffset</c>) добавляет <see cref="MetadataPageView"/>.
+    /// </summary>
+    /// <param name="maxChildren">
+    /// Предел списков формы: он же предел детей дерева, поэтому у формы списки ограничены тем же числом.
+    /// </param>
+    private static JsonObject MetadataTreeView(MetadataCard card, int maxChildren, JsonObject usages)
+    {
+        var root = MetadataNode(card, usages);
+        root["uuid"] = card.Uuid;
+        root["file"] = card.SourcePath;
+        root["isTopLevel"] = card.IsTopLevel;
+        root["parent"] = card.ParentId;
+
+        var properties = new JsonObject();
+        foreach (var property in card.Properties)
+        {
+            properties[property.Key] = property.Value;
+        }
+
+        root["properties"] = properties.Count > 0 ? properties : null;
+
+        var references = new JsonArray();
+        foreach (var reference in card.References)
+        {
+            references.Add(new JsonObject
+            {
+                ["kind"] = reference.Kind,
+                ["target"] = reference.Target,
+                ["detail"] = reference.Detail,
+            });
+        }
+
+        root["references"] = references.Count > 0 ? references : null;
+
+        var modules = new JsonArray();
+        foreach (var path in card.ModulePaths)
+        {
+            modules.Add(new JsonObject { ["path"] = path });
+        }
+
+        root["modules"] = modules.Count > 0 ? modules : null;
+
+        // Описание формы (Ext/Form.xml) добавляется только форме: у остальных объектов его нет,
+        // а существующие поля ответа не меняются.
+        if (card.Form is { } form)
+        {
+            root["form"] = FormView(form, maxChildren);
+        }
+
+        return root;
+    }
 
     /// <summary>
     /// Виды разделов из аргумента <c>sections</c> в канонической записи: неизвестное значение отвергается
