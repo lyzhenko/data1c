@@ -3081,6 +3081,7 @@ public sealed class ToolCatalog
             indexPath = Session.IndexPath,
             watching = Session.IsWatching,
             rebuilding = Session.IsRebuilding,
+            ready = ReadyView(),
             server = ServerView(),
             dumpChange = DumpChangeView(),
             lastCheckedAt = Session.LastCheckedAt,
@@ -3122,6 +3123,34 @@ public sealed class ToolCatalog
             error = Session.Failure?.Message,
             hint = Session.IsOpen ? null : "Выгрузка не открыта: вызовите open с путём к каталогу выгрузки 1С.",
         });
+    }
+
+    /// <summary>
+    /// Что уже можно спрашивать у сервера: модель метаданных прочитана, поиск доступен, граф построен.
+    /// Признаки выводятся из того, что сессия уже знает: разбор в памяти (<c>Session.Result</c>) и
+    /// готовый индекс на диске. Индекс проверяется отдельно (<c>GetIndexReader</c> открывает файл,
+    /// только если он пригоден, и ничего не пересобирает): иначе одинокий <c>status</c> при уже
+    /// собранном индексе сообщал бы «поиск недоступен». Где признак неизвестен — <c>false</c>,
+    /// а не «готово»: обещать готовность хуже, чем честно сказать «пока нет».
+    /// </summary>
+    private object ReadyView()
+    {
+        var result = Session.Result;
+        var indexReady = Session.IsIndexReady || (Session.IsIndexMode && Session.GetIndexReader() is not null);
+        var ready = result is not null || indexReady;
+
+        return new
+        {
+            metadata = ready,
+            search = ready,
+            graph = result is not null,
+            index = indexReady,
+            note = result is not null
+                ? null
+                : indexReady
+                    ? "Разбор в память не выполнялся: отвечает готовый индекс, поиск и обращения к метаданным полны."
+                    : "Разбор ещё не закончен: поиск и граф могут быть неполными.",
+        };
     }
 
     /// <summary>

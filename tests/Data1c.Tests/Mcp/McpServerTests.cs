@@ -479,6 +479,25 @@ public sealed class McpServerTests
     }
 
     [Fact]
+    public async Task Состояние_сообщает_что_уже_готово()
+    {
+        // T-7 из внешнего отзыва: агенту нужно знать, какие запросы уже осмысленны, а какие дадут
+        // неполный граф. Проверяем, что блок ready есть всегда и что после разбора он честно «готов».
+        var before = Json(ContentText(await ExchangeAsync(InitializeKnown, ToolCall(2, "status", "{}")), 2));
+        Assert.NotNull(before["ready"]);
+        Assert.False(before["ready"]!["graph"]!.GetValue<bool>());
+
+        var session = Session();
+        await ExchangeAsync(session, InitializeKnown, ToolCall(2, "search", """{"query":"Товары","limit":1}"""));
+        var after = Json(ContentText(await ExchangeAsync(session, ToolCall(3, "status", "{}")), 3));
+
+        var ready = after["ready"]!;
+        Assert.True(ready["metadata"]!.GetValue<bool>());
+        Assert.True(ready["search"]!.GetValue<bool>());
+        Assert.True(ready["graph"]!.GetValue<bool>());
+    }
+
+    [Fact]
     public async Task Вызов_без_обязательного_аргумента_помечается_ошибкой()
     {
         var responses = await ExchangeAsync(
