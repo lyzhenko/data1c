@@ -98,6 +98,48 @@ public sealed class IndexGraphQueryTests
     }
 
     [Fact]
+    public void Карточка_из_индекса_уважает_виды_разделов_и_смещение()
+    {
+        using var fixture = new QueryFixture();
+
+        // Отбор видов идёт в SQL: без него предел вернул бы первые записи по алфавиту,
+        // и запрошенная форма осталась бы за кадром.
+        var forms = fixture.Query.GetMetadata("Catalog.Товары", sections: ["Form"]);
+        Assert.NotNull(forms);
+        var form = Assert.Single(forms.Children);
+        Assert.Equal("Form", form.Kind);
+        Assert.Equal(0, forms.ChildrenNotShown);
+
+        // Порядок индекса — по виду и имени: смещение пропускает первый реквизит.
+        var tail = fixture.Query.GetMetadata("Catalog.Товары", sections: ["Attribute"], offset: 1);
+        Assert.NotNull(tail);
+        var attribute = Assert.Single(tail.Children);
+        Assert.Equal("Единица", attribute.Name);
+        Assert.Equal(1, tail.ChildrenNotShown);
+
+        // Всё вместе: виды, смещение и предел ветки.
+        var page = fixture.Query.GetMetadata("Catalog.Товары", maxChildren: 1, offset: 1);
+        Assert.NotNull(page);
+        Assert.Equal("Единица", Assert.Single(page.Children).Name);
+        Assert.Equal(3, page.ChildrenNotShown);
+    }
+
+    [Fact]
+    public void Фильтр_видов_действует_на_каждом_уровне_дерева()
+    {
+        using var fixture = new QueryFixture();
+
+        var card = fixture.Query.GetMetadata("Catalog.Товары", sections: ["Form", "Command"]);
+
+        Assert.NotNull(card);
+        Assert.Equal(2, card.Children.Count);
+        Assert.DoesNotContain(card.Children, static child => child.Kind == "Attribute");
+
+        // Скрытых детей считаем по тому же фильтру: чужие виды в счётчик не попадают.
+        Assert.Equal(0, card.ChildrenNotShown);
+    }
+
+    [Fact]
     public void Подстрочный_поиск_находит_середину_имени()
     {
         using var fixture = new QueryFixture();

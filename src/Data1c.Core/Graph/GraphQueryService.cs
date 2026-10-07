@@ -135,7 +135,12 @@ public sealed class GraphQueryService : IGraphQuery
     }
 
     /// <summary>Карточка объекта метаданных из модели в памяти.</summary>
-    public MetadataCard? GetMetadata(string? id, int depth = 3, int maxChildren = 200)
+    public MetadataCard? GetMetadata(
+        string? id,
+        int depth = 3,
+        int maxChildren = 200,
+        IReadOnlyCollection<string>? sections = null,
+        int offset = 0)
     {
         if (_metadata is null || string.IsNullOrWhiteSpace(id))
         {
@@ -143,7 +148,9 @@ public sealed class GraphQueryService : IGraphQuery
         }
 
         var obj = _metadata.Find(id.Trim());
-        return obj is null ? null : Card(obj, Math.Clamp(depth, 1, 4), Math.Clamp(maxChildren, 1, 500));
+        return obj is null
+            ? null
+            : Card(obj, Math.Clamp(depth, 1, 4), Math.Clamp(maxChildren, 1, 500), sections, Math.Max(0, offset));
     }
 
     /// <summary>
@@ -226,7 +233,12 @@ public sealed class GraphQueryService : IGraphQuery
         return MetadataUsageSummary.From(usages, limit, context);
     }
 
-    private static MetadataCard Card(MdObject obj, int depth, int maxChildren)
+    private static MetadataCard Card(
+        MdObject obj,
+        int depth,
+        int maxChildren,
+        IReadOnlyCollection<string>? sections,
+        int offset)
     {
         var properties = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var property in obj.Properties)
@@ -237,12 +249,20 @@ public sealed class GraphQueryService : IGraphQuery
             }
         }
 
+        // Отбор идёт по всем детям: счётчик скрытых обязан описывать тот же набор видов, что и фильтр.
         var children = new List<MetadataCard>();
-        if (depth > 1)
+        var matching = 0;
+        foreach (var child in obj.Children)
         {
-            foreach (var child in obj.Children.Take(maxChildren))
+            if (!MetadataSections.Matches(child.Kind.Name, sections))
             {
-                children.Add(Card(child, depth - 1, maxChildren));
+                continue;
+            }
+
+            matching++;
+            if (depth > 1 && matching > offset && children.Count < maxChildren)
+            {
+                children.Add(Card(child, depth - 1, maxChildren, sections, offset));
             }
         }
 
@@ -271,7 +291,7 @@ public sealed class GraphQueryService : IGraphQuery
                     reference.Detail))],
             [.. obj.Modules.Select(static module => module.RelativePath)],
             children,
-            Math.Max(0, obj.Children.Count - children.Count),
+            Math.Max(0, matching - children.Count),
             obj.Form);
     }
 

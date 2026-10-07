@@ -1124,18 +1124,48 @@ public sealed class IndexReader
         });
     }
 
-    /// <summary>Дети объекта метаданных вместе с их общим числом: состав дерева для карточки.</summary>
-    public MetadataChildrenPage MetadataChildren(string parentId, int limit = 500) => _index.WithLock(() =>
+    /// <summary>
+    /// Дети объекта метаданных вместе с их общим числом: состав дерева для карточки.
+    /// Виды разделов и смещение фильтруются в SQL — иначе предел вернул бы первые записи по алфавиту,
+    /// а запрошенный раздел (например, только формы) остался бы за кадром. Общее число считается
+    /// по тому же фильтру, поэтому счётчик скрытых относится к запрошенным видам.
+    /// </summary>
+    public MetadataChildrenPage MetadataChildren(
+        string parentId,
+        int limit = 500,
+        int offset = 0,
+        IReadOnlyCollection<string>? sections = null) => _index.WithLock(() =>
     {
+        var filter = new StringBuilder("parent_id = @id");
+        var kinds = sections is null || sections.Count == 0 ? null : sections.ToList();
+        if (kinds is not null)
+        {
+            var names = new List<string>(kinds.Count);
+            for (var index = 0; index < kinds.Count; index++)
+            {
+                names.Add("@kind" + index.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+
+            filter.Append(" AND kind IN (").Append(string.Join(", ", names)).Append(')');
+        }
+
         var items = new List<MetadataItemRow>();
         using (var command = _index.CreateCommand(
-            """
-            SELECT object_id, kind, name, type_info, parent_id, synonym, comment
-            FROM metadata_items WHERE parent_id = @id ORDER BY kind, name LIMIT @limit
-            """))
+            "SELECT object_id, kind, name, type_info, parent_id, synonym, comment FROM metadata_items WHERE "
+            + filter
+            + " ORDER BY kind, name LIMIT @limit OFFSET @offset"))
         {
             command.Parameters.AddWithValue("@id", parentId);
             command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 5000));
+            command.Parameters.AddWithValue("@offset", Math.Max(0, offset));
+            if (kinds is not null)
+            {
+                for (var index = 0; index < kinds.Count; index++)
+                {
+                    command.Parameters.AddWithValue("@kind" + index.ToString(System.Globalization.CultureInfo.InvariantCulture), kinds[index]);
+                }
+            }
+
             using var reader = command.ExecuteReader();
             while (reader.Read())
             {
@@ -1150,8 +1180,16 @@ public sealed class IndexReader
             }
         }
 
-        using var count = _index.CreateCommand("SELECT COUNT(*) FROM metadata_items WHERE parent_id = @id");
+        using var count = _index.CreateCommand("SELECT COUNT(*) FROM metadata_items WHERE " + filter);
         count.Parameters.AddWithValue("@id", parentId);
+        if (kinds is not null)
+        {
+            for (var index = 0; index < kinds.Count; index++)
+            {
+                count.Parameters.AddWithValue("@kind" + index.ToString(System.Globalization.CultureInfo.InvariantCulture), kinds[index]);
+            }
+        }
+
         var total = Convert.ToInt32(count.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
         return new MetadataChildrenPage(items, total);
     });
