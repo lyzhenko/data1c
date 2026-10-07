@@ -2558,7 +2558,67 @@ public sealed class ToolCatalog
         string File,
         int Line,
         string Text,
-        List<string> Context);
+        List<string> Context,
+        GrepRoutine? Routine);
+
+    /// <summary>
+    /// Процедура, внутри которой лежит найденная строка. Без неё агенту приходится считать
+    /// принадлежность вручную — на разборе легаси это основная задача (внешний отзыв, T-1).
+    /// </summary>
+    private sealed record GrepRoutine(string Id, string Name, int StartLine, int EndLine);
+
+    /// <summary>Вид находки для ответа: процедура либо null, если строку не удалось к ней отнести.</summary>
+    private static object? RoutineView(GrepRoutine? routine) =>
+        routine is null
+            ? null
+            : new
+            {
+                id = routine.Id,
+                name = routine.Name,
+                startLine = routine.StartLine,
+                endLine = routine.EndLine,
+            };
+
+    /// <summary>Ищет процедуру, содержащую строку, по границам символов модуля.</summary>
+    private static GrepRoutine? ResolveRoutine(IReadOnlyList<SymbolRow>? symbols, int line)
+    {
+        if (symbols is null)
+        {
+            return null;
+        }
+
+        foreach (var symbol in symbols)
+        {
+            if (line >= symbol.StartLine && line <= symbol.EndLine)
+            {
+                return new GrepRoutine(symbol.NodeId, symbol.Name, symbol.StartLine, symbol.EndLine);
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// То же по разбору в памяти: индекс может быть не готов или работать в режиме <c>--no-index</c>,
+    /// и тогда процедура берётся из разобранных модулей. Идентификатор строится в том же виде,
+    /// в каком его принимают <c>code</c> и <c>neighbors</c>.
+    /// </summary>
+    private static GrepRoutine? ResolveRoutineInModule(BslModuleInfo module, int line)
+    {
+        foreach (var routine in module.Routines)
+        {
+            if (line >= routine.StartLine && line <= routine.EndLine)
+            {
+                return new GrepRoutine(
+                    $"routine:module:{module.Path}#{routine.Name}",
+                    routine.Name,
+                    routine.StartLine,
+                    routine.EndLine);
+            }
+        }
+
+        return null;
+    }
 
     /// <summary>Поиск по тексту файлов выгрузки.</summary>
     private async Task<string> GrepAsync(ToolArguments arguments, CancellationToken cancellationToken)
@@ -2574,13 +2634,15 @@ public sealed class ToolCatalog
         var contextLines = arguments.GetInt("context", 1, 0, 3);
         var waitMs = arguments.GetInt("waitMs", 60_000, 0, 600_000);
 
+        // Список файлов берётся из индекса — обход каталога выгрузки стоил несколько секунд.
+        // У составного источника список не подставляем: нужно показать обе версии перекрытых файлов.
+        // Читатель нужен и дальше: по нему находки привязываются к процедурам.
+        var reader = source is IVersionedDumpSource ? null : Session.GetIndexReader();
+
         CodeSearchResult found;
         try
         {
             // Поиск по тексту живёт в ядре (CodeSearchService): своей реализации сканирования у сервера нет.
-            // Список файлов берётся из индекса — обход каталога выгрузки стоил несколько секунд.
-            // У составного источника список не подставляем: нужно показать обе версии перекрытых файлов.
-            var reader = source is IVersionedDumpSource ? null : Session.GetIndexReader();
             found = new CodeSearchService(source).Search(
                 pattern,
                 new CodeSearchOptions
@@ -2609,6 +2671,18 @@ public sealed class ToolCatalog
 
         var matchedFiles = new HashSet<string>(files, StringComparer.OrdinalIgnoreCase);
         var overriddenFound = false;
+
+        // Процедуры символов модуля читаются один раз на файл: находок может быть до 500,
+        // а лежат они обычно в нескольких файлах. Без индекса те же границы берутся из разбора
+        // в памяти — иначе в режиме --no-index атрибуция пропала бы.
+        var symbolsByFile = new Dictionary<string, IReadOnlyList<SymbolRow>>(StringComparer.OrdinalIgnoreCase);
+        var modulesByPath = reader is null
+            ? (Session.Result?.Modules ?? []).ToDictionary(
+                static module => module.Path,
+                static module => module,
+                StringComparer.OrdinalIgnoreCase)
+            : null;
+
         var hits = new List<GrepHit>(found.Hits.Count);
         foreach (var entry in found.Hits)
         {
@@ -2617,6 +2691,23 @@ public sealed class ToolCatalog
             var sourceName = composite is not null && entry.SourceIndex >= 0 && entry.SourceIndex < composite.Sources.Count
                 ? composite.Sources[entry.SourceIndex].DisplayName
                 : source.DisplayName;
+
+            GrepRoutine? routine = null;
+            if (reader is not null)
+            {
+                if (!symbolsByFile.TryGetValue(entry.Path, out var symbols))
+                {
+                    symbols = reader.FindSymbolsInModule(entry.Path);
+                    symbolsByFile[entry.Path] = symbols;
+                }
+
+                routine = ResolveRoutine(symbols, entry.Line);
+            }
+            else if (modulesByPath is not null && modulesByPath.TryGetValue(entry.Path, out var module))
+            {
+                routine = ResolveRoutineInModule(module, entry.Line);
+            }
+
             hits.Add(new GrepHit(
                 owners.TryGetValue(entry.Path, out var owner) ? owner : null,
                 sourceName,
@@ -2624,7 +2715,8 @@ public sealed class ToolCatalog
                 entry.Path,
                 entry.Line,
                 entry.Text,
-                [.. entry.Context]));
+                [.. entry.Context],
+                routine));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -2647,6 +2739,7 @@ public sealed class ToolCatalog
             matches = hits.Count,
             truncated = found.Truncated,
             ownersResolved,
+            routineSource = reader is not null ? "index" : (Session.Result is not null ? "analysis" : null),
             byOwner = ownerSummary,
             note = BuildGrepNote(overriddenFound, ownersResolved),
             hits = hits.Select(static hit => new
@@ -2658,6 +2751,7 @@ public sealed class ToolCatalog
                 line = hit.Line,
                 text = hit.Text,
                 context = hit.Context.Count > 0 ? hit.Context : null,
+                routine = RoutineView(hit.Routine),
             }).ToList(),
         });
     }

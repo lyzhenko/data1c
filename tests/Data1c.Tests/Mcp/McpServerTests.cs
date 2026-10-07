@@ -559,6 +559,37 @@ public sealed class McpServerTests
     }
 
     [Fact]
+    public async Task Поиск_по_тексту_показывает_процедуру_находки()
+    {
+        // T-1 из внешнего отзыва: строка без процедуры бесполезна при разборе легаси — агент
+        // вынужден считать принадлежность вручную. Проверяем и границы, и источник процедур.
+        var responses = await ExchangeAsync(
+            InitializeKnown,
+            ToolCall(2, "grep", """{"pattern":"НайтиПоНаименованию"}"""));
+
+        var payload = Json(ContentText(responses, 2));
+
+        // Процедуры берутся из индекса, а если его нет — из разбора в памяти; в тестовой сессии
+        // индекса может не быть, поэтому принимаем оба источника, но требуем, чтобы он был назван.
+        string[] routineSources = ["index", "analysis"];
+        Assert.Contains(Text(payload["routineSource"]), routineSources);
+
+        var hit = payload["hits"]!.AsArray()[0]!;
+        var routine = hit["routine"];
+        Assert.NotNull(routine);
+
+        var id = Text(routine!["id"]);
+        Assert.StartsWith("routine:module:", id, StringComparison.Ordinal);
+        Assert.Contains(SampleDump.CommonModuleBslPath, id, StringComparison.Ordinal);
+        Assert.False(string.IsNullOrEmpty(Text(routine["name"])));
+
+        var start = routine["startLine"]!.GetValue<int>();
+        var end = routine["endLine"]!.GetValue<int>();
+        var line = hit["line"]!.GetValue<int>();
+        Assert.True(start <= line && line <= end, $"строка {line} не попадает в процедуру {start}-{end}");
+    }
+
+    [Fact]
     public async Task Поиск_по_тексту_уважает_регистр_расширения_и_пути()
     {
         var sensitive = await ExchangeAsync(
