@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json.Nodes;
 using Data1c.Core.Analysis;
 using Data1c.Core.Dump;
+using Data1c.Core.Graph;
 using Data1c.Mcp;
 using Xunit;
 
@@ -178,6 +179,27 @@ public sealed class MetadataSectionsTests
         // Детали формы — не счётчики: списков в режиме summary нет.
         Assert.Null(form["attributes"]);
         Assert.Null(form["handlers"]);
+    }
+
+    [Fact]
+    public async Task Схема_инструмента_объявляет_аргументы_из_подсказки()
+    {
+        var responses = await ExchangeAsync(
+            SmallSession(),
+            InitializeKnown,
+            """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""");
+
+        var metadata = Result(responses, 2)["tools"]!.AsArray().Single(tool => Text(tool!["name"]) == "metadata")!;
+        var properties = metadata["inputSchema"]!["properties"]!.AsObject();
+
+        // Именно эти аргументы называет подсказка при обрезке: схема и подсказка обязаны совпадать.
+        foreach (var argument in new[] { "id", "depth", "maxChildren", "sections", "summary", "offset", "usages", "usageContext" })
+        {
+            Assert.True(properties.ContainsKey(argument), "в схеме metadata нет аргумента " + argument);
+        }
+
+        var allowed = properties["sections"]!["enum"]!.AsArray().Select(Text).ToList();
+        Assert.Equal(MetadataSections.All, allowed);
     }
 
     /// <summary>Выгрузка с документом: три реквизита, табличная часть, форма, команда и макет.</summary>
