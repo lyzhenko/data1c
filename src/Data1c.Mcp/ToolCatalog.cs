@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -2311,16 +2312,150 @@ public sealed class ToolCatalog
         _ => "none",
     };
 
+    /// <summary>
+    /// Перечитать выгрузку после правки модулей. С аргументом <c>paths</c> обновляются только
+    /// указанные модули — тем же механизмом, что и у наблюдателя за выгрузкой, поэтому это доли
+    /// секунды; без него запускается полная перезагрузка выгрузки. Ответ в обоих режимах
+    /// машинно-цепляемый: что обновилось, сколько это заняло и что ещё отличается от индекса.
+    /// </summary>
     private ToolSpec ReloadTool() => new(
         "reload",
         "Перечитать выгрузку заново: сбрасывает разбор и кеш исходников, чтобы поиск и граф увидели "
-        + "изменения после правки модулей. Разбор продолжится в фоне, следите через status.",
-        [],
-        (_, _) =>
+        + "изменения после правки модулей. С аргументом paths переиндексируются только указанные "
+        + "модули BSL (доли секунды вместо минут), без него — полная перезагрузка всей выгрузки. "
+        + "Разбор продолжится в фоне, следите через status.",
+        [
+            new ToolParameter(
+                "paths",
+                "array",
+                "Пути модулей относительно корня выгрузки, например "
+                + "[\"CommonModules/АТОбщегоНазначенияСервер/Ext/Module.bsl\"]. Указаны — "
+                + "переиндексируются только эти модули; не указаны — полная перезагрузка."),
+        ],
+        (arguments, _) => Task.FromResult(ReloadResponse(arguments)));
+
+    /// <summary>
+    /// Ответ инструмента reload. Без paths — полная перезагрузка, с paths — частичная
+    /// переиндексация указанных модулей.
+    /// </summary>
+    private string ReloadResponse(ToolArguments arguments)
+    {
+        var paths = arguments.GetStringList("paths");
+        if (paths is null && !arguments.Has("paths"))
+        {
+            return FullReloadResponse();
+        }
+
+        var outcome = Session.ReindexModules(paths ?? []);
+        if (outcome.Done)
+        {
+            return Render.JsonOf(new
+            {
+                mode = "partial",
+                reindexed = true,
+                modules = outcome.Modules,
+                counts = WrittenCounts(outcome.Written),
+                seconds = Seconds(outcome.Written?.Duration),
+                compareSeconds = Seconds(outcome.CompareDuration),
+                dumpChange = ChangeView(outcome.Change),
+                dumpFreshAfter = Session.DumpChange?.IsEmpty,
+                state = Session.State,
+            });
+        }
+
+        // Полная перезагрузка — единственный путь, когда индекса нет или он ещё не собран:
+        // инструмент её и выполняет, а не только советует.
+        var fullReload = outcome.NeedsFullReload;
+        if (fullReload)
         {
             Session.Reload();
-            return Task.FromResult($"Разбор запущен заново. Состояние: {Session.State}");
+        }
+
+        return Render.JsonOf(new
+        {
+            mode = fullReload ? "full" : "partial",
+            reindexed = false,
+            modules = outcome.Modules,
+            unknown = outcome.Unknown.Count > 0 ? outcome.Unknown : null,
+            dumpChange = ChangeView(outcome.Change),
+            reason = outcome.Reason,
+            hint = outcome.Hint,
+            fullReloadStarted = fullReload,
+            state = Session.State,
+            message = fullReload
+                ? "Частичная переиндексация невозможна: запущена полная перезагрузка выгрузки."
+                : "Индекс не обновлялся: исправьте запрос по подсказке hint.",
         });
+    }
+
+    /// <summary>
+    /// Полная перезагрузка выгрузки: прежнее поведение инструмента reload. Перед запуском
+    /// считается сводка изменений — иначе ответ не показывал бы, что именно устарело.
+    /// </summary>
+    private string FullReloadResponse()
+    {
+        var compare = Stopwatch.StartNew();
+        var change = SafeDumpChange();
+        compare.Stop();
+
+        Session.Reload();
+
+        return Render.JsonOf(new
+        {
+            mode = "full",
+            reindexed = false,
+            fullReloadStarted = true,
+            dumpChange = ChangeView(change),
+            compareSeconds = Seconds(compare.Elapsed),
+            state = Session.State,
+            message = "Полная перезагрузка запущена: разбор идёт в фоне, состояние смотрите в status.",
+        });
+    }
+
+    /// <summary>Сводка изменений выгрузки: свежая сверка, а если она не удалась — прежняя.</summary>
+    private DumpChange? SafeDumpChange()
+    {
+        try
+        {
+            return Session.CheckDumpChange() ?? Session.DumpChange;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            _ = exception;
+            return Session.DumpChange;
+        }
+    }
+
+    /// <summary>Сводка изменений выгрузки — та же форма, что у инструмента status.</summary>
+    private static object? ChangeView(DumpChange? change) =>
+        change is null
+            ? null
+            : new
+            {
+                added = change.Added,
+                changed = change.Changed,
+                removed = change.Removed,
+                total = change.Total,
+                fresh = change.IsEmpty,
+            };
+
+    /// <summary>Сколько узлов, связей, символов и вызовов записала частичная переиндексация.</summary>
+    private static object? WrittenCounts(IndexWriteResult? written) =>
+        written is null
+            ? null
+            : new
+            {
+                nodes = written.Nodes,
+                edges = written.Edges,
+                symbols = written.Symbols,
+                calls = written.Calls,
+                metadataRefs = written.MetadataRefs,
+                files = written.Files,
+            };
+
+    /// <summary>Секунды с двумя знаками: и время записи, и время сверки выгрузки.</summary>
+    private static double? Seconds(TimeSpan? duration) =>
+        duration is null ? null : Math.Round(duration.Value.TotalSeconds, 2);
 
     /// <summary>Готовое совпадение: где найдено, из какого источника и какому объекту принадлежит файл.</summary>
     private sealed record GrepHit(

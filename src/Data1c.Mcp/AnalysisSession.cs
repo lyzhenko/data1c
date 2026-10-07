@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Data1c.Core.Analysis;
 using Data1c.Core.Dump;
 using Data1c.Core.Graph;
@@ -375,6 +376,240 @@ public sealed class AnalysisSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// Итог частичной переиндексации выбранных модулей. Если <see cref="Done"/> ложно,
+    /// переиндексации не было: <see cref="Reason"/> объясняет почему, <see cref="Hint"/> — что
+    /// делать вместо неё, а <see cref="NeedsFullReload"/> говорит, что частичный путь невозможен
+    /// в принципе и выручает только <see cref="Reload"/>.
+    /// </summary>
+    /// <param name="Done">Модули записаны в индекс, индекс переоткрыт.</param>
+    /// <param name="Modules">Нормализованные пути модулей из запроса.</param>
+    /// <param name="Unknown">Пути, которых нет в индексе: такие модули разбирает только полная сборка.</param>
+    /// <param name="Written">Счётчики и время записи, как их вернул <see cref="IndexWriter.WriteModuleFiles"/>.</param>
+    /// <param name="Change">Сводка изменений выгрузки на момент вызова; null — сравнивать не с чем.</param>
+    /// <param name="CompareDuration">Сколько заняла сверка файлов выгрузки с индексом.</param>
+    /// <param name="Reason">Почему частичная переиндексация не выполнена.</param>
+    /// <param name="Hint">Что делать вместо неё.</param>
+    /// <param name="NeedsFullReload">Помогает только полная перезагрузка.</param>
+    public sealed record ReindexOutcome(
+        bool Done,
+        IReadOnlyList<string> Modules,
+        IReadOnlyList<string> Unknown,
+        IndexWriteResult? Written,
+        DumpChange? Change,
+        TimeSpan CompareDuration,
+        string? Reason,
+        string? Hint,
+        bool NeedsFullReload);
+
+    /// <summary>
+    /// Частичная переиндексация указанных модулей: тем же механизмом, что и у наблюдателя за
+    /// выгрузкой, но список модулей задаёт вызывающий. Метаданные из XML не перечитываются,
+    /// поэтому правка одного модуля стоит десятые доли секунды, а не минуты.
+    /// </summary>
+    /// <param name="modulePaths">Пути модулей BSL относительно корня выгрузки.</param>
+    public ReindexOutcome ReindexModules(IReadOnlyList<string> modulePaths)
+    {
+        ArgumentNullException.ThrowIfNull(modulePaths);
+        if (_source is null)
+        {
+            throw new ToolException(_sourceError ?? "Выгрузка недоступна.");
+        }
+
+        var modules = modulePaths
+            .Select(static path => NormalizeModulePath(path))
+            .Where(static path => path.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (modules.Count == 0)
+        {
+            return Refuse(
+                modules,
+                [],
+                "аргумент paths пуст: не указан ни один модуль",
+                "Укажите пути модулей BSL относительно корня выгрузки "
+                + "(например CommonModules/Имя/Ext/Module.bsl) или вызовите reload без paths для полной перезагрузки.");
+        }
+
+        if (_forceRebuild)
+        {
+            // Полная перезагрузка уже запущена: частичная запись легла бы в индекс, который
+            // следующая пересборка тут же заменит.
+            return Refuse(
+                modules,
+                [],
+                "полная перезагрузка уже запущена, индекс ещё не пересобран",
+                "Дождитесь окончания пересборки (status) и повторите вызов.");
+        }
+
+        if (!_request.IncludeBsl)
+        {
+            return Refuse(
+                modules,
+                [],
+                "модули BSL не разбираются (--no-bsl)",
+                "Частичная переиндексация обновляет только модули BSL: нужна полная перезагрузка.",
+                needsFullReload: true);
+        }
+
+        var path = ResolveIndexPath();
+        if (path is null)
+        {
+            return Refuse(
+                modules,
+                [],
+                "индекс не используется (--no-index)",
+                "Без индекса частичная переиндексация невозможна: нужна полная перезагрузка.",
+                needsFullReload: true);
+        }
+
+        if (!IsUsableIndex(path))
+        {
+            return Refuse(
+                modules,
+                [],
+                "индекс ещё не собран",
+                "Частичная переиндексация работает только по готовому индексу: нужна полная перезагрузка.",
+                needsFullReload: true);
+        }
+
+        var foreign = modules.Where(static module => !module.EndsWith(".bsl", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (foreign.Count > 0)
+        {
+            return Refuse(
+                modules,
+                [],
+                "не модуль BSL: " + string.Join(", ", foreign),
+                "Правка XML меняет состав метаданных: нужна полная перезагрузка.");
+        }
+
+        var reader = GetIndexReader();
+        var unknown = reader is null
+            ? modules
+            : [.. modules.Where(module => reader.GetNode("module:" + module) is null)];
+        if (unknown.Count > 0)
+        {
+            return Refuse(
+                modules,
+                unknown,
+                "модуль неизвестен индексу: " + string.Join(", ", unknown),
+                "Модуль появился вместе с новым объектом метаданных: нужна полная сборка "
+                + "(reload без paths), которая разберёт XML метаданных.");
+        }
+
+        // Сводка изменений считается до записи: она описывает, что именно устарело.
+        var compare = Stopwatch.StartNew();
+        var change = SafeCheckDumpChange();
+        compare.Stop();
+
+        if (!WriteModules(modules, out var written))
+        {
+            return new ReindexOutcome(
+                false,
+                modules,
+                unknown,
+                null,
+                change,
+                compare.Elapsed,
+                "индекс не знает часть модулей: " + string.Join(", ", modules),
+                "Нужна полная сборка (reload без paths).",
+                false);
+        }
+
+        if (written is { Nodes: 0 })
+        {
+            // Строки модулей в индексе есть, а файлов в выгрузке нет: обновлять нечего.
+            return new ReindexOutcome(
+                false,
+                modules,
+                [],
+                written,
+                change,
+                compare.Elapsed,
+                "файлы модулей не найдены в выгрузке: " + string.Join(", ", modules),
+                "Полная сборка (reload без paths) уберёт их из индекса.",
+                false);
+        }
+
+        // Если обновлено всё, чем выгрузка отличалась от индекса, индекс снова свежий.
+        if (change is { Removed: 0, ChangedPaths: { } touched }
+            && touched.All(item => modules.Contains(item, StringComparer.OrdinalIgnoreCase)))
+        {
+            _lastChange = new DumpChange(0, 0, 0, change.Total);
+            _lastCheckedAt = DateTimeOffset.Now;
+        }
+
+        _state = $"готов (индекс), обновлено модулей: {modules.Count}";
+        return new ReindexOutcome(true, modules, [], written, change, compare.Elapsed, null, null, false);
+    }
+
+    /// <summary>
+    /// Путь модуля внутри выгрузки — как в индексе: разделители «/», без ведущего слэша.
+    /// Обёртка над <c>DumpPath.Normalize</c> нужна потому, что свойство <see cref="DumpPath"/>
+    /// перекрывает одноимённый класс путей.
+    /// </summary>
+    private static string NormalizeModulePath(string path) => Data1c.Core.Dump.DumpPath.Normalize(path);
+
+    /// <summary>Отказ от частичной переиндексации: причина, что делать вместо неё и признак «нужна полная».</summary>
+    private ReindexOutcome Refuse(
+        IReadOnlyList<string> modules,
+        IReadOnlyList<string> unknown,
+        string reason,
+        string hint,
+        bool needsFullReload = false) =>
+        new(false, modules, unknown, null, _lastChange, TimeSpan.Zero, reason, hint, needsFullReload);
+
+    /// <summary>Сверка выгрузки с индексом для сводки: неудача сверки переиндексацию не отменяет.</summary>
+    private DumpChange? SafeCheckDumpChange()
+    {
+        try
+        {
+            return CheckDumpChange();
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or SqliteException or InvalidOperationException)
+        {
+            _failure = exception;
+            return _lastChange;
+        }
+    }
+
+    /// <summary>
+    /// Запись модулей в индекс: общий путь для наблюдателя за выгрузкой и инструмента reload.
+    /// После записи индекс переоткрывается, а кеш исходных текстов сбрасывается — иначе инструмент
+    /// code отдал бы старый текст отредактированного модуля.
+    /// </summary>
+    /// <returns>false, если индекс не знает часть модулей: тогда нужна полная сборка.</returns>
+    private bool WriteModules(IReadOnlyList<string> modules, out IndexWriteResult? written)
+    {
+        var path = ResolveIndexPath()!;
+        _state = $"частичная переиндексация: модулей {modules.Count}";
+
+        // Метаданные из XML не перечитываются: владелец и вид модуля берутся из индекса,
+        // поэтому обновление стоит секунды, а не минуты.
+        using (var index = SqliteIndex.Open(path))
+        {
+            written = new IndexWriter(index).WriteModuleFiles(_source!, modules, Platform);
+        }
+
+        if (written is null)
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            _index?.Dispose();
+            _index = null;
+            _indexGraph = null;
+            _reader = null;
+            _code = new SourceCodeReader(_source!);
+        }
+
+        OpenIndex(path);
+        return true;
+    }
+
     /// <summary>Настройки полного разбора выгрузки.</summary>
     private AnalysisOptions CreateAnalysisOptions() => new()
     {
@@ -436,32 +671,13 @@ public sealed class AnalysisSession : IDisposable
             modules.Add(file);
         }
 
-        _state = $"частичная переиндексация: модулей {modules.Count}";
-
-        // Метаданные из XML не перечитываются: владелец и вид модуля берутся из индекса,
-        // поэтому обновление стоит секунды, а не минуты.
-        IndexWriteResult? written;
-        using (var index = SqliteIndex.Open(path))
-        {
-            written = new IndexWriter(index).WriteModuleFiles(_source, modules, Platform);
-        }
-
-        if (written is null)
+        if (!WriteModules(modules, out _))
         {
             // Среди модулей есть неизвестный индексу: он появился вместе с новым объектом
             // метаданных, и разбирать его нужно полной сборкой.
             return false;
         }
 
-        lock (_gate)
-        {
-            _index?.Dispose();
-            _index = null;
-            _indexGraph = null;
-            _reader = null;
-        }
-
-        OpenIndex(path);
         message = $", обновлено модулей: {modules.Count}";
         return true;
     }
