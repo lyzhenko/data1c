@@ -459,7 +459,7 @@ public sealed class AnalysisSession : IDisposable
             return Refuse(
                 modules,
                 [],
-                "индекс не используется (--no-index)",
+                "индекс не используется (--no-index или индекс некуда положить)",
                 "Без индекса частичная переиндексация невозможна: нужна полная перезагрузка.",
                 needsFullReload: true);
         }
