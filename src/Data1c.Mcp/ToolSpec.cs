@@ -151,6 +151,12 @@ public sealed class ToolArguments
         throw new ToolException($"Аргумент «{name}» должен быть логическим (true/false).");
     }
 
+    /// <summary>
+    /// Аргумент присутствует в вызове: отличает пустой массив от отсутствующего аргумента,
+    /// потому что <see cref="GetStringList"/> в обоих случаях отдаёт null.
+    /// </summary>
+    public bool Has(string name) => _arguments.ContainsKey(name);
+
     /// <summary>Массив строк или null.</summary>
     public IReadOnlyList<string>? GetStringList(string name)
     {
