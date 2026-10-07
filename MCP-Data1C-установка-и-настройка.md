@@ -46,8 +46,8 @@ DeepSeek Harness (профиль desktop или web)
 ### 3.1 Собрать из репозитория
 
 ```powershell
-git clone <адрес-репозитория> D:\dev\data1c
-cd D:\dev\data1c
+git clone <адрес-репозитория> ***\data1c
+cd ***\data1c
 dotnet build Data1C.sln -c Release
 # или штатным скриптом: tools\build.ps1
 ```
@@ -66,7 +66,7 @@ dotnet build Data1C.sln -c Release
 ```powershell
 $dst = "$env:USERPROFILE\.dsh\tools\mcp-data1c"
 New-Item -ItemType Directory -Force $dst | Out-Null
-Copy-Item "D:\dev\data1c\src\Data1c.Mcp\bin\Release\net10.0\*" $dst -Recurse -Force
+Copy-Item "***\data1c\src\Data1c.Mcp\bin\Release\net10.0\*" $dst -Recurse -Force
 ```
 
 ### 3.3 Проверить, что сервер запускается
@@ -91,7 +91,7 @@ $req | & $exe --dump 'D:\1c_conf' --platform 2>&1 | Select-Object -First 2
 Ожидаемая первая строка (диагностика идёт в stderr, stdout занят протоколом):
 
 ```
-data1c-mcp 0.1.0: выгрузка D:\1c_conf; состояние: ожидание; индекс: D:\1c_conf\.data1c\index.db (готов)
+data1c-mcp 0.1.0: выгрузка D:\<Конфигурурация 1с>; состояние: ожидание; индекс: D:\<Конфигурурация 1с>\.data1c\index.db (готов)
 ```
 
 ---
@@ -250,7 +250,7 @@ open → status → search / grep / metadata → similar / conventions → code 
       config:
         serverName: data1c
         transport: stdio
-        command: 'C:\Users\****\.dsh\profiles\mcp_1с\Data1c.Mcp.exe'
+        command: 'C:\Users\<пользователь>\.dsh\profiles\mcp_1с\Data1c.Mcp.exe'
         args:
           - '--dump'
           - 'D:\1c_conf'
