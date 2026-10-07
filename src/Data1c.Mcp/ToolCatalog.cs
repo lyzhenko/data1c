@@ -2593,6 +2593,7 @@ public sealed class ToolCatalog
             indexPath = Session.IndexPath,
             watching = Session.IsWatching,
             rebuilding = Session.IsRebuilding,
+            server = ServerView(),
             dumpChange = DumpChangeView(),
             lastCheckedAt = Session.LastCheckedAt,
             indexStatistics = Session.GetIndexStatistics() is { } index
@@ -2633,6 +2634,38 @@ public sealed class ToolCatalog
             error = Session.Failure?.Message,
             hint = Session.IsOpen ? null : "Выгрузка не открыта: вызовите open с путём к каталогу выгрузки 1С.",
         });
+    }
+
+    /// <summary>
+    /// Что за сборка отвечает на запросы: файл сервера и время его сборки, версия схемы индекса и
+    /// полный список инструментов. Нужно, чтобы «инструмент не найден» сразу объяснялось устаревшей
+    /// сборкой (или закешированным списком на стороне клиента), а не выглядело отсутствующим
+    /// инструментом: фильтрации инструментов у сервера нет, он отдаёт всё, что зарегистрировано.
+    /// </summary>
+    private object ServerView()
+    {
+        var assembly = typeof(ToolCatalog).Assembly;
+        var location = assembly.Location;
+        DateTimeOffset? builtAt = null;
+        if (!string.IsNullOrEmpty(location) && File.Exists(location))
+        {
+            builtAt = File.GetLastWriteTimeUtc(location);
+        }
+
+        var names = _tools
+            .Select(static tool => tool.Name)
+            .OrderBy(static name => name, StringComparer.Ordinal)
+            .ToList();
+
+        return new
+        {
+            assembly = string.IsNullOrEmpty(location) ? assembly.GetName().Name : Path.GetFileName(location),
+            assemblyPath = location,
+            builtAt,
+            schemaVersion = SqliteIndex.SupportedSchemaVersion,
+            toolsCount = names.Count,
+            tools = names,
+        };
     }
 
     /// <summary>

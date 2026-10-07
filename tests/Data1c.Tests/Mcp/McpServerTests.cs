@@ -446,6 +446,39 @@ public sealed class McpServerTests
     }
 
     [Fact]
+    public async Task Состояние_показывает_сборку_и_полный_список_инструментов()
+    {
+        // Ловушка из внешнего отзыва (docs/FEEDBACK-ERP.md): «инструмент не найден» на самом деле
+        // означало устаревшую сборку на стороне клиента. status обязан показывать, какая сборка
+        // отвечает на запросы, какую версию схемы она поддерживает и какие инструменты в ней есть —
+        // и список обязан совпадать с тем, что отдаёт tools/list.
+        var responses = await ExchangeAsync(
+            InitializeKnown,
+            Initialized,
+            ToolCall(2, "status", "{}"),
+            """{"jsonrpc":"2.0","id":3,"method":"tools/list"}""");
+
+        var server = Json(ContentText(responses, 2))["server"]!;
+        Assert.True(server["schemaVersion"]!.GetValue<int>() > 0);
+        Assert.False(string.IsNullOrEmpty(Text(server["assembly"])));
+        Assert.False(string.IsNullOrEmpty(Text(server["assemblyPath"])));
+        Assert.NotNull(server["builtAt"]);
+
+        var registered = server["tools"]!.AsArray()
+            .Select(item => Text(item))
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToList();
+        var declared = Result(responses, 3)["tools"]!.AsArray()
+            .Select(tool => Text(tool!["name"]))
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToList();
+
+        Assert.Equal(declared.Count, server["toolsCount"]!.GetValue<int>());
+        Assert.Equal(declared, registered);
+        Assert.Contains("entrypoints", registered);
+    }
+
+    [Fact]
     public async Task Вызов_без_обязательного_аргумента_помечается_ошибкой()
     {
         var responses = await ExchangeAsync(
