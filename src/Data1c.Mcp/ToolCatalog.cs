@@ -479,7 +479,8 @@ public sealed class ToolCatalog
             new ToolParameter("paths", "array", "Ограничить префиксами путей: [\"Reports/\", \"Documents/Заказ/\" ]."),
             new ToolParameter("limit", "integer", "Предел числа совпадений (1–500, по умолчанию 50)."),
             new ToolParameter("context", "integer", "Сколько строк до и после совпадения показать (0–3, по умолчанию 1)."),
-            new ToolParameter("waitMs", "integer", "Сколько миллисекунд ждать разбор ради имён владельцев (0–600000, по умолчанию 60000; 0 — не ждать)."),
+            new ToolParameter("waitMs", "integer", "Сколько миллисекунд ждать разбор ради имён владельцев (0–600000, по умолчанию 60000; 0 — не ждать). Это НЕ бюджет поиска."),
+            new ToolParameter("deadlineMs", "integer", "Бюджет самого поиска по файлам, в миллисекундах (1000–120000, по умолчанию 8000). При исчерпании бюджета скан останавливается и ответ помечается scan.complete = false: часть выгрузки не просмотрена. Увеличьте бюджет или сузьте paths, чтобы получить полную картину."),
         ],
         (arguments, cancellationToken) => GrepAsync(arguments, cancellationToken));
 
@@ -2787,11 +2788,13 @@ public sealed class ToolCatalog
         var limit = arguments.GetInt("limit", 50, 1, 500);
         var contextLines = arguments.GetInt("context", 1, 0, 3);
         var waitMs = arguments.GetInt("waitMs", 60_000, 0, 600_000);
+        var deadlineMs = arguments.GetInt("deadlineMs", 8_000, 1_000, 120_000);
 
         // Список файлов берётся из индекса — обход каталога выгрузки стоил несколько секунд.
         // У составного источника список не подставляем: нужно показать обе версии перекрытых файлов.
         // Читатель нужен и дальше: по нему находки привязываются к процедурам.
         var reader = source is IVersionedDumpSource ? null : Session.GetIndexReader();
+        var fileList = reader?.FilePaths(extensions, prefixes);
 
         CodeSearchResult found;
         try
@@ -2808,7 +2811,8 @@ public sealed class ToolCatalog
                     CaseSensitive = !ignoreCase,
                     Extensions = extensions,
                     PathPrefixes = prefixes,
-                    Paths = reader?.FilePaths(extensions, prefixes),
+                    Paths = fileList,
+                    Deadline = TimeSpan.FromMilliseconds(deadlineMs),
                 },
                 cancellationToken);
         }
@@ -2894,6 +2898,13 @@ public sealed class ToolCatalog
             truncated = found.Truncated,
             ownersResolved,
             routineSource = reader is not null ? "index" : (Session.Result is not null ? "analysis" : null),
+            scan = new
+            {
+                filesScanned = found.ScannedFiles,
+                totalFiles = fileList?.Count,
+                deadlineMs,
+                complete = !found.Truncated,
+            },
             byOwner = ownerSummary,
             note = BuildGrepNote(overriddenFound, ownersResolved),
             hits = hits.Select(static hit => new
