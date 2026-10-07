@@ -339,7 +339,7 @@ public sealed class GraphQueryService : IGraphQuery
     /// Ищет узлы по идентификатору, имени, синониму, виду объекта или пути файла.
     /// Ранжирование: точное совпадение, затем совпадение с начала строки, затем вхождение.
     /// </summary>
-    public IReadOnlyList<GraphSearchHit> Search(string? query, int limit = 30)
+    public IReadOnlyList<GraphSearchHit> Search(string? query, int limit = 30, int offset = 0)
     {
         if (string.IsNullOrWhiteSpace(query))
         {
@@ -364,6 +364,7 @@ public sealed class GraphQueryService : IGraphQuery
             .OrderBy(static h => h.Score)
             .ThenByDescending(static h => h.Degree)
             .ThenBy(static h => h.Node.Id, StringComparer.Ordinal)
+            .Skip(Math.Max(0, offset))
             .Take(Math.Max(1, limit))
             .Select(h => new GraphSearchHit(
                 h.Node.Id,

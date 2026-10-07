@@ -64,8 +64,8 @@ public interface IGraphQuery
     /// <summary>Сводная статистика графа.</summary>
     GraphStatistics Statistics { get; }
 
-    /// <summary>Поиск узлов по идентификатору, имени, синониму или пути файла.</summary>
-    IReadOnlyList<GraphSearchHit> Search(string? query, int limit = 30);
+    /// <summary>Поиск узлов по идентификатору, имени, синониму или пути файла; <paramref name="offset"/> пропускает первые результаты (добор страницы).</summary>
+    IReadOnlyList<GraphSearchHit> Search(string? query, int limit = 30, int offset = 0);
 
     /// <summary>Разрешение ссылки на узел: идентификатор, часть имени или путь.</summary>
     IReadOnlyList<GraphNode> Resolve(string? reference, int limit = 10);

@@ -41,14 +41,20 @@ public sealed class IndexGraphQuery : IGraphQuery
         }
     }
 
-    public IReadOnlyList<GraphSearchHit> Search(string? query, int limit = 30)
+    public IReadOnlyList<GraphSearchHit> Search(string? query, int limit = 30, int offset = 0)
     {
         if (string.IsNullOrWhiteSpace(query))
         {
             return [];
         }
 
-        var rows = _reader.Search(query, Math.Clamp(limit, 1, 200));
+        var rows = _reader.Search(query, Math.Clamp(limit + offset, 1, 500));
+        if (offset > 0)
+        {
+            // Смещение применяется до подсчёта степеней: считается только показанная страница.
+            rows = [.. rows.Skip(offset)];
+        }
+
         if (rows.Count == 0)
         {
             return [];

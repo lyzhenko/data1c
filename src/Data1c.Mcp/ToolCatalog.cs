@@ -147,6 +147,7 @@ public sealed class ToolCatalog
         [
             new ToolParameter("query", "string", "Имя, синоним, часть идентификатора (Catalog.Товары) или путь файла.", Required: true),
             new ToolParameter("limit", "integer", "Сколько результатов вернуть (1–100, по умолчанию 20)."),
+            new ToolParameter("offset", "integer", "Пропустить первые N результатов (0–500, по умолчанию 0) — добор следующей страницы."),
             new ToolParameter(
                 "kinds",
                 "array",
@@ -163,13 +164,20 @@ public sealed class ToolCatalog
             var query = await QueryAsync(token);
             var text = arguments.RequireString("query");
             var limit = arguments.GetInt("limit", 20, 1, 100);
+            var offset = arguments.GetInt("offset", 0, 0, 500);
             var kinds = ParseKinds(arguments.GetStringList("kinds"));
             var includeNested = arguments.GetBool("includeNested", true);
             var metadataKinds = arguments.GetStringList("metadataKinds");
 
-            var hits = query.Search(text, kinds is null ? limit : Math.Min(100, limit * 4));
-            var filtered = hits
+            // Берём на один элемент больше страницы и столько же пропускаем: лишний элемент честно
+            // говорит, что результаты не кончились, а смещение отдаёт следующую страницу.
+            var fetch = Math.Clamp(offset + limit + 1, 1, 200);
+            var hits = query.Search(text, fetch, offset);
+            // Совпадения после фильтра видов считаются ДО усечения: иначе «есть ещё» всегда false.
+            var matched = hits
                 .Where(hit => kinds is null || kinds.Contains(hit.Kind))
+                .ToList();
+            var filtered = matched
                 .Take(limit)
                 .Select(hit => new
                 {
@@ -223,13 +231,24 @@ public sealed class ToolCatalog
 
             if (results.Count == 0 && nestedView.Count == 0)
             {
-                return $"Ничего не найдено по запросу «{text}». Попробуйте часть имени, синоним или путь файла.";
+                return offset > 0
+                    ? Render.JsonOf(new
+                    {
+                        query = text,
+                        offset,
+                        found = 0,
+                        hasMore = false,
+                        note = $"По запросу «{text}» больше результатов нет: смещение {offset} вышло за конец списка.",
+                    })
+                    : $"Ничего не найдено по запросу «{text}». Попробуйте часть имени, синоним или путь файла.";
             }
 
             return Render.JsonOf(new
             {
                 query = text,
+                offset,
                 found = results.Count,
+                hasMore = matched.Count > results.Count,
                 total = hits.Count,
                 results,
                 nestedFound = nestedView.Count,

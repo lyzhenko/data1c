@@ -590,6 +590,38 @@ public sealed class McpServerTests
     }
 
     [Fact]
+    public async Task Поиск_отдаёт_страницы_по_offset()
+    {
+        // T-5 из внешнего отзыва: «found: 6, total: 24, а добраться до остальных нельзя».
+        // Теперь смещение отдаёт следующую страницу, а hasMore говорит, что результаты не кончились.
+        // Сколько всего совпадений — нужно, чтобы проверка не зависела от состава тестовой выгрузки.
+        var all = Json(ContentText(
+            await ExchangeAsync(InitializeKnown, ToolCall(2, "search", """{"query":"Товары","limit":10}""")), 2));
+        var found = all["found"]!.GetValue<int>();
+
+        var first = Json(ContentText(
+            await ExchangeAsync(InitializeKnown, ToolCall(2, "search", """{"query":"Товары","limit":1}""")), 2));
+        Assert.Equal(0, first["offset"]!.GetValue<int>());
+        Assert.Equal(found > 1, first["hasMore"]!.GetValue<bool>());
+
+        if (found > 1)
+        {
+            var second = Json(ContentText(
+                await ExchangeAsync(InitializeKnown, ToolCall(2, "search", """{"query":"Товары","limit":1,"offset":1}""")), 2));
+            Assert.Equal(1, second["offset"]!.GetValue<int>());
+            Assert.NotEqual(
+                Text(first["results"]!.AsArray()[0]!["id"]),
+                Text(second["results"]!.AsArray()[0]!["id"]));
+        }
+
+        var beyond = Json(ContentText(
+            await ExchangeAsync(InitializeKnown, ToolCall(2, "search", """{"query":"Товары","limit":1,"offset":500}""")), 2));
+        Assert.Equal(500, beyond["offset"]!.GetValue<int>());
+        Assert.Equal(0, beyond["found"]!.GetValue<int>());
+        Assert.False(beyond["hasMore"]!.GetValue<bool>());
+    }
+
+    [Fact]
     public async Task Поиск_по_тексту_уважает_регистр_расширения_и_пути()
     {
         var sensitive = await ExchangeAsync(
