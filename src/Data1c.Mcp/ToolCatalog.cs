@@ -2421,7 +2421,8 @@ public sealed class ToolCatalog
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
         {
-            _ = exception;
+            // Обход выгрузки не удался (например, каталог стал недоступен): reload из-за этого
+            // не отказывает, а сводка остаётся прежней.
             return Session.DumpChange;
         }
     }
