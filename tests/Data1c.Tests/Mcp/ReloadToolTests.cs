@@ -212,6 +212,27 @@ public sealed class ReloadToolTests
         }
     }
 
+    [Fact]
+    public async Task Исчезнувший_из_выгрузки_модуль_не_выглядит_обновлённым()
+    {
+        var root = TestDump.Materialize();
+        try
+        {
+            using var session = await OpenIndexedAsync(root);
+            File.Delete(Path.Combine(root, SampleDump.CommonModuleBslPath.Replace('/', Path.DirectorySeparatorChar)));
+
+            var answer = await CallAsync(session, new JsonObject { ["paths"] = new JsonArray(SampleDump.CommonModuleBslPath) });
+
+            Assert.False(answer["reindexed"]!.GetValue<bool>());
+            Assert.Contains("не найдены в выгрузке", Text(answer["reason"]), StringComparison.Ordinal);
+            Assert.Contains("reload без paths", Text(answer["hint"]), StringComparison.Ordinal);
+        }
+        finally
+        {
+            TestDump.Remove(root);
+        }
+    }
+
     /// <summary>Открывает выгрузку на диске и собирает индекс: частичная переиндексация работает по нему.</summary>
     private static async Task<AnalysisSession> OpenIndexedAsync(string root)
     {

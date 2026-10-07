@@ -485,9 +485,17 @@ public sealed class AnalysisSession : IDisposable
         }
 
         var reader = GetIndexReader();
-        var unknown = reader is null
-            ? modules
-            : [.. modules.Where(module => reader.GetNode("module:" + module) is null)];
+        if (reader is null)
+        {
+            return Refuse(
+                modules,
+                [],
+                "индекс не открывается, проверить модули не по чему",
+                "Частичная переиндексация работает только по открытому индексу: нужна полная перезагрузка.",
+                needsFullReload: true);
+        }
+
+        var unknown = modules.Where(module => reader.GetNode("module:" + module) is null).ToList();
         if (unknown.Count > 0)
         {
             return Refuse(
