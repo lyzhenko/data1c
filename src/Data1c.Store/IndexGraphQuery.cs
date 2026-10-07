@@ -146,7 +146,12 @@ public sealed class IndexGraphQuery : IGraphQuery
     }
 
     /// <summary>Карточка объекта метаданных из таблиц индекса.</summary>
-    public MetadataCard? GetMetadata(string? id, int depth = 3, int maxChildren = 200)
+    public MetadataCard? GetMetadata(
+        string? id,
+        int depth = 3,
+        int maxChildren = 200,
+        IReadOnlyCollection<string>? sections = null,
+        int offset = 0)
     {
         if (string.IsNullOrWhiteSpace(id))
         {
@@ -154,7 +159,9 @@ public sealed class IndexGraphQuery : IGraphQuery
         }
 
         var row = _reader.GetMetadataObject(id.Trim());
-        return row is null ? null : Card(row, Math.Clamp(depth, 1, 4), Math.Clamp(maxChildren, 1, 500));
+        return row is null
+            ? null
+            : Card(row, Math.Clamp(depth, 1, 4), Math.Clamp(maxChildren, 1, 500), sections, Math.Max(0, offset));
     }
 
     /// <summary>Обращения к объекту метаданных из таблицы <c>metadata_refs</c>, при необходимости — одного контекста.</summary>
@@ -163,15 +170,23 @@ public sealed class IndexGraphQuery : IGraphQuery
             ? MetadataUsageSummary.Empty
             : _reader.GetMetadataUsages(id.Trim(), limit, context);
 
-    private MetadataCard Card(MetadataObjectRow row, int depth, int maxChildren)
+    private MetadataCard Card(
+        MetadataObjectRow row,
+        int depth,
+        int maxChildren,
+        IReadOnlyCollection<string>? sections,
+        int offset)
     {
         var references = _reader.ReferencesOf(row.Id, limit: 400);
-        var page = _reader.MetadataChildren(row.Id, maxChildren);
+
+        // Отбор видов и смещение делает SQL: иначе предел вернул бы первые записи по алфавиту,
+        // и запрошенный раздел (например, только формы) остался бы за кадром.
+        var page = _reader.MetadataChildren(row.Id, maxChildren, offset, sections);
 
         var children = new List<MetadataCard>();
         if (depth > 1)
         {
-            children.AddRange(page.Items.Select(item => Item(row.Id, item, depth - 1, maxChildren)));
+            children.AddRange(page.Items.Select(item => Item(row.Id, item, depth - 1, maxChildren, sections, offset)));
         }
 
         // Описание формы читается только для самой формы: у остальных объектов его нет,
@@ -208,15 +223,21 @@ public sealed class IndexGraphQuery : IGraphQuery
     /// Вложенный объект собирается из записи состава: вид, имя, синоним, комментарий и типы,
     /// а его собственные дети — из следующих уровней таблицы состава.
     /// </summary>
-    private MetadataCard Item(string ownerId, MetadataItemRow item, int depth, int maxChildren)
+    private MetadataCard Item(
+        string ownerId,
+        MetadataItemRow item,
+        int depth,
+        int maxChildren,
+        IReadOnlyCollection<string>? sections,
+        int offset)
     {
         var id = $"{ownerId}/{item.Kind}.{item.Name}";
         var children = new List<MetadataCard>();
         var hidden = 0;
         if (depth > 1)
         {
-            var page = _reader.MetadataChildren(id, maxChildren);
-            children.AddRange(page.Items.Select(child => Item(id, child, depth - 1, maxChildren)));
+            var page = _reader.MetadataChildren(id, maxChildren, offset, sections);
+            children.AddRange(page.Items.Select(child => Item(id, child, depth - 1, maxChildren, sections, offset)));
             hidden = Math.Max(0, page.Total - children.Count);
         }
 

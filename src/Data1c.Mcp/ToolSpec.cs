@@ -195,7 +195,8 @@ public static class Render
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
 
-    public static string JsonOf(object value) => TruncateJson(JsonSerializer.Serialize(value, Json));
+    public static string JsonOf(object value, string? truncationHint = null) =>
+        TruncateJson(JsonSerializer.Serialize(value, Json), truncationHint);
 
     /// <summary>
     /// Обрезка ответа-текста: хвост заменяется пометкой. Для JSON так делать нельзя — там своя обрезка.
@@ -210,7 +211,12 @@ public static class Render
     /// в поле <c>head</c> строкой, а рядом — пометка. Обрезка самого документа давала обрывок
     /// строки, который клиент не мог прочитать.
     /// </summary>
-    private static string TruncateJson(string json) =>
+    /// <param name="json">Готовый ответ инструмента.</param>
+    /// <param name="truncationHint">
+    /// Чем именно сузить запрос у этого инструмента: подсказка обязана называть его собственные
+    /// аргументы, иначе агент пробует то, чего у инструмента нет.
+    /// </param>
+    private static string TruncateJson(string json, string? truncationHint) =>
         json.Length <= MaxChars
             ? json
             : JsonSerializer.Serialize(
@@ -218,7 +224,8 @@ public static class Render
                 {
                     truncated = true,
                     limit = MaxChars,
-                    message = $"Ответ не поместился в {MaxChars} символов (было {json.Length}); сузьте запрос (limit, depth, диапазон строк).",
+                    message = $"Ответ не поместился в {MaxChars} символов (было {json.Length}); "
+                        + (truncationHint ?? "сузьте запрос (limit, depth, диапазон строк)."),
                     head = json[..MaxChars],
                 },
                 Json);

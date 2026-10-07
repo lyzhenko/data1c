@@ -87,7 +87,25 @@ public interface IGraphQuery
     IReadOnlyList<GraphNestedHit> SearchNested(string? query, int limit = 20, IReadOnlyCollection<string>? metadataKinds = null);
 
     /// <summary>Карточка объекта метаданных деревом: свойства, состав, типы, ссылки, модули.</summary>
-    MetadataCard? GetMetadata(string? id, int depth = 3, int maxChildren = 200);
+    /// <param name="id">Идентификатор объекта метаданных.</param>
+    /// <param name="depth">Глубина дерева состава.</param>
+    /// <param name="maxChildren">Сколько детей показывать у одного узла дерева.</param>
+    /// <param name="sections">
+    /// Виды разделов состава, которые остаются в дереве (имена видов из разбора выгрузки:
+    /// <c>Attribute</c>, <c>TabularSection</c>, <c>Form</c> и так далее). <see langword="null"/> — все виды.
+    /// Фильтр действует на каждом уровне: у табличной части остаются только запрошенные виды её реквизитов,
+    /// а <see cref="MetadataCard.ChildrenNotShown"/> считает не показанные дети того же вида.
+    /// </param>
+    /// <param name="offset">
+    /// Сколько первых детей пропустить в каждом узле дерева: вместе с <paramref name="maxChildren"/>
+    /// даёт добор хвоста раздела. Считается после фильтра <paramref name="sections"/>.
+    /// </param>
+    MetadataCard? GetMetadata(
+        string? id,
+        int depth = 3,
+        int maxChildren = 200,
+        IReadOnlyCollection<string>? sections = null,
+        int offset = 0);
 
     /// <summary>
     /// Кто и в каком контексте обращается к объекту метаданных: счётчики по контекстам и видам связи,

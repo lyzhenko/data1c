@@ -671,11 +671,32 @@ public sealed class ToolCatalog
         + "по ним агент находит образцы работы с объектом. "
         + "Аргумент usageContext оставляет в usages один контекст, например только чтение в запросах: "
         + "счётчики, читатели и примеры тогда пересчитываются по нему. "
+        + "Аргумент sections оставляет в дереве только запрошенные виды разделов, offset пропускает первые "
+        + "дети раздела вместе с maxChildren, а summary отвечает одними счётчиками состава — так крупный "
+        + "объект (сотни реквизитов и десятки табличных частей) читается без обрезки ответа по длине. "
         + "Нужен, чтобы писать код по реальной структуре объекта. Пример: id=\"Catalog.Товары\".",
         [
             new ToolParameter("id", "string", "Идентификатор: Catalog.Товары, Document.Заказ, Document.Заказ/TabularSection.Строки.", Required: true),
             new ToolParameter("depth", "integer", "Глубина дерева состава (1–4, по умолчанию 3)."),
             new ToolParameter("maxChildren", "integer", "Сколько детей показывать у одного узла (1–500, по умолчанию 200)."),
+            new ToolParameter(
+                "sections",
+                "array",
+                "Оставить в дереве только эти виды разделов: Attribute — реквизит, TabularSection — табличная часть, "
+                + "Form — форма, Command — команда, Template — макет, Dimension — измерение, Resource — ресурс, "
+                + "EnumValue — значение перечисления, Parameter — параметр. Без аргумента — все виды.",
+                Values: MetadataSections.All),
+            new ToolParameter(
+                "summary",
+                "boolean",
+                "Отвечать только счётчиками: по каждому виду раздела число элементов состава, без деревьев и без "
+                + "примеров обращений. Раздел usages (счётчики) остаётся. Числа считаются по всему составу, "
+                + "поэтому depth, maxChildren и offset на них не влияют."),
+            new ToolParameter(
+                "offset",
+                "integer",
+                "Сколько первых детей пропустить в каждом узле дерева (0–500, по умолчанию 0): вместе с maxChildren "
+                + "добирает хвост раздела."),
             new ToolParameter("usages", "integer", "Сколько обращений показать в разделе usages (1–500, по умолчанию 20); счётчики всегда полные."),
             new ToolParameter(
                 "usageContext",
@@ -691,10 +712,19 @@ public sealed class ToolCatalog
             var id = arguments.RequireString("id");
             var depth = arguments.GetInt("depth", 3, 1, 4);
             var maxChildren = arguments.GetInt("maxChildren", 200, 1, 500);
+            var offset = arguments.GetInt("offset", 0, 0, 500);
             var usages = arguments.GetInt("usages", 20, 1, 500);
             var usageContext = UsageContext(arguments);
+            var sections = Sections(arguments);
+            var summary = arguments.GetBool("summary", false);
 
-            var card = query.GetMetadata(id, depth, maxChildren);
+            // Режим summary считает весь состав: урезанные пределом числа агент принял бы за полные.
+            var card = query.GetMetadata(
+                id,
+                summary ? MetadataSummaryDepth : depth,
+                summary ? MetadataSummaryMaxChildren : maxChildren,
+                sections,
+                summary ? 0 : offset);
             if (card is null)
             {
                 var candidates = query.Search(id, 10).Select(hit => hit.Id).ToList();
@@ -704,7 +734,14 @@ public sealed class ToolCatalog
 
             // Обращения к объекту идут в начало карточки, до дерева состава: у крупных объектов
             // ответ обрезается пределом длины, и раздел usages должен пережить обрезку.
-            var usageView = UsageView(query.GetMetadataUsages(card.Id, usages, usageContext));
+            var usageView = UsageView(
+                query.GetMetadataUsages(card.Id, usages, usageContext),
+                withExamples: !summary);
+
+            if (summary)
+            {
+                return Render.JsonOf(MetadataSummaryView(card, usageView), MetadataTruncationHint);
+            }
 
             var root = MetadataNode(card, usageView);
             root["uuid"] = card.Uuid;
@@ -748,8 +785,183 @@ public sealed class ToolCatalog
                 root["form"] = FormView(form, maxChildren);
             }
 
-            return Render.JsonOf(root);
+            return Render.JsonOf(root, MetadataTruncationHint);
         });
+
+    /// <summary>
+    /// Глубина и предел ветки для счётчиков режима <c>summary</c>: счётчики обязаны описывать весь состав,
+    /// а не ту его часть, которую показало бы дерево при заданных агентом пределах.
+    /// </summary>
+    private const int MetadataSummaryDepth = 4;
+
+    /// <summary>Предел числа детей на узел в режиме <c>summary</c>: предел чтения таблицы состава.</summary>
+    private const int MetadataSummaryMaxChildren = 500;
+
+    /// <summary>
+    /// Подсказка при обрезке ответа <c>metadata</c>: названы только те аргументы, которые у инструмента есть,
+    /// иначе агент пробует <c>limit</c> и диапазон строк, которых здесь нет.
+    /// </summary>
+    private const string MetadataTruncationHint =
+        "сузьте запрос: summary=true — счётчики состава по видам разделов, sections — только нужные виды "
+        + "(Attribute, TabularSection, Form и так далее), depth и maxChildren — глубина и размер ветки, "
+        + "offset — добор хвоста раздела, usages — сколько примеров обращений показать.";
+
+    /// <summary>
+    /// Виды разделов из аргумента <c>sections</c> в канонической записи: неизвестное значение отвергается
+    /// со списком допустимых, чтобы агент видел причину, а не пустой раздел. Повторы схлопываются.
+    /// </summary>
+    private static IReadOnlyList<string>? Sections(ToolArguments arguments)
+    {
+        var values = arguments.GetStringList("sections");
+        if (values is null)
+        {
+            return null;
+        }
+
+        var result = new List<string>(values.Count);
+        foreach (var value in values)
+        {
+            var known = MetadataSections.Known(value) ?? throw new ToolException(
+                $"Недопустимое значение sections: «{value}». Возможные виды разделов: {string.Join(", ", MetadataSections.All)}.");
+            if (!result.Contains(known, StringComparer.Ordinal))
+            {
+                result.Add(known);
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Ответ режима <c>summary</c>: счётчики состава по видам разделов вместо деревьев и примеров.
+    /// Считается всё дерево, а не только корень: у документа реквизиты лежат и в нём самом, и внутри
+    /// табличных частей, и агент должен видеть обе части. Поля самой карточки остаются, потому что
+    /// по ним агент решает, куда спускаться дальше; ссылки и детали формы — нет, это не счётчики.
+    /// </summary>
+    private static JsonObject MetadataSummaryView(MetadataCard card, JsonObject usages)
+    {
+        var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+        var partial = false;
+        CountSections(card, counts, ref partial);
+
+        var view = new JsonObject
+        {
+            ["id"] = card.Id,
+            ["kind"] = card.Kind,
+            ["name"] = card.Name,
+        };
+
+        if (!string.IsNullOrWhiteSpace(card.Synonym))
+        {
+            view["synonym"] = card.Synonym;
+        }
+
+        if (!string.IsNullOrWhiteSpace(card.Comment))
+        {
+            view["comment"] = card.Comment;
+        }
+
+        if (card.Types.Count > 0)
+        {
+            var types = new JsonArray();
+            foreach (var type in card.Types)
+            {
+                types.Add(type);
+            }
+
+            view["types"] = types;
+        }
+
+        // usages — единственный раздел подробностей, который остаётся в режиме счётчиков:
+        // он объясняет, кто читает объект, и раньше других переживал обрезку ответа.
+        view["usages"] = usages;
+        view["uuid"] = card.Uuid;
+        view["file"] = card.SourcePath;
+        view["isTopLevel"] = card.IsTopLevel;
+        view["parent"] = card.ParentId;
+
+        var properties = new JsonObject();
+        foreach (var property in card.Properties)
+        {
+            properties[property.Key] = property.Value;
+        }
+
+        view["properties"] = properties.Count > 0 ? properties : null;
+
+        var modules = new JsonArray();
+        foreach (var path in card.ModulePaths)
+        {
+            modules.Add(new JsonObject { ["path"] = path });
+        }
+
+        view["modules"] = modules.Count > 0 ? modules : null;
+
+        if (card.Form is { } form)
+        {
+            view["form"] = FormCountsView(form);
+        }
+
+        var sections = new JsonArray();
+        var total = 0;
+        foreach (var group in counts.OrderByDescending(static pair => pair.Value).ThenBy(static pair => pair.Key, StringComparer.Ordinal))
+        {
+            sections.Add(new JsonObject
+            {
+                ["kind"] = group.Key,
+                ["count"] = group.Value,
+            });
+
+            total += group.Value;
+        }
+
+        view["sectionCounts"] = sections;
+        view["total"] = total;
+
+        // Счётчики честны только тогда, когда в них попал весь состав: глубина 4 и предел 500
+        // на узел у крупнейших объектов ERP ещё не достигались, но обещать этого нельзя.
+        if (partial)
+        {
+            view["partial"] = true;
+        }
+
+        return view;
+    }
+
+    /// <summary>
+    /// Считает элементы состава по видам разделов во всём дереве карточки. <paramref name="partial"/>
+    /// поднимается, если какой-то узел не поместился в предел: тогда числа — не весь состав.
+    /// </summary>
+    private static void CountSections(MetadataCard card, Dictionary<string, int> counts, ref bool partial)
+    {
+        if (card.ChildrenNotShown > 0)
+        {
+            partial = true;
+        }
+
+        foreach (var child in card.Children)
+        {
+            counts[child.Kind] = counts.GetValueOrDefault(child.Kind) + 1;
+            CountSections(child, counts, ref partial);
+        }
+    }
+
+    /// <summary>Счётчики состава формы: в режиме <c>summary</c> списки элементов и обработчиков не нужны.</summary>
+    private static JsonObject FormCountsView(FormModel form) => new()
+    {
+        ["name"] = form.Name,
+        ["kind"] = form.Kind switch
+        {
+            FormKind.Managed => "Managed",
+            FormKind.Ordinary => "Ordinary",
+            _ => null,
+        },
+        ["file"] = form.SourcePath,
+        ["attributesCount"] = form.Attributes.Count,
+        ["elementsCount"] = form.Elements.Count,
+        ["commandsCount"] = form.Commands.Count,
+        ["handlersCount"] = form.Handlers.Count,
+        ["handlersResolved"] = form.Handlers.Count(static handler => handler.Resolved),
+    };
 
     /// <summary>
     /// Контекст обращений из аргумента <c>usageContext</c>: <see langword="null"/> — фильтра нет,
@@ -780,7 +992,12 @@ public sealed class ToolCatalog
     /// это видно. Счётчики берутся из полного набора обращений, а списки уже обрезаны лимитом.
     /// При фильтре по контексту раздел помечается: видно, что счётчики описывают только его.
     /// </summary>
-    private static JsonObject UsageView(MetadataUsageSummary usage)
+    /// <param name="usage">Сводка обращений к объекту.</param>
+    /// <param name="withExamples">
+    /// <see langword="false"/> — только счётчики: режим <c>summary</c> отвечает без примеров,
+    /// чтобы ответ крупного объекта не разрастался списками читателей и обращений.
+    /// </param>
+    private static JsonObject UsageView(MetadataUsageSummary usage, bool withExamples = true)
     {
         var view = new JsonObject
         {
@@ -810,6 +1027,17 @@ public sealed class ToolCatalog
             }
 
             view["byKind"] = kinds;
+        }
+
+        if (!withExamples)
+        {
+            if (usage.Total > 0)
+            {
+                view["hint"] = "Примеры обращений скрыты режимом summary: перезапросите metadata без summary, "
+                    + "чтобы увидеть модули-читатели и обращения со строками.";
+            }
+
+            return view;
         }
 
         if (usage.Readers.Count > 0)
