@@ -250,7 +250,7 @@ open → status → search / grep / metadata → similar / conventions → code 
       config:
         serverName: data1c
         transport: stdio
-        command: 'C:\Users\Лыженко Александр\.dsh\profiles\mcp_1с\Data1c.Mcp.exe'
+        command: 'C:\Users\****\.dsh\profiles\mcp_1с\Data1c.Mcp.exe'
         args:
           - '--dump'
           - 'D:\1c_conf'
