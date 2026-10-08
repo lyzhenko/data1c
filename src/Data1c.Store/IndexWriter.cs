@@ -54,12 +54,21 @@ public sealed class IndexWriter
         return _index.WithLock(() =>
         {
             _index.Execute("PRAGMA synchronous=OFF");
+
+            // Полная сборка пишет индекс в стороне от живого файла: сервер собирает его
+            // в «<индекс>.building» и подменяет готовым, поэтому журнал транзакции здесь не нужен —
+            // без него 7,65 ГБ не пишутся дважды. Индексы снимаются и строятся заново после загрузки:
+            // сопровождение деревьев на каждой из 4,8 млн связей дороже одной сортировки готовой таблицы.
+            _index.Execute("PRAGMA journal_mode=OFF");
+            _index.Execute("PRAGMA cache_size=-262144");
+            DropIndexes(_index);
             try
             {
-                using var transaction = _index.Connection.BeginTransaction();
-                var connection = transaction.Connection!;
                 var counters = new Counters();
                 var phase = Stopwatch.StartNew();
+                using (var transaction = _index.Connection.BeginTransaction())
+                {
+                    var connection = transaction.Connection!;
 
                 Clear(connection);
                 Report("очистка", phase);
@@ -91,14 +100,21 @@ public sealed class IndexWriter
                     Report("права", phase);
                 }
 
-                _index.SetMeta("dump_path", result.SourceName);
-                _index.SetMeta("indexed_at", DateTimeOffset.UtcNow.ToString("O"));
-                _index.SetMeta("schema_version", IndexSchema.Version.ToString(System.Globalization.CultureInfo.InvariantCulture));
-                _index.SetMeta("nodes", counters.Nodes.ToString(System.Globalization.CultureInfo.InvariantCulture));
-                _index.SetMeta("edges", counters.Edges.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    _index.SetMeta("dump_path", result.SourceName);
+                    _index.SetMeta("indexed_at", DateTimeOffset.UtcNow.ToString("O"));
+                    _index.SetMeta("schema_version", IndexSchema.Version.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    _index.SetMeta("nodes", counters.Nodes.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    _index.SetMeta("edges", counters.Edges.ToString(System.Globalization.CultureInfo.InvariantCulture));
 
-                WriteCounters(connection, counters, cancellationToken);
-                transaction.Commit();
+                    WriteCounters(connection, counters, cancellationToken);
+                    transaction.Commit();
+                }
+
+                // Индексы строятся после загрузки и попадают в общее время сборки: по нему видно,
+                // во что обошлась отложенная постройка.
+                var indexes = Stopwatch.StartNew();
+                CreateIndexes(_index);
+                Report("индексы", indexes);
                 stopwatch.Stop();
 
                 return new IndexWriteResult(
@@ -115,9 +131,33 @@ public sealed class IndexWriter
             }
             finally
             {
+                // Возврат к обычному режиму: журнал WAL нужен читателям, которые откроют индекс позже.
+                _index.Execute("PRAGMA cache_size=-65536");
+                _index.Execute("PRAGMA journal_mode=WAL");
                 _index.Execute("PRAGMA synchronous=NORMAL");
             }
         });
+    }
+
+    /// <summary>
+    /// Снимает индексы перед массовой загрузкой: вставка миллионов строк не тратит время на перенос
+    /// индексных деревьев. Возвращает их <see cref="CreateIndexes"/> после загрузки.
+    /// </summary>
+    private static void DropIndexes(SqliteIndex index)
+    {
+        foreach (var name in IndexSchema.IndexNames)
+        {
+            index.Execute($"DROP INDEX IF EXISTS {name}");
+        }
+    }
+
+    /// <summary>Строит индексы заново по тем же операторам, что и DDL схемы.</summary>
+    private static void CreateIndexes(SqliteIndex index)
+    {
+        foreach (var statement in IndexSchema.IndexStatements)
+        {
+            index.Execute(statement);
+        }
     }
 
     /// <summary>Сообщает время стадии и запускает отсчёт следующей.</summary>
@@ -1212,6 +1252,7 @@ public sealed class IndexWriter
                  region, parameters, parameters_count, required_count, directives, comment_head)
             VALUES (@nodeId, @module, @owner, @name, @nameLower, @kind, @isExport, @start, @end,
                     @region, @parameters, @parametersCount, @requiredCount, @directives, @comment)
+            RETURNING id
             """;
         var nodeId = insert.Parameters.Add("@nodeId", SqliteType.Text);
         var module = insert.Parameters.Add("@module", SqliteType.Text);
@@ -1237,11 +1278,8 @@ public sealed class IndexWriter
         var termsComment = termsCommand.Parameters.Add("@comment", SqliteType.Text);
         var termsParams = termsCommand.Parameters.Add("@params", SqliteType.Text);
 
-        // Идентификатор символа нужен для связи с таблицей термов: берём фактический rowid,
-        // а не порядковый номер, чтобы связь не разъехалась при любом изменении порядка вставки.
-        using var lastId = connection.CreateCommand();
-        lastId.CommandText = "SELECT last_insert_rowid()";
-
+        // Идентификатор символа нужен для связи с таблицей термов: его отдаёт сам INSERT (RETURNING id),
+        // поэтому отдельный запрос на каждую процедуру не нужен.
         foreach (var moduleInfo in modules)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -1267,8 +1305,10 @@ public sealed class IndexWriter
                 requiredCount.Value = routine.RequiredCount;
                 directives.Value = routine.Directives.Count == 0 ? DBNull.Value : string.Join(", ", routine.Directives);
                 comment.Value = (object?)commentHead ?? DBNull.Value;
-                insert.ExecuteNonQuery();
-                var symbolId = Convert.ToInt64(lastId.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
+
+                // Идентификатор строки приходит тем же оператором (RETURNING): отдельный запрос
+                // last_insert_rowid() на каждую из 582 тысяч процедур стоил десятки секунд.
+                var symbolId = Convert.ToInt64(insert.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
 
                 termsId.Value = symbolId.ToString(System.Globalization.CultureInfo.InvariantCulture);
                 termsName.Value = Tokenize(routine.Name);

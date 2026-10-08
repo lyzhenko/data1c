@@ -50,6 +50,58 @@ public sealed class SqliteIndexTests
     }
 
     [Fact]
+    public void После_полной_записи_индексы_на_месте()
+    {
+        // Полная сборка снимает индексы перед массовой загрузкой и строит их заново после неё
+        // (так вставка 4,8 млн связей не тратит время на перенос деревьев). Если какой-то индекс
+        // забыть вернуть, запросы продолжат работать, но станут медленными — это надо ловить.
+        var path = Path.Combine(Path.GetTempPath(), "data1c-indexes-" + Guid.NewGuid().ToString("N") + ".db");
+        try
+        {
+            var source = SampleDump.Create();
+            var result = new DumpAnalyzer().Analyze(source);
+            using (var index = SqliteIndex.Open(path))
+            {
+                new IndexWriter(index) { IncludeComments = false }.Write(source, result);
+            }
+
+            // Pooling=False: пул соединений держит файл открытым и мешает очистке после проверки.
+            using (var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={path};Pooling=False"))
+            {
+                connection.Open();
+                using var command = connection.CreateCommand();
+                command.CommandText = "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL";
+                var indexes = new List<string>();
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        indexes.Add(reader.GetString(0));
+                    }
+                }
+
+                foreach (var required in new[]
+                {
+                    "idx_edges_source", "idx_edges_target", "idx_nodes_name",
+                    "idx_symbols_module", "idx_refs_target", "idx_items_object", "idx_forms_object",
+                })
+                {
+                    Assert.Contains(required, indexes);
+                }
+
+                Assert.True(indexes.Count >= 20, $"индексов после записи: {indexes.Count}");
+            }
+        }
+        finally
+        {
+            foreach (var file in Directory.EnumerateFiles(Path.GetDirectoryName(path)!, Path.GetFileName(path) + "*"))
+            {
+                File.Delete(file);
+            }
+        }
+    }
+
+    [Fact]
     public void Находит_процедуры_и_определяет_процедуру_по_строке()
     {
         using var fixture = new IndexFixture();

@@ -276,4 +276,24 @@ internal static class IndexSchema
         )
         """,
     ];
+
+    /// <summary>
+    /// Операторы создания индексов: полная загрузка снимает эти индексы и создаёт заново после
+    /// вставки — сопровождение индексных деревьев на каждой из 4,8 млн связей дороже, чем одна
+    /// сортировка по готовой таблице.
+    /// </summary>
+    internal static readonly string[] IndexStatements =
+    [
+        .. Statements.Where(static statement => statement.StartsWith("CREATE INDEX", StringComparison.Ordinal)),
+    ];
+
+    /// <summary>
+    /// Имена индексов из <see cref="IndexStatements"/>: берутся из тех же операторов, поэтому список
+    /// не может разойтись с DDL. В операторе «CREATE INDEX IF NOT EXISTS имя ON …» имя — шестое слово.
+    /// </summary>
+    internal static readonly string[] IndexNames =
+    [
+        .. IndexStatements.Select(static statement =>
+            statement.Split(' ', StringSplitOptions.RemoveEmptyEntries)[5]),
+    ];
 }
