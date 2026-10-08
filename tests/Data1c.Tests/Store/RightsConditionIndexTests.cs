@@ -7,7 +7,7 @@ using Xunit;
 namespace Data1c.Tests.Store;
 
 /// <summary>
-/// Проверки хранения текста условий RLS в индексе (схема v9): условие лежит в
+/// Проверки хранения текста условий RLS в индексе (колонка появилась в схеме v9): условие лежит в
 /// <c>metadata_refs.condition</c> рядом со строкой прав, пишется целиком и ищется по подстроке.
 /// </summary>
 public sealed class RightsConditionIndexTests
@@ -95,7 +95,7 @@ public sealed class RightsConditionIndexTests
     }
 
     [Fact]
-    public void Схема_v9_создаётся_идемпотентно_и_считает_условия()
+    public void Схема_создаётся_идемпотентно_и_считает_условия()
     {
         var path = Path.Combine(Path.GetTempPath(), "data1c-rls-" + Guid.NewGuid().ToString("N") + ".db");
         try
@@ -103,13 +103,12 @@ public sealed class RightsConditionIndexTests
             // Повторное открытие той же базы схему не ломает: колонка условия одна и та же.
             using (var index = SqliteIndex.Open(path))
             {
-                Assert.Equal(9, index.SchemaVersion);
-                Assert.Equal(9, SqliteIndex.SupportedSchemaVersion);
+                Assert.Equal(SqliteIndex.SupportedSchemaVersion, index.SchemaVersion);
             }
 
             using (var index = SqliteIndex.Open(path))
             {
-                Assert.Equal(9, index.SchemaVersion);
+                Assert.Equal(SqliteIndex.SupportedSchemaVersion, index.SchemaVersion);
             }
 
             var source = RlsConditionDump.Create();

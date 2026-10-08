@@ -966,6 +966,47 @@ public sealed class IndexReader
         return symbols.FirstOrDefault(s => s.StartLine <= line && s.EndLine >= line);
     }
 
+    /// <summary>
+    /// Модули, в телах которых встречаются слова запроса FTS5: модули-кандидаты для поиска
+    /// по содержимому, в порядке релевантности (bm25). Пустой список означает, что индекс
+    /// ничего не подтвердил, — тогда вызывающий ищет по файлам, как раньше.
+    /// </summary>
+    /// <param name="query">
+    /// Запрос в синтаксисе FTS5: слова, фраза в кавычках, префикс со звёздочкой. Строит его
+    /// инструмент: полнотекстовый поиск не умеет подстроки и регулярные выражения.
+    /// </param>
+    /// <param name="limit">Сколько модулей вернуть: их тексты потом читаются целиком.</param>
+    public IReadOnlyList<string> SearchModuleText(string query, int limit = 200)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return [];
+        }
+
+        return _index.WithLock(() =>
+        {
+            // Путь берётся из обычной таблицы по rowid: у contentless-таблицы колонки не читаются.
+            using var command = _index.CreateCommand(
+                """
+                SELECT p.path FROM modules_fts JOIN module_paths p ON p.id = modules_fts.rowid
+                WHERE modules_fts MATCH @query
+                ORDER BY bm25(modules_fts)
+                LIMIT @limit
+                """);
+            command.Parameters.AddWithValue("@query", query);
+            command.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, 2000));
+
+            using var reader = command.ExecuteReader();
+            var paths = new List<string>();
+            while (reader.Read())
+            {
+                paths.Add(reader.GetString(0));
+            }
+
+            return (IReadOnlyList<string>)paths;
+        });
+    }
+
     /// <summary>Все процедуры модуля по порядку строк.</summary>
     public IReadOnlyList<SymbolRow> FindSymbolsInModule(string modulePath) => _index.WithLock(() =>
     {

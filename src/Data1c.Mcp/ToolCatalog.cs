@@ -470,7 +470,13 @@ public sealed class ToolCatalog
         "grep",
         "Поиск по тексту файлов выгрузки (BSL, XML): подстрока или регулярное выражение. Ищет во всех "
         + "подключённых источниках (база и расширения) и для каждого совпадения указывает источник и "
-        + "объект-владелец. Пример: найти реквизит в текстах запросов — grep pattern=\"Артикул\" paths=[\"Reports/\"].",
+        + "объект-владелец. Тела модулей лежат в полнотекстовом индексе: по подстроке от трёх знаков "
+        + "модули-кандидаты находятся там, файлы читаются только эти (на ERP это миллисекунды вместо "
+        + "секунд), а строки, контекст и процедуры даёт обычный поиск по тексту — ответ тот же. "
+        + "Блок scan показывает, чем искали: mode=index (индекс подтвердил шаблон, candidates — сколько "
+        + "модулей он предложил) или mode=scan (полный проход по выгрузке: короткий шаблон, регулярное "
+        + "выражение или другой вид файлов). Пример: найти реквизит в текстах запросов — "
+        + "grep pattern=\"Артикул\" paths=[\"Reports/\"].",
         [
             new ToolParameter("pattern", "string", "Что искать: подстрока или регулярное выражение.", Required: true),
             new ToolParameter("regex", "boolean", "Считать pattern регулярным выражением (по умолчанию — подстрока)."),
@@ -480,7 +486,7 @@ public sealed class ToolCatalog
             new ToolParameter("limit", "integer", "Предел числа совпадений (1–500, по умолчанию 50)."),
             new ToolParameter("context", "integer", "Сколько строк до и после совпадения показать (0–3, по умолчанию 1)."),
             new ToolParameter("waitMs", "integer", "Сколько миллисекунд ждать разбор ради имён владельцев (0–600000, по умолчанию 60000; 0 — не ждать). Это НЕ бюджет поиска."),
-            new ToolParameter("deadlineMs", "integer", "Бюджет самого поиска по файлам, в миллисекундах (1000–120000, по умолчанию 8000). При исчерпании бюджета скан останавливается и ответ помечается scan.complete = false: часть выгрузки не просмотрена. Увеличьте бюджет или сузьте paths, чтобы получить полную картину."),
+            new ToolParameter("deadlineMs", "integer", "Бюджет самого поиска по файлам, в миллисекундах (1000–120000, по умолчанию 8000). При исчерпании бюджета скан останавливается и ответ помечается scan.complete = false: часть выгрузки не просмотрена. Увеличьте бюджет или сузьте paths, чтобы получить полную картину. На поиск по индексу бюджет не влияет."),
         ],
         (arguments, cancellationToken) => GrepAsync(arguments, cancellationToken));
 
@@ -3007,12 +3013,35 @@ public sealed class ToolCatalog
         var reader = source is IVersionedDumpSource ? null : Session.GetIndexReader();
         var fileList = reader?.FilePaths(extensions, prefixes);
 
+        // Кандидаты из полнотекстового индекса тел модулей: шаблон ищется здесь, а сами находки
+        // (строки, контекст, процедура) по-прежнему даёт поиск по файлам — только по этим. Индекс
+        // не подсказал ничего — ищем по всей выгрузке, как раньше: так подстрока внутри слова
+        // и регулярное выражение не теряются.
+        var candidates = ModuleTextCandidates(reader, pattern, isRegex, extensions, prefixes);
+
         CodeSearchResult found;
         try
         {
             // Поиск по тексту живёт в ядре (CodeSearchService): своей реализации сканирования у сервера нет.
-            found = new CodeSearchService(source).Search(
-                pattern,
+            found = SearchSource(source, pattern, candidates ?? fileList);
+        }
+        catch (ArgumentException exception)
+        {
+            throw new ToolException($"Шаблон поиска не разобран: {exception.Message}");
+        }
+
+        var byIndex = candidates is not null;
+        if (candidates is not null && found.Hits.Count == 0)
+        {
+            // Индекс отобрал модули, но находок в них нет: шаблон мог не попасть в индекс
+            // (короткий, со знаками, с другим разделением слов) — проходим выгрузку целиком.
+            found = SearchSource(source, pattern, fileList);
+            byIndex = false;
+        }
+
+        CodeSearchResult SearchSource(IDumpSource dumpSource, string query, IReadOnlyList<string>? paths) =>
+            new CodeSearchService(dumpSource).Search(
+                query,
                 new CodeSearchOptions
                 {
                     MaxResults = limit,
@@ -3022,15 +3051,10 @@ public sealed class ToolCatalog
                     CaseSensitive = !ignoreCase,
                     Extensions = extensions,
                     PathPrefixes = prefixes,
-                    Paths = fileList,
+                    Paths = paths,
                     Deadline = TimeSpan.FromMilliseconds(deadlineMs),
                 },
                 cancellationToken);
-        }
-        catch (ArgumentException exception)
-        {
-            throw new ToolException($"Шаблон поиска не разобран: {exception.Message}");
-        }
 
         var composite = source as CompositeDumpSource;
         var files = found.Hits.Select(static entry => entry.Path).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
@@ -3097,6 +3121,10 @@ public sealed class ToolCatalog
             .Select(static group => new { owner = group.Key, count = group.Count() })
             .ToList();
 
+        // Область поиска честно: по индексу просматриваются только тела модулей, поэтому в ответе
+        // видно, что XML не смотрели, и сказано, как поискать и там (note).
+        var scannedExtensions = byIndex ? [".bsl"] : extensions.ToArray();
+
         return Render.JsonOf(new
         {
             pattern,
@@ -3111,13 +3139,16 @@ public sealed class ToolCatalog
             routineSource = reader is not null ? "index" : (Session.Result is not null ? "analysis" : null),
             scan = new
             {
+                mode = byIndex ? "index" : "scan",
+                extensions = scannedExtensions,
+                candidates = candidates?.Count,
                 filesScanned = found.ScannedFiles,
                 totalFiles = fileList?.Count,
                 deadlineMs,
                 complete = !found.Truncated,
             },
             byOwner = ownerSummary,
-            note = BuildGrepNote(overriddenFound, ownersResolved),
+            note = BuildGrepNote(overriddenFound, ownersResolved, byIndex, extensions),
             hits = hits.Select(static hit => new
             {
                 owner = hit.Owner,
@@ -3132,9 +3163,13 @@ public sealed class ToolCatalog
         });
     }
 
-    private static string? BuildGrepNote(bool overridden, bool ownersResolved)
+    private static string? BuildGrepNote(
+        bool overridden,
+        bool ownersResolved,
+        bool byIndex,
+        IReadOnlyCollection<string> extensions)
     {
-        var parts = new List<string>(2);
+        var parts = new List<string>(3);
         if (!ownersResolved)
         {
             parts.Add("Разбор выгрузки ещё идёт, поэтому владельцы не определены: повторите поиск позже "
@@ -3144,6 +3179,14 @@ public sealed class ToolCatalog
         if (overridden)
         {
             parts.Add("Часть файлов перекрыта другим источником (расширением): показаны обе версии, у совпадения указан source.");
+        }
+
+        // Индекс тел модулей отвечает только за BSL: если агент просил и другие файлы, об этом
+        // сказано прямо, иначе пропуск XML выглядел бы как «в выгрузке этого нет».
+        if (byIndex && extensions.Any(extension => !string.Equals(extension, ".bsl", StringComparison.OrdinalIgnoreCase)))
+        {
+            parts.Add("Поиск по индексу просмотрел тела модулей (.bsl), другие файлы (XML) не смотрелись: "
+                + "повторите с extensions=[\".xml\"] или regex=true, чтобы поискать и в них.");
         }
 
         return parts.Count == 0 ? null : string.Join(' ', parts);
@@ -3251,6 +3294,46 @@ public sealed class ToolCatalog
         }
 
         return (byFile, true);
+    }
+
+    /// <summary>
+    /// Модули-кандидаты из полнотекстового индекса тел модулей (<c>modules_fts</c>): если шаблон
+    /// в них есть, читать всю выгрузку незачем — файлы читаются только эти, а находки, строки,
+    /// контекст и границы процедур по-прежнему даёт обычный поиск по тексту, поэтому ответ
+    /// не отличается от полного скана.
+    /// </summary>
+    /// <returns>
+    /// null — индекс не подсказывает (нет индекса, это регулярное выражение, шаблон короче трёх
+    /// знаков, ищем не в модулях или шаблон не подтверждён): тогда поиск идёт по файлам как раньше.
+    /// </returns>
+    private static IReadOnlyList<string>? ModuleTextCandidates(
+        IndexReader? reader,
+        string pattern,
+        bool isRegex,
+        IReadOnlyCollection<string>? extensions,
+        IReadOnlyList<string>? prefixes)
+    {
+        // Регулярное выражение индекс не выражает, а триграммы индексируют подстроки от трёх знаков.
+        if (reader is null || isRegex || pattern.Length < 3)
+        {
+            return null;
+        }
+
+        // Тела модулей — это BSL: если шаблон сужен другими расширениями, индекс не при чём.
+        if (extensions is { Count: > 0 } && !extensions.Contains(".bsl", StringComparer.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var found = reader.SearchModuleText($"\"{pattern.Replace("\"", "\"\"", StringComparison.Ordinal)}\"");
+        if (prefixes is { Count: > 0 })
+        {
+            // Тот же отбор по путям, что и в поиске по файлам: иначе кандидаты из других каталогов
+            // дали бы пустую выдачу и лишний полный проход.
+            found = [.. found.Where(path => prefixes.Any(prefix => path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))];
+        }
+
+        return found.Count == 0 ? null : found;
     }
 
     private static IReadOnlyCollection<string> NormalizeExtensions(IReadOnlyList<string>? values)

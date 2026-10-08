@@ -76,6 +76,9 @@ public sealed class IndexWriter
                 WriteSymbols(source, result.Modules, connection, counters, cancellationToken);
                 Report("символы", phase);
 
+                WriteModuleTexts(source, result.Modules, connection, cancellationToken);
+                Report("тексты модулей", phase);
+
                 WriteMetadata(result, connection, counters, cancellationToken);
                 Report("метаданные", phase);
 
@@ -154,6 +157,10 @@ public sealed class IndexWriter
                 var known = ReadModuleInfo(connection, modulePaths);
                 var parser = new BslModuleParser();
                 var modules = new List<BslModuleInfo>(modulePaths.Count);
+
+                // Тексты уже прочитаны для разбора: полнотекстовый индекс наполняется из них,
+                // а не повторным чтением файлов.
+                var texts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var path in modulePaths)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -179,6 +186,7 @@ public sealed class IndexWriter
                     }
 
                     modules.Add(parser.Parse(new BslModuleSource(path, text, info.OwnerId, info.Kind)));
+                    texts[path] = text;
                 }
 
                 if (modules.Count == 0)
@@ -211,6 +219,11 @@ public sealed class IndexWriter
                 // записать заново, иначе после частичной переиндексации обращения пропадут.
                 WriteMetadataRefs(rows.Edges, connection, counters);
                 WriteSymbols(source, modules, connection, counters, cancellationToken);
+                WriteModuleTexts(
+                    [.. modules.Select(static module => module.Path)],
+                    path => texts.TryGetValue(path, out var body) ? body : null,
+                    connection,
+                    cancellationToken);
                 TouchFiles(source, connection, new IndexScope([.. scopePaths]), counters, cancellationToken);
 
                 // Процедуры, которых раньше не было: вызовы из других модулей шли на внешние
@@ -952,6 +965,111 @@ public sealed class IndexWriter
         }
     }
 
+    /// <summary>
+    /// Тела модулей в полнотекстовый индекс: по нему <c>grep</c> отбирает модули-кандидаты и читает
+    /// только их, а строки, контекст и границы процедур по-прежнему берутся из текста файла.
+    /// </summary>
+    /// <param name="textOf">
+    /// Текст модуля по пути или null, если файла нет. Полная сборка читает его по одному модулю
+    /// (держать в памяти всю выгрузку — 1,2 ГБ на ERP — незачем), частичная переиндексация отдаёт
+    /// уже прочитанное.
+    /// </param>
+    private static void WriteModuleTexts(
+        IReadOnlyList<string> paths,
+        Func<string, string?> textOf,
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        // Путь лежит в обычной таблице: у contentless-таблицы читать колонки нельзя, а rowid
+        // и есть связь между модулем и его полнотекстовой строкой.
+        using var find = connection.CreateCommand();
+        find.CommandText = "SELECT id FROM module_paths WHERE path = @path";
+        var sought = find.Parameters.Add("@path", SqliteType.Text);
+
+        using var add = connection.CreateCommand();
+        add.CommandText = "INSERT INTO module_paths (path) VALUES (@path)";
+        var added = add.Parameters.Add("@path", SqliteType.Text);
+
+        using var lastId = connection.CreateCommand();
+        lastId.CommandText = "SELECT last_insert_rowid()";
+
+        using var delete = connection.CreateCommand();
+        delete.CommandText = "DELETE FROM modules_fts WHERE rowid = @id";
+        var deleted = delete.Parameters.Add("@id", SqliteType.Integer);
+
+        using var insert = connection.CreateCommand();
+        insert.CommandText = "INSERT INTO modules_fts (rowid, text) VALUES (@id, @text)";
+        var rowid = insert.Parameters.Add("@id", SqliteType.Integer);
+        var text = insert.Parameters.Add("@text", SqliteType.Text);
+
+        foreach (var modulePath in paths)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var body = textOf(modulePath);
+            if (body is null)
+            {
+                continue;
+            }
+
+            sought.Value = modulePath;
+            var existing = find.ExecuteScalar();
+            long id;
+            if (existing is null || existing is DBNull)
+            {
+                added.Value = modulePath;
+                add.ExecuteNonQuery();
+                id = Convert.ToInt64(lastId.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
+            }
+            else
+            {
+                id = Convert.ToInt64(existing, System.Globalization.CultureInfo.InvariantCulture);
+            }
+
+            // Строка модуля заменяется целиком: у contentless-таблицы удаление разрешено
+            // (contentless_delete=1), иначе после правки модуля в индексе остались бы старые слова.
+            deleted.Value = id;
+            delete.ExecuteNonQuery();
+            rowid.Value = id;
+            text.Value = body;
+            insert.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Тела модулей полной сборки: файлы выгрузки читаются по одному.</summary>
+    private static void WriteModuleTexts(
+        IDumpSource source,
+        IReadOnlyList<BslModuleInfo> modules,
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        if (modules.Count == 0)
+        {
+            return;
+        }
+
+        var files = new Dictionary<string, DumpFile>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in source.EnumerateFiles(cancellationToken))
+        {
+            if (file.Extension == ".bsl")
+            {
+                files.TryAdd(file.RelativePath, file);
+            }
+        }
+
+        WriteModuleTexts(
+            [.. modules.Select(static module => module.Path)],
+            path => files.TryGetValue(path, out var file) ? ReadModuleText(source, file) : null,
+            connection,
+            cancellationToken);
+    }
+
+    /// <summary>Текст модуля целиком: кодировку определяет читатель выгрузки (UTF-8 или CP1251).</summary>
+    private static string ReadModuleText(IDumpSource source, DumpFile file)
+    {
+        using var stream = source.OpenRead(file);
+        return DumpTextReader.ReadAllText(stream);
+    }
+
     private static void Clear(SqliteConnection connection)
     {
         using var command = connection.CreateCommand();
@@ -959,6 +1077,8 @@ public sealed class IndexWriter
             """
             DELETE FROM nodes_fts;
             DELETE FROM terms_fts;
+            DELETE FROM modules_fts;
+            DELETE FROM module_paths;
             DELETE FROM edges;
             DELETE FROM symbols;
             DELETE FROM metadata_refs;
