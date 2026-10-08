@@ -121,6 +121,51 @@ public sealed class SqliteIndexTests
     }
 
     [Fact]
+    public void Обход_с_фильтром_по_виду_связи_даёт_те_же_узлы_что_без_фильтра()
+    {
+        // Шаг рекурсии называет индекс рёбер явно (INDEXED BY): без этого фильтр по виду связи
+        // заставлял планировщик просматривать все рёбра вида на каждый узел фронта, и neighbors
+        // на ERP отвечал секундами (находка T-9). Здесь проверяется, что подсказка не поменяла ответ.
+        using var fixture = new IndexFixture();
+        var caller = Routine(FirstModule, "МояПроцедура");
+        var callee = Routine(FirstModule, "ДругаяПроцедура");
+
+        foreach (var direction in new[] { "in", "out", "all" })
+        {
+            var all = fixture.Reader.Reach(callee, depth: 2, maxNodes: 200, direction: direction);
+            var calls = fixture.Reader.Reach(callee, depth: 2, maxNodes: 200, direction: direction, kinds: ["Calls"]);
+
+            Assert.NotEmpty(all);
+            Assert.All(calls, hit => Assert.Contains(all, item => item.Id == hit.Id));
+        }
+
+        // Направления «в» и «в обе стороны» идут разными запросами: «в обе стороны» — сумма двух
+        // слагаемых вместо OR, и она обязана совпасть с объединением односторонних обходов.
+        foreach (var kinds in new IReadOnlyCollection<string>?[] { null, ["Calls"] })
+        {
+            var both = fixture.Reader.Reach(callee, depth: 1, maxNodes: 200, direction: "all", kinds: kinds);
+            var incoming = fixture.Reader.Reach(callee, depth: 1, maxNodes: 200, direction: "in", kinds: kinds);
+            var outgoing = fixture.Reader.Reach(callee, depth: 1, maxNodes: 200, direction: "out", kinds: kinds);
+
+            Assert.Equal(
+                both.Select(static hit => hit.Id).Order(StringComparer.Ordinal),
+                incoming.Concat(outgoing).Select(static hit => hit.Id).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal));
+        }
+
+        // Фильтр действительно отсекает другие виды связей: по вызовам цель — вызов метода менеджера,
+        // а обращение к метаданным видно только с фильтром UsesMetadata.
+        var outCalls = fixture.Reader.Reach(callee, depth: 1, maxNodes: 200, direction: "out", kinds: ["Calls"]);
+        Assert.Contains(outCalls, hit => hit.Id == "call:Справочники.Товары.НайтиПоНаименованию");
+        Assert.DoesNotContain(outCalls, hit => hit.Id == "Catalog.Товары");
+
+        var outUsages = fixture.Reader.Reach(callee, depth: 1, maxNodes: 200, direction: "out", kinds: ["UsesMetadata"]);
+        Assert.Contains(outUsages, hit => hit.Id == "Catalog.Товары");
+
+        var inCalls = fixture.Reader.Reach(callee, depth: 1, maxNodes: 200, direction: "in", kinds: ["Calls"]);
+        Assert.Contains(inCalls, hit => hit.Id == caller);
+    }
+
+    [Fact]
     public void Обход_не_зацикливается_и_уважает_лимиты()
     {
         using var fixture = new IndexFixture();

@@ -1625,17 +1625,29 @@ public sealed class IndexReader
     /// Рекурсивная часть обхода связей. Временные таблицы намеренно не используются: индекс
     /// открывается и только на чтение, а создание временной таблицы в этом режиме запрещено.
     /// </summary>
+    /// <remarks>
+    /// Индексы рёбер называются явно (<c>INDEXED BY</c>), потому что при фильтре по виду связи
+    /// планировщик выбирает <c>idx_edges_kind</c> — просмотр всех рёбер этого вида на каждый узел
+    /// фронта: на ERP это 9–16 с вместо миллисекунд (`Catalog.Номенклатура` с
+    /// <c>edgeKinds: ["UsesMetadata"]</c>, направление «в»; замер и план — в <c>docs/BACKLOG.md</c>,
+    /// находка T-9). Вид связи лежит вторым столбцом в <c>idx_edges_source</c> и <c>idx_edges_target</c>,
+    /// поэтому поиск по узлу и виду связи идёт по индексу. Для направления «в обе стороны» рекурсия
+    /// разделена на два слагаемых: условие <c>OR</c> не даёт воспользоваться ни одним из этих индексов.
+    /// </remarks>
     private static (string Walk, string KindPrefix) BuildWalk(string? direction, IReadOnlyCollection<string>? kinds)
     {
         var kindFilter = kinds is { Count: > 0 }
             ? " AND e.kind IN (" + string.Join(", ", kinds.Select(static (_, i) => "@e" + i.ToString(CultureInfo.InvariantCulture))) + ")"
             : string.Empty;
 
+        const string BySource = "SELECT e.target_id, w.depth + 1 FROM edges e INDEXED BY idx_edges_source JOIN walk w ON e.source_id = w.id WHERE w.depth < @depth";
+        const string ByTarget = "SELECT e.source_id, w.depth + 1 FROM edges e INDEXED BY idx_edges_target JOIN walk w ON e.target_id = w.id WHERE w.depth < @depth";
+
         var walk = direction switch
         {
-            "out" => "SELECT e.target_id, w.depth + 1 FROM edges e JOIN walk w ON e.source_id = w.id WHERE w.depth < @depth" + kindFilter,
-            "in" => "SELECT e.source_id, w.depth + 1 FROM edges e JOIN walk w ON e.target_id = w.id WHERE w.depth < @depth" + kindFilter,
-            _ => "SELECT CASE WHEN e.source_id = w.id THEN e.target_id ELSE e.source_id END, w.depth + 1 FROM edges e JOIN walk w ON (e.source_id = w.id OR e.target_id = w.id) WHERE w.depth < @depth" + kindFilter,
+            "out" => BySource + kindFilter,
+            "in" => ByTarget + kindFilter,
+            _ => BySource + kindFilter + " UNION " + ByTarget + kindFilter,
         };
 
         return (walk, "@e");
