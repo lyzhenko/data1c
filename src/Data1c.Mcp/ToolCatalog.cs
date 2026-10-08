@@ -484,9 +484,24 @@ public sealed class ToolCatalog
         ],
         (arguments, cancellationToken) => GrepAsync(arguments, cancellationToken));
 
+    /// <summary>
+    /// Подсказка при обрезке ответа <c>node</c>: названы свои аргументы, а не чужие <c>limit</c>
+    /// и диапазон строк, которых у инструмента нет.
+    /// </summary>
+    private const string NodeTruncationHint =
+        "сузьте запрос: edges — сколько связей показывать в каждую сторону, id — конкретный узел, "
+        + "у объекта метаданных ещё и usageContext.";
+
+    /// <summary>То же для <c>neighbors</c>: у него свои пределы обхода, а не <c>limit</c>.</summary>
+    private const string NeighborsTruncationHint =
+        "сузьте запрос: maxNodes — сколько узлов вернуть, depth — радиус обхода, edgeKinds и nodeKinds — "
+        + "какие связи и узлы нужны, direction — направление связей.";
+
     private ToolSpec NodeTool() => new(
         "node",
-        "Карточка узла конфигурации: вид, имя, файл, теги и связи со строками кода. "
+        "Карточка узла конфигурации: вид, имя, файл, теги, границы процедуры (startLine, endLine) "
+        + "и связи со строками кода. У каждой связи видны модуль и границы процедуры второй стороны "
+        + "(file, startLine, endLine), поэтому цепочку вызовов видно без дополнительных запросов. "
         + "Кто вызывает процедуру и что вызывает она сама — в neighbors с edgeKinds=[\"Calls\"]. "
         + "У объекта метаданных показана короткая сводка обращений (usages): сколько раз и в каком "
         + "контексте его читают, а читатели и примеры строк — в metadata. "
@@ -511,8 +526,11 @@ public sealed class ToolCatalog
             var details = query.GetNode(id) ?? throw new ToolException(
                 $"Узел «{id}» не найден. Уточните идентификатор инструментом search.");
 
-            var incoming = details.Incoming.Take(edges).Select(edge => EdgeView(edge, edge.SourceId, query)).ToList();
-            var outgoing = details.Outgoing.Take(edges).Select(edge => EdgeView(edge, edge.TargetId, query)).ToList();
+            // Границы процедур считаются один раз на вызов: рёбер в ответе до 400, а модулей у них
+            // единицы, поэтому символы модуля читаются по одному разу на файл.
+            var bounds = RoutineBounds.For(Session);
+            var incoming = details.Incoming.Take(edges).Select(edge => EdgeView(edge, edge.SourceId, query, bounds)).ToList();
+            var outgoing = details.Outgoing.Take(edges).Select(edge => EdgeView(edge, edge.TargetId, query, bounds)).ToList();
 
             // Сводка обращений нужна только объектам метаданных: обращения адресуются именно им,
             // а полный список читателей и примеров отдаёт metadata. Списки здесь не нужны — только
@@ -523,18 +541,20 @@ public sealed class ToolCatalog
 
             return Render.JsonOf(new
             {
-                node = NodeView(details.Node),
+                node = NodeView(details.Node, bounds),
                 incomingCount = details.Incoming.Count,
                 outgoingCount = details.Outgoing.Count,
                 usages,
                 incoming,
                 outgoing,
-            });
+            }, NodeTruncationHint);
         });
 
     private ToolSpec NeighborsTool() => new(
         "neighbors",
-        "Окружение узла в графе: кто вызывает и что вызывается на заданной глубине. "
+        "Окружение узла в графе: кто вызывает и что вызывается на заданной глубине. У каждого узла виден "
+        + "модуль (file) и границы процедуры (startLine, endLine), а у каждой связи — её начало и конец "
+        + "(from, to) и строка вызова: цепочки вызовов читаются без дополнительных запросов. "
         + "Для поиска вызовов процедуры укажите edgeKinds=[\"Calls\"], direction=\"in\".",
         [
             new ToolParameter("id", "string", "Идентификатор узла (см. search).", Required: true),
@@ -575,11 +595,14 @@ public sealed class ToolCatalog
                 throw new ToolException($"Узел «{id}» не найден. Уточните идентификатор инструментом search.");
             }
 
+            // Границы процедур: у узлов окружения их не было, а по ним видно, куда ведёт цепочка вызовов.
+            var bounds = RoutineBounds.For(Session);
+
             return Render.JsonOf(new
             {
                 center = id,
                 truncated = neighborhood.Truncated,
-                nodes = neighborhood.Nodes.Select(NodeView).ToList(),
+                nodes = neighborhood.Nodes.Select(node => NodeView(node, bounds)).ToList(),
                 edges = neighborhood.Edges.Select(edge => new
                 {
                     kind = edge.Kind.ToString(),
@@ -587,7 +610,7 @@ public sealed class ToolCatalog
                     to = edge.TargetId,
                     line = edge.Line,
                 }).ToList(),
-            });
+            }, NeighborsTruncationHint);
         });
 
     private ToolSpec CodeTool() => new(
@@ -3432,29 +3455,124 @@ public sealed class ToolCatalog
         }
     }
 
-    private static object NodeView(GraphNode node) => new
+    private static object NodeView(GraphNode node, RoutineBounds? bounds = null)
     {
-        id = node.Id,
-        kind = node.Kind.ToString(),
-        name = node.Name,
-        metadataKind = node.MetadataKind,
-        file = node.SourcePath,
-        external = node.IsExternal ? true : (bool?)null,
-        tags = node.Tags is { Count: > 0 } ? node.Tags : null,
-    };
+        var span = bounds?.Of(node);
+        return new
+        {
+            id = node.Id,
+            kind = node.Kind.ToString(),
+            name = node.Name,
+            metadataKind = node.MetadataKind,
+            file = node.SourcePath,
+            external = node.IsExternal ? true : (bool?)null,
+            tags = node.Tags is { Count: > 0 } ? node.Tags : null,
 
-    private static object EdgeView(GraphEdge edge, string otherId, IGraphQuery query)
+            // Границы процедуры отдельными полями, а не только в тегах: индекс теги узлов
+            // не хранит, и без этого карточка процедуры в режиме индекса теряла номера строк.
+            startLine = span?.Start,
+            endLine = span?.End,
+        };
+    }
+
+    private static object EdgeView(GraphEdge edge, string otherId, IGraphQuery query, RoutineBounds bounds)
     {
         var other = query.FindNode(otherId);
+        var span = other is null ? null : bounds.Of(other);
         return new
         {
             kind = edge.Kind.ToString(),
             node = otherId,
             name = other?.Name,
             nodeKind = other?.Kind.ToString(),
+            file = other?.SourcePath,
             line = edge.Line,
             detail = edge.Detail,
+            startLine = span?.Start,
+            endLine = span?.End,
         };
+    }
+
+    /// <summary>
+    /// Границы процедур для узлов и сторон связей: где процедура начинается и где кончается.
+    /// У разбора в памяти границы лежат в тегах узла (<c>startLine</c> и <c>lines</c>), а индекс теги
+    /// не хранит — там они берутся из символов модуля, по одному запросу на файл. Кэш живёт один вызов
+    /// инструмента: рёбер в ответе до 400, а модулей у них единицы. Нужен, чтобы цепочки вызовов
+    /// читались по одному ответу (внешний отзыв, T-9).
+    /// </summary>
+    private sealed class RoutineBounds(IndexReader? reader)
+    {
+        private readonly Dictionary<string, IReadOnlyList<SymbolRow>> _symbols = new(StringComparer.OrdinalIgnoreCase);
+
+        public static RoutineBounds For(AnalysisSession session) => new(session.GetIndexReader());
+
+        /// <summary>Первая и последняя строки процедуры или null, если узел не процедура.</summary>
+        public (int Start, int End)? Of(GraphNode node)
+        {
+            if (node.Kind != GraphNodeKind.Routine)
+            {
+                return null;
+            }
+
+            // Разбор в памяти кладёт границы в теги узла: в индекс за ними идти не нужно.
+            var start = TagInt(node, "startLine");
+            var lines = TagInt(node, "lines");
+            if (start > 0 && lines > 0)
+            {
+                return (start, start + lines - 1);
+            }
+
+            if (reader is null || !TrySplitRoutineId(node.Id, out var modulePath, out var name))
+            {
+                return null;
+            }
+
+            var symbols = Symbols(modulePath);
+
+            // Идентификатор символа совпадает с идентификатором узла: одноимённые процедуры
+            // (вложенные и под #Если) различаются только им, поэтому имя — лишь запасной вариант.
+            var symbol = symbols.FirstOrDefault(item => string.Equals(item.NodeId, node.Id, StringComparison.Ordinal))
+                ?? symbols.FirstOrDefault(item => string.Equals(item.Name, name, StringComparison.Ordinal));
+            return symbol is null ? null : (symbol.StartLine, symbol.EndLine);
+        }
+
+        private IReadOnlyList<SymbolRow> Symbols(string modulePath)
+        {
+            if (_symbols.TryGetValue(modulePath, out var cached))
+            {
+                return cached;
+            }
+
+            var found = reader!.FindSymbolsInModule(modulePath);
+            _symbols[modulePath] = found;
+            return found;
+        }
+
+        /// <summary>
+        /// Разбирает идентификатор процедуры <c>routine:module:&lt;путь&gt;#&lt;Имя&gt;</c>: путь модуля
+        /// отделяется от имени последним символом '#', потому что имя процедуры его не содержит.
+        /// </summary>
+        private static bool TrySplitRoutineId(string id, out string modulePath, out string name)
+        {
+            const string prefix = "routine:module:";
+            modulePath = string.Empty;
+            name = string.Empty;
+
+            if (!id.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var separator = id.LastIndexOf('#');
+            if (separator <= prefix.Length || separator == id.Length - 1)
+            {
+                return false;
+            }
+
+            modulePath = id[prefix.Length..separator];
+            name = id[(separator + 1)..];
+            return true;
+        }
     }
 
     private static string TopicText(PlatformTopic topic, bool full)
