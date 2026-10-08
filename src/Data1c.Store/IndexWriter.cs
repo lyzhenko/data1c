@@ -37,6 +37,13 @@ public sealed class IndexWriter
     /// </summary>
     public bool IncludeRights { get; init; } = true;
 
+    /// <summary>
+    /// Куда сообщать время каждой стадии записи. Нужно для замеров: на ERP запись занимает 85 %
+    /// времени сборки (399,7 с из 467,5 с), и по стадиям видно, какую из них ускорять.
+    /// По умолчанию время стадий никуда не идёт.
+    /// </summary>
+    public Action<string, TimeSpan>? PhaseReport { get; init; }
+
     /// <summary>Полностью перезаписывает индекс данными разбора.</summary>
     public IndexWriteResult Write(IDumpSource source, AnalysisResult result, CancellationToken cancellationToken = default)
     {
@@ -52,17 +59,33 @@ public sealed class IndexWriter
                 using var transaction = _index.Connection.BeginTransaction();
                 var connection = transaction.Connection!;
                 var counters = new Counters();
+                var phase = Stopwatch.StartNew();
 
                 Clear(connection);
+                Report("очистка", phase);
+
                 WriteFiles(source, connection, counters, cancellationToken);
+                Report("файлы", phase);
+
                 WriteNodes(result.Graph.Nodes, connection, counters, cancellationToken);
+                Report("узлы", phase);
+
                 WriteEdges(result.Graph.Edges, connection, counters, cancellationToken);
+                Report("связи", phase);
+
                 WriteSymbols(source, result.Modules, connection, counters, cancellationToken);
+                Report("символы", phase);
+
                 WriteMetadata(result, connection, counters, cancellationToken);
+                Report("метаданные", phase);
+
                 WriteForms(result, connection, counters, cancellationToken);
+                Report("формы", phase);
+
                 if (IncludeRights)
                 {
                     WriteRights(source, connection, counters, cancellationToken);
+                    Report("права", phase);
                 }
 
                 _index.SetMeta("dump_path", result.SourceName);
@@ -92,6 +115,14 @@ public sealed class IndexWriter
                 _index.Execute("PRAGMA synchronous=NORMAL");
             }
         });
+    }
+
+    /// <summary>Сообщает время стадии и запускает отсчёт следующей.</summary>
+    private void Report(string phase, Stopwatch watch)
+    {
+        watch.Stop();
+        PhaseReport?.Invoke(phase, watch.Elapsed);
+        watch.Restart();
     }
 
     /// <summary>

@@ -79,7 +79,11 @@ if (build)
 
     using var fresh = SqliteIndex.Open(indexPath);
     var writeWatch = Stopwatch.StartNew();
-    var written = new IndexWriter(fresh).Write(source, analysis);
+    var written = new IndexWriter(fresh)
+    {
+        // Стадии записи: на большой выгрузке она занимает 85 % сборки, и по стадиям видно, куда идти.
+        PhaseReport = (phase, elapsed) => Console.WriteLine($"  {phase,-12} {elapsed.TotalSeconds,8:F1} с"),
+    }.Write(source, analysis);
     writeWatch.Stop();
 
     Console.WriteLine($"разбор выгрузки:            {analysisWatch.Elapsed.TotalSeconds,8:F1} с");
