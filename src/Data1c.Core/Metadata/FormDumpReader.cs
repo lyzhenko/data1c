@@ -73,7 +73,7 @@ public sealed class FormDumpReader
     }
 
     /// <summary>Имя формы по пути файла: «…/Forms/ФормаЭлемента/Ext/Form.xml» → «ФормаЭлемента».</summary>
-    public static string NameFromPath(string sourcePath)
+    private static string NameFromPath(string sourcePath)
     {
         var normalized = DumpPath.Normalize(sourcePath);
         var name = DumpPath.GetFileName(DumpPath.GetDirectory(DumpPath.GetDirectory(normalized)));

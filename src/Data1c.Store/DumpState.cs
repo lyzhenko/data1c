@@ -32,7 +32,7 @@ public sealed record DumpChange(
 public static class DumpState
 {
     /// <summary>Служебный каталог индекса: он лежит внутри каталога выгрузки, но её файлом не является.</summary>
-    public const string ServiceDirectory = ".data1c";
+    private const string ServiceDirectory = ".data1c";
 
     /// <summary>Путь относится к служебным файлам индекса, а не к выгрузке 1С.</summary>
     public static bool IsServicePath(string relativePath) =>
